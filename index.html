@@ -2476,22 +2476,21 @@ function renderStatSum() {
     legendEl.innerHTML=regions.map((r,i)=>{
       const _regMemIds=FM.filter(m=>m.region===r).map(m=>m.id);
       const cur=statGs(_regMemIds).pct;
-      // 전주대비: 지역별 독립 계산 (선택 날짜 기준, 해당 지역 기록의 직전 날짜)
+      // 전주대비: _prev는 전역 records의 dates에서 찾고, 해당 지역 records로 비교
       let deltaHtml='';
       try{
         const _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-        const _mids=new Set(_regMemIds);
-        const _regR=_allR.filter(rec=>_mids.has(rec.id));
-        const _dd=[...(new Set(_regR.map(rec=>String(rec&&rec.date||'').slice(0,10)).filter(Boolean)))].sort();
-        const _cur=_statD||(_dd.length?_dd[_dd.length-1]:'');
+        const _allDates=[...new Set(_allR.map(rec=>String(rec&&rec.date||'').slice(0,10)).filter(Boolean))].sort();
+        const _cur=_statD||(_allDates.length?_allDates[_allDates.length-1]:'');
         if(_cur){
-          // _cur보다 작은 날짜 중 가장 큰 것을 prev로 (indexOf 실패에도 견고)
           let _prev='';
-          for(let _i=_dd.length-1;_i>=0;_i--){ if(_dd[_i]<_cur){ _prev=_dd[_i]; break; } }
+          for(let _i=_allDates.length-1;_i>=0;_i--){ if(_allDates[_i]<_cur){ _prev=_allDates[_i]; break; } }
           if(_prev){
-            const _pR=_regR.filter(rec=>String(rec&&rec.date||'').slice(0,10)===_prev);
+            const _mids=new Set(_regMemIds);
+            const _pR=_allR.filter(rec=>_mids.has(rec.id)&&String(rec&&rec.date||'').slice(0,10)===_prev);
             if(_pR.length){
-              const prevAtt=_pR.filter(rec=>rec.st!=='사유결석').length;
+              // cur(statGs)는 qr+sa 공식 → prev도 동일하게 qr+sa 공식 사용
+              const prevAtt=_pR.filter(rec=>rec.st==='QR인증'||rec.st==='사유출석').length;
               const prev=Math.round(prevAtt/_pR.length*1000)/10;
               const delta=Math.round((cur-prev)*10)/10;
               const cls=delta>0?'up':delta<0?'dn':'eq';
@@ -2813,21 +2812,22 @@ function renderRegionCards(){
         <span style="font-size:10px;color:var(--text3);white-space:nowrap">${actualCount}명</span>
         ${(function(){
           try{
-            // 지역별 독립 계산: 선택 날짜(d) 기준 cur, 해당 지역 기록에서 이전 날짜 prev
+            // _prev는 전역 records의 dates에서 찾는다 — 지역별 records에서만 찾으면
+            // 해당 지역 데이터가 일시적으로 누락된 상태에서 직전 예배일을 건너뛰고
+            // 더 과거 날짜를 _prev로 잡는 버그가 발생함 (예: 도봉 5/10 vs 5/3 비교가
+            // 5/3 누락 시 5/10 vs 4/26으로 계산되어 부호가 뒤집힘)
             var _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-            var _mids=new Set(FM.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
-            var _regR=_allR.filter(function(r){return _mids.has(r.id);});
-            var _dd=[]; _regR.forEach(function(r){var dd=String(r&&r.date||'').slice(0,10);if(dd&&_dd.indexOf(dd)<0)_dd.push(dd);});
-            _dd.sort();
-            var _cur=d||(_dd.length?_dd[_dd.length-1]:'');
+            var _allDates=[]; _allR.forEach(function(r){var dd=String(r&&r.date||'').slice(0,10);if(dd&&_allDates.indexOf(dd)<0)_allDates.push(dd);});
+            _allDates.sort();
+            var _cur=d||(_allDates.length?_allDates[_allDates.length-1]:'');
             if(!_cur)return'';
-            var _prev=''; for(var _pi=_dd.length-1;_pi>=0;_pi--){if(_dd[_pi]<_cur){_prev=_dd[_pi];break;}}
+            var _prev=''; for(var _pi=_allDates.length-1;_pi>=0;_pi--){if(_allDates[_pi]<_cur){_prev=_allDates[_pi];break;}}
             if(!_prev)return'';
-            var _cR=_regR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_cur;});
-            var _pR=_regR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_prev;});
+            var _mids=new Set(FM.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
+            var _cR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_cur;});
+            var _pR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_prev;});
             if(_cR.length&&_pR.length){
-              // 표시값 pct1(qr+sa, t)과 동일한 공식 사용 — st가 빈 값/미인식 레코드를
-              // 출석으로 오인하지 않도록 QR인증·사유출석만 명시적으로 카운트
+              // 표시값 pct1(qr+sa, t)과 동일한 공식 사용
               var _cA=_cR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
               var _pA=_pR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
               var _delta=Math.round((_cA/_cR.length-_pA/_pR.length)*1000)/10;
@@ -2858,20 +2858,20 @@ function renderRegionCards(){
             return {pct:pct1(att,tdr.length),att,tot:tdr.length};
           })();
           const tc=tgs.pct>=80?'var(--green)':(tgs.pct>=60?'var(--amber)':'var(--red)');
-          // 유형별 전주대비
+          // 유형별 전주대비 — _prev는 전역 records dates에서 (지역/유형 records 부분 누락 영향 회피)
           let dStr='';
           try{
             const allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-            const mids=new Set(tArr.map(m=>m.id));
-            const tRegR=allR.filter(r=>mids.has(r.id));
-            const tDd=[...new Set(tRegR.map(r=>String(r&&r.date||'').slice(0,10)).filter(Boolean))].sort();
-            const tCur=d||(tDd.length?tDd[tDd.length-1]:'');
+            const allDates=[...new Set(allR.map(r=>String(r&&r.date||'').slice(0,10)).filter(Boolean))].sort();
+            const tCur=d||(allDates.length?allDates[allDates.length-1]:'');
             if(tCur){
-              let tPrev=''; for(let _ti=tDd.length-1;_ti>=0;_ti--){if(tDd[_ti]<tCur){tPrev=tDd[_ti];break;}}
+              let tPrev=''; for(let _ti=allDates.length-1;_ti>=0;_ti--){if(allDates[_ti]<tCur){tPrev=allDates[_ti];break;}}
               if(tPrev){
-                const cR=tRegR.filter(r=>String(r&&r.date||'').slice(0,10)===tCur);
-                const pR=tRegR.filter(r=>String(r&&r.date||'').slice(0,10)===tPrev);
+                const mids=new Set(tArr.map(m=>m.id));
+                const cR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tCur);
+                const pR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tPrev);
                 if(cR.length&&pR.length){
+                  // tgs.pct(표시값)가 not-사유결석 공식이므로 delta도 동일 공식 유지
                   const dd=Math.round((cR.filter(r=>r.st!=='사유결석').length/cR.length-pR.filter(r=>r.st!=='사유결석').length/pR.length)*1000)/10;
                   const dc=dd>0?'up':dd<0?'dn':'eq';
                   dStr='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
@@ -2893,19 +2893,18 @@ function renderRegionCards(){
         ${teams.map(tm=>{
           const tmArr=arr.filter(m=>m.team===tm);
           const tmgs=statGs(tmArr.map(m=>m.id));
-          // 팀별 전주대비
+          // 팀별 전주대비 — _prev는 전역 records dates에서 (팀 records 부분 누락 영향 회피)
           let tmDelta='';
           try{
             const allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-            const tmids=new Set(tmArr.map(m=>m.id));
-            const tmR=allR.filter(r=>tmids.has(r.id));
-            const tmDd=[...new Set(tmR.map(r=>String(r&&r.date||'').slice(0,10)).filter(Boolean))].sort();
-            const tmCur=d||(tmDd.length?tmDd[tmDd.length-1]:'');
+            const allDates=[...new Set(allR.map(r=>String(r&&r.date||'').slice(0,10)).filter(Boolean))].sort();
+            const tmCur=d||(allDates.length?allDates[allDates.length-1]:'');
             if(tmCur){
-              let tmPrev=''; for(let _i=tmDd.length-1;_i>=0;_i--){if(tmDd[_i]<tmCur){tmPrev=tmDd[_i];break;}}
+              let tmPrev=''; for(let _i=allDates.length-1;_i>=0;_i--){if(allDates[_i]<tmCur){tmPrev=allDates[_i];break;}}
               if(tmPrev){
-                const cR=tmR.filter(r=>String(r&&r.date||'').slice(0,10)===tmCur);
-                const pR=tmR.filter(r=>String(r&&r.date||'').slice(0,10)===tmPrev);
+                const tmids=new Set(tmArr.map(m=>m.id));
+                const cR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmCur);
+                const pR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmPrev);
                 if(cR.length&&pR.length){
                   // statGs 표시값(qr+sa/total)과 동일한 공식 사용
                   const dd=Math.round((cR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/cR.length-pR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/pR.length)*1000)/10;
