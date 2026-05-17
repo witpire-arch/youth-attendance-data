@@ -1226,11 +1226,17 @@ const REGION_PINS = {
   '0808': { role: 'region', region: '이음', label: '이음' },
 };
 
-let currentUser = null; // { role, region, label }
+// 로그인 사용자 정보. Google 로그인 후 google-auth 스크립트가 채움.
+// shape: { role: 'admin'|'region', region: string|null, label, email, name }
+//   role==='admin' → MEMBERS 전체 노출
+//   role==='region' → MEMBERS.filter(m=>m.region===currentUser.region)
+let currentUser = null;
 
 function getFilteredMembers() {
+  // 안전장치: window.currentUser와 lexical currentUser 둘 다 확인 (스크립트 격리 환경 대비)
+  const u = currentUser || (typeof window !== 'undefined' ? window.currentUser : null);
   // _retired:true 인원은 현재 명단에서 제외 (재적 계산에만 포함)
-  const base = (!currentUser || currentUser.role === 'admin') ? MEMBERS : MEMBERS.filter(m => m.region === currentUser.region);
+  const base = (!u || u.role === 'admin') ? MEMBERS : MEMBERS.filter(m => m.region === u.region);
   return base.filter(m => !m._retired);
 }
 
