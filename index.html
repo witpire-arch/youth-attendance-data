@@ -9,6 +9,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap');
 :root{
@@ -488,28 +489,68 @@ body.llf-pin-loading::before{
 <body class="llf-pin-loading">
 
 <!-- ── LOGIN ── -->
-<div id="login-screen" onclick="document.getElementById('pin-input-field').focus()">
+<style id="auth-screen-style">
+#login-screen .google-btn{
+  width:100%;padding:14px 16px;font-size:14px;font-weight:600;
+  border:1px solid var(--border-md,#ccc);border-radius:var(--r,10px);
+  background:var(--surface,#fff);color:var(--text,#1c1b18);
+  cursor:pointer;font-family:var(--font);display:flex;align-items:center;
+  justify-content:center;gap:10px;transition:.12s;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;
+}
+#login-screen .google-btn:hover{ background:var(--surface2,#efede7); }
+#login-screen .google-btn:active{ transform:scale(.98); }
+#login-screen .google-btn svg{ width:18px;height:18px;flex-shrink:0; }
+#login-screen .google-btn.loading{ opacity:.6;cursor:wait; }
+#login-error{ font-size:12px;color:var(--red,#a01e1e);min-height:16px;margin-top:10px; }
+#access-denied-screen{
+  position:fixed;inset:0;background:var(--bg,#f5f4f0);
+  display:none;align-items:center;justify-content:center;z-index:9999;padding:20px;
+}
+#access-denied-screen.show{ display:flex; }
+#access-denied-screen .login-box{ text-align:center; }
+#access-denied-screen .denied-icon{
+  width:56px;height:56px;border-radius:50%;background:var(--red-bg,#fde8e8);
+  display:flex;align-items:center;justify-content:center;margin:0 auto 14px;
+  color:var(--red,#a01e1e);font-size:28px;
+}
+#access-denied-screen h2{ font-size:17px;font-weight:700;margin-bottom:6px; }
+#access-denied-screen .denied-msg{ font-size:12.5px;color:var(--text2,#6a6a62);margin-bottom:6px; }
+#access-denied-screen .denied-email{ font-size:11px;color:var(--text3,#a2a099);margin-bottom:18px;font-family:var(--mono,monospace);word-break:break-all; }
+#access-denied-screen .signout-btn{
+  width:100%;padding:12px;font-size:14px;font-weight:600;
+  border:1px solid var(--border-md,#ccc);border-radius:var(--r,10px);
+  background:var(--surface,#fff);color:var(--text,#1c1b18);cursor:pointer;
+  font-family:var(--font);
+}
+#access-denied-screen .signout-btn:hover{ background:var(--surface2,#efede7); }
+</style>
+<div id="login-screen">
   <div class="login-box">
     <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 2L2 7v10l10 5 10-5V7L12 2z"/></svg></div>
     <h2>출결 관리 시스템</h2>
-    <p style="margin-bottom:4px;font-size:13px">지역 PIN을 입력하세요</p>
-    <p style="font-size:11px;color:var(--text3);margin-bottom:16px">관리자 또는 지역 번호로 로그인</p>
-    <input
-      type="tel"
-      id="pin-input-field"
-      maxlength="4"
-      placeholder="0000"
-      autocomplete="off"
-      autocorrect="off"
-      autocapitalize="off"
-      spellcheck="false"
-      style="width:100%;text-align:center;font-size:32px;letter-spacing:16px;padding:16px 0;border:2px solid var(--border-md);border-radius:var(--r);margin-bottom:14px;background:var(--surface);font-family:var(--mono);outline:none;-webkit-appearance:none"
-    >
-    <button
-      id="pin-confirm-btn"
-      style="width:100%;padding:16px;font-size:16px;font-weight:700;border:none;border-radius:var(--r);background:var(--text);color:white;cursor:pointer;font-family:var(--font);margin-bottom:8px;-webkit-tap-highlight-color:transparent;touch-action:manipulation"
-    >확인</button>
-    <div class="pin-error" id="pin-error"></div>
+    <p style="margin-bottom:20px;font-size:12.5px;color:var(--text3)">Google 계정으로 로그인하세요</p>
+    <button id="google-signin-btn" class="google-btn" type="button">
+      <svg viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+        <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/>
+        <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/>
+        <path fill="#FBBC05" d="M3.964 10.706A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.706V4.962H.957A8.997 8.997 0 0 0 0 9c0 1.452.348 2.827.957 4.038l3.007-2.332z"/>
+        <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.962L3.964 7.294C4.672 5.167 6.656 3.58 9 3.58z"/>
+      </svg>
+      <span>Google로 로그인</span>
+    </button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- ── ACCESS DENIED ── -->
+<div id="access-denied-screen">
+  <div class="login-box">
+    <div class="denied-icon">🚫</div>
+    <h2>접근 권한이 없습니다</h2>
+    <p class="denied-msg">관리자에게 문의하세요.</p>
+    <p class="denied-email" id="denied-email"></p>
+    <button class="signout-btn" id="denied-signout-btn" type="button">로그아웃</button>
   </div>
 </div>
 
@@ -565,6 +606,10 @@ body.llf-pin-loading::before{
     <input type="date" id="gb-date" class="fc" style="font-size:11.5px;height:28px;padding:2px 7px;width:100%;margin-bottom:8px" onchange="gbApplyDate()">
     <input type="hidden" id="globalMonth" value="2026-05">
     <div id="db-status" style="font-size:10.5px;color:var(--text3);text-align:center;padding:4px 0;border-top:1px solid var(--border);margin-top:2px">로컬 저장소</div>
+    <div id="sb-user-box" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10.5px;color:var(--text3);display:none">
+      <div id="sb-user-email" style="word-break:break-all;line-height:1.4;margin-bottom:6px;font-family:var(--mono,monospace);font-size:10px"></div>
+      <button id="signout-btn" type="button" style="width:100%;padding:5px 8px;font-size:11px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);color:var(--text);cursor:pointer;font-family:var(--font)">로그아웃</button>
+    </div>
   </div>
 </nav>
 
@@ -1480,8 +1525,7 @@ function initSupabase() {
       }
       fbDB = firebase.database();
       showDBStatus('Firebase 연결됨 ✓', 'ok');
-      // 연결되자마자 백그라운드 prefetch 시작 (로그인 대기 시간 활용)
-      prefetchFromDB();
+      // 로그인 인증 완료 후에만 데이터 읽기 — prefetch는 auth 콜백에서 시작
     } catch(e) {
       console.error('Firebase 초기화 실패:', e);
       showDBStatus('Firebase 오류', 'error');
@@ -9035,9 +9079,9 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     if(btn){ btn.onclick=function(e){ if(e)e.preventDefault(); return window.doPinSubmit(); }; btn.ontouchend=btn.onclick; }
     if(inp){ inp.oninput=function(){ this.value=only4(this.value); if(this.value.length===4) setTimeout(window.doPinSubmit,60); }; inp.onkeydown=function(e){ if(e.key==='Enter') window.doPinSubmit(); }; }
   }
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){bindLogin();bindPwInputs();});
-  else {bindLogin();bindPwInputs();}
-  window.addEventListener('load',function(){ setTimeout(loadPinsFromDB,1200); setTimeout(loadPinsFromDB,3500); });
+  // PIN 로그인 제거됨 — Google 로그인으로 교체. bindLogin/loadPinsFromDB 자동 호출 차단
+  // (관련 함수와 DOM 요소가 존재하지 않으므로 호출되어도 안전하지만, 명시적으로 비활성화)
+  if(false){bindLogin();bindPwInputs();}
 })();
 </script>
 <!-- V79_PASSWORD_SETTINGS_END -->
@@ -12401,3 +12445,221 @@ console.log('[MFV2] Loaded');
 })();
 </script>
 <!-- LOADING_LIFECYCLE_FIX_END -->
+
+<!-- GOOGLE_AUTH_START -->
+<script id="google-auth">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Google Sign-In — replaces 4-digit PIN login
+       Step 1 임시 정책: witpire@gmail.com만 admin으로 통과
+                        그 외 Google 사용자는 "접근 권한 없음" 화면
+       Step 2에서 Firebase RTDB의 /allowedUsers 기반 허용 목록으로 교체 예정
+     ════════════════════════════════════════════════════════════════ */
+
+  // Step 1 하드코드 — Step 2에서 DB 조회로 교체
+  var BOOTSTRAP_ADMIN_EMAIL = 'witpire@gmail.com';
+
+  var _authReady = false;     // onAuthStateChanged 첫 콜백이 발화했는가
+  var _signingIn = false;     // 로그인 중 (중복 클릭 차단)
+  var _appStarted = false;    // initApp이 호출되었는가 (재호출 방지)
+
+  function $(id){ return document.getElementById(id); }
+  function showLoginScreen(){
+    var l = $('login-screen'); if(l) l.style.display = 'flex';
+    var d = $('access-denied-screen'); if(d) d.classList.remove('show');
+    var a = $('app'); if(a) a.style.display = 'none';
+    var box = $('sb-user-box'); if(box) box.style.display = 'none';
+  }
+  function showAccessDenied(email){
+    var l = $('login-screen'); if(l) l.style.display = 'none';
+    var d = $('access-denied-screen'); if(d) d.classList.add('show');
+    var a = $('app'); if(a) a.style.display = 'none';
+    var e = $('denied-email'); if(e) e.textContent = email || '';
+  }
+  function showApp(){
+    var l = $('login-screen'); if(l) l.style.display = 'none';
+    var d = $('access-denied-screen'); if(d) d.classList.remove('show');
+    var a = $('app'); if(a) a.style.display = 'flex';
+    // 사이드바 배지 + 사용자 박스
+    var u = window.currentUser || {};
+    var badge = $('sb-login-badge');
+    if(badge){
+      var labelText = u.role === 'admin'
+        ? '👑 ' + (u.name || '관리자')
+        : '📍 ' + (u.region || '') + (u.name ? ' · ' + u.name : '');
+      badge.textContent = labelText;
+    }
+    var adminNav = $('admin-nav-section');
+    if(adminNav) adminNav.style.display = (u.role === 'admin') ? '' : 'none';
+    var box = $('sb-user-box'); if(box) box.style.display = '';
+    var em = $('sb-user-email'); if(em) em.textContent = u.email || '';
+  }
+
+  function setLoginError(msg){
+    var el = $('login-error');
+    if(el) el.textContent = msg || '';
+  }
+
+  function waitForAuthSDK(retries){
+    if(typeof firebase !== 'undefined' && firebase.auth){
+      return Promise.resolve();
+    }
+    if(retries <= 0) return Promise.reject(new Error('Firebase Auth SDK 로드 실패'));
+    return new Promise(function(resolve){ setTimeout(resolve, 100); })
+      .then(function(){ return waitForAuthSDK(retries - 1); });
+  }
+
+  function signInWithGoogle(){
+    if(_signingIn) return;
+    _signingIn = true;
+    setLoginError('');
+    var btn = $('google-signin-btn');
+    if(btn){ btn.classList.add('loading'); btn.disabled = true; }
+    try{
+      var provider = new firebase.auth.GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      firebase.auth().signInWithPopup(provider)
+        .catch(function(err){
+          // 팝업 차단/실패 시 redirect로 폴백
+          var code = err && err.code || '';
+          var popupFailure = code === 'auth/popup-blocked'
+            || code === 'auth/popup-closed-by-user'
+            || code === 'auth/cancelled-popup-request'
+            || code === 'auth/operation-not-supported-in-this-environment';
+          if(popupFailure){
+            console.warn('[auth] popup 실패, redirect로 폴백:', code);
+            try{
+              firebase.auth().signInWithRedirect(provider);
+            }catch(e){
+              console.error('[auth] redirect 실패:', e);
+              setLoginError('로그인 실패: ' + (e.message || e));
+              _signingIn = false;
+              if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+            }
+            return;
+          }
+          // 그 외 오류
+          console.error('[auth] 로그인 실패:', err);
+          setLoginError('로그인 실패: ' + (err && err.message || err));
+          _signingIn = false;
+          if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+        });
+    }catch(e){
+      console.error('[auth] signIn 호출 실패:', e);
+      setLoginError('로그인 호출 오류: ' + (e.message || e));
+      _signingIn = false;
+      if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+    }
+  }
+
+  function signOut(){
+    try{
+      firebase.auth().signOut().catch(function(err){
+        console.error('[auth] 로그아웃 실패:', err);
+      });
+    }catch(e){
+      console.error('[auth] signOut 호출 실패:', e);
+    }
+    // 로컬 currentUser 정리
+    try{ window.currentUser = null; }catch(e){}
+    try{ currentUser = null; }catch(e){}
+  }
+
+  // 인증된 사용자가 허용된지 판단 (Step 1: 하드코드, Step 2에서 DB 조회로 교체)
+  function resolveUserAccess(firebaseUser){
+    var email = (firebaseUser.email || '').toLowerCase().trim();
+    if(!email) return null;
+    if(email === BOOTSTRAP_ADMIN_EMAIL){
+      return {
+        role: 'admin',
+        region: null,
+        label: '관리자',
+        email: email,
+        name: firebaseUser.displayName || '관리자'
+      };
+    }
+    // Step 1 임시 정책: 외 사용자는 모두 거부
+    // Step 2에서 /allowedUsers 조회로 교체
+    return null;
+  }
+
+  function handleAuthChange(firebaseUser){
+    _authReady = true;
+    _signingIn = false;
+    if(!firebaseUser){
+      // 로그아웃 상태 → 로그인 화면
+      showLoginScreen();
+      var btn = $('google-signin-btn');
+      if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+      return;
+    }
+    var profile = resolveUserAccess(firebaseUser);
+    if(!profile){
+      // 인증은 됐지만 허용 목록에 없음
+      showAccessDenied(firebaseUser.email);
+      return;
+    }
+    // 허용된 사용자 → currentUser 세팅 후 앱 진입
+    window.currentUser = profile;
+    try{ currentUser = profile; }catch(e){}
+    showApp();
+    if(!_appStarted && typeof window.initApp === 'function'){
+      _appStarted = true;
+      try{ window.initApp(); }
+      catch(e){ console.error('[auth] initApp 오류:', e); }
+    }
+  }
+
+  // 버튼 바인딩 (DOM은 이미 존재함 — 스크립트가 body 끝에 있음)
+  function bindButtons(){
+    var gBtn = $('google-signin-btn');
+    if(gBtn && !gBtn._authBound){
+      gBtn._authBound = true;
+      gBtn.addEventListener('click', signInWithGoogle);
+    }
+    var sBtn = $('signout-btn');
+    if(sBtn && !sBtn._authBound){
+      sBtn._authBound = true;
+      sBtn.addEventListener('click', signOut);
+    }
+    var dBtn = $('denied-signout-btn');
+    if(dBtn && !dBtn._authBound){
+      dBtn._authBound = true;
+      dBtn.addEventListener('click', signOut);
+    }
+  }
+  bindButtons();
+  // DOM이 늦게 준비되는 경우 대비 짧은 재바인딩
+  setTimeout(bindButtons, 100);
+  setTimeout(bindButtons, 500);
+
+  // Firebase Auth SDK가 로드되면 인증 상태 리스너 등록
+  waitForAuthSDK(60)
+    .then(function(){
+      // redirect 결과 처리 (모바일 fallback 경로)
+      try{
+        firebase.auth().getRedirectResult().catch(function(err){
+          if(err && err.code && err.code !== 'auth/no-auth-event'){
+            console.error('[auth] redirect 결과 오류:', err);
+            setLoginError('로그인 실패: ' + (err.message || err));
+          }
+        });
+      }catch(e){}
+      firebase.auth().onAuthStateChanged(handleAuthChange, function(err){
+        console.error('[auth] onAuthStateChanged 오류:', err);
+      });
+    })
+    .catch(function(err){
+      console.error('[auth] Firebase Auth SDK 로드 실패:', err);
+      setLoginError('Firebase Auth 로드 실패. 새로고침 해주세요.');
+    });
+
+  // 외부에서 호출 가능하도록 노출
+  window.signOutCurrentUser = signOut;
+  window.signInWithGoogle = signInWithGoogle;
+
+  console.log('[google-auth] loaded');
+})();
+</script>
+<!-- GOOGLE_AUTH_END -->
