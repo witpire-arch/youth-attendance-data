@@ -2799,16 +2799,25 @@ function renderRegionCards(){
 
   // 선택 날짜의 전체 기록 (MEMBERS 외 퇴적자 포함)
   const dateRecs = d ? recsForDate(d) : [];
-  // 지역별 실제 재적: 해당 날짜에 기록이 있는 인원 (MEMBERS 기준으로 region 매핑)
+  // 날짜별 region 매핑: 퇴적 멤버까지 포함해 그 날짜 당시 재적을 정확히 산출.
+  // 지역 계정 로그인 시 다른 지역 누수를 막기 위해 currentUser scope도 함께 적용.
+  const _allMembersById = new Map(MEMBERS.map(m => [m.id, m]));
+  const _isRegionAccount = (typeof currentUser !== 'undefined' && currentUser && currentUser.role !== 'admin' && currentUser.region);
+  function _recBelongsToRegion(r, reg){
+    const m = _allMembersById.get(r.id);
+    if(!m) return false;
+    if(m.region !== reg) return false;
+    if(_isRegionAccount && m.region !== currentUser.region) return false;
+    return true;
+  }
+  // 지역별 실제 재적: 해당 날짜에 그 지역으로 기록된 인원 (퇴적 포함)
   function getRegionCountOnDate(reg) {
     if (!d || !dateRecs.length) return FM.filter(m=>m.region===reg).length;
-    const membersInReg = new Set(FM.filter(m=>m.region===reg).map(m=>m.id));
-    return dateRecs.filter(r => membersInReg.has(r.id)).length;
+    return dateRecs.filter(r => _recBelongsToRegion(r, reg)).length;
   }
   function getRegionStatOnDate(reg) {
     if (!d || !dateRecs.length) return statGs(FM.filter(m=>m.region===reg).map(m=>m.id));
-    const membersInReg = new Set(FM.filter(m=>m.region===reg).map(m=>m.id));
-    const dr = dateRecs.filter(r => membersInReg.has(r.id));
+    const dr = dateRecs.filter(r => _recBelongsToRegion(r, reg));
     const qr=dr.filter(r=>r.st==='QR인증').length;
     const sa=dr.filter(r=>r.st==='사유출석').length;
     const ab=dr.filter(r=>r.st==='사유결석').length;
@@ -2816,13 +2825,19 @@ function renderRegionCards(){
     return {tot:t,att:qr+sa,pct:pct1(qr+sa,t),count:t,qr,sa,ab};
   }
 
-  // 유형별 × 지역별 출석률 (날짜 기준)
+  // 유형별 × 지역별 출석률 (날짜 기준, 퇴적 포함)
   function getTypeRegionStatOnDate(reg, type) {
-    const tArr = FM.filter(m => m.region === reg && (typeof normType === 'function' ? normType(m.type) : m.type) === type);
-    if (!tArr.length) return {pct: 0};
-    if (!d || !dateRecs.length) return statGs(tArr.map(m => m.id));
-    const mids = new Set(tArr.map(m => m.id));
-    const dr = dateRecs.filter(r => mids.has(r.id));
+    if (!d || !dateRecs.length){
+      const tArr = FM.filter(m => m.region === reg && (typeof normType === 'function' ? normType(m.type) : m.type) === type);
+      if (!tArr.length) return {pct: 0};
+      return statGs(tArr.map(m => m.id));
+    }
+    const normT = (typeof normType === 'function') ? normType : (function(t){return t;});
+    const dr = dateRecs.filter(r => {
+      if(!_recBelongsToRegion(r, reg)) return false;
+      const m = _allMembersById.get(r.id);
+      return normT(m.type) === type;
+    });
     if (!dr.length) return {pct: 0};
     const att = dr.filter(r => r.st !== '사유결석').length;
     return {pct: pct1(att, dr.length)};
