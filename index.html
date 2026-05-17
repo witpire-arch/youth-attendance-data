@@ -2814,8 +2814,10 @@ function renderRegionCards(){
             var _cR=_regR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_cur;});
             var _pR=_regR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_prev;});
             if(_cR.length&&_pR.length){
-              var _cA=_cR.filter(function(r){return r.st!=='사유결석';}).length;
-              var _pA=_pR.filter(function(r){return r.st!=='사유결석';}).length;
+              // 표시값 pct1(qr+sa, t)과 동일한 공식 사용 — st가 빈 값/미인식 레코드를
+              // 출석으로 오인하지 않도록 QR인증·사유출석만 명시적으로 카운트
+              var _cA=_cR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
+              var _pA=_pR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
               var _delta=Math.round((_cA/_cR.length-_pA/_pR.length)*1000)/10;
               var _cls=_delta>0?'up':_delta<0?'dn':'eq';
               return '<span class="v115-delta '+_cls+'" style="font-size:11px;white-space:nowrap">'+((_delta>0)?'+':'')+_delta.toFixed(1)+'%</span>';
@@ -2893,7 +2895,8 @@ function renderRegionCards(){
                 const cR=tmR.filter(r=>String(r&&r.date||'').slice(0,10)===tmCur);
                 const pR=tmR.filter(r=>String(r&&r.date||'').slice(0,10)===tmPrev);
                 if(cR.length&&pR.length){
-                  const dd=Math.round((cR.filter(r=>r.st!=='사유결석').length/cR.length-pR.filter(r=>r.st!=='사유결석').length/pR.length)*1000)/10;
+                  // statGs 표시값(qr+sa/total)과 동일한 공식 사용
+                  const dd=Math.round((cR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/cR.length-pR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/pR.length)*1000)/10;
                   const dc=dd>0?'up':dd<0?'dn':'eq';
                   tmDelta='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
                 }
