@@ -11532,8 +11532,44 @@ window.addEventListener('load',function(){
       /* ── Step 1: 로컬 캐시 즉시 표시 ── */
       var m=localStorage.getItem('att_members_v1'), r=localStorage.getItem('att_records_v1');
       var hasLocal = false;
-      if(m){ try{ MEMBERS=JSON.parse(m)||[]; hasLocal=true; }catch(e){} }
-      if(r){ try{ RECORDS=JSON.parse(r)||[]; hasLocal=true; }catch(e){} }
+      // ── MEMBERS: 캐시가 현재보다 풍부할 때만 덮어쓰기 ──
+      if(m){
+        try{
+          var cachedM = JSON.parse(m) || [];
+          var cachedMValid = cachedM.filter(function(x){return x && x.id;}).length;
+          var currentMValid = Array.isArray(MEMBERS) ? MEMBERS.filter(function(x){return x && x.id;}).length : 0;
+          if(cachedMValid > currentMValid){
+            MEMBERS = cachedM;
+            hasLocal = true;
+          } else if(currentMValid > 0){
+            // 이미 풍부한 데이터 (예: applyFinalData가 FINAL_MEMBERS로 채워둠) — 유지
+            hasLocal = true;
+          }
+        }catch(e){ console.warn('[minjiFastLoad] MEMBERS cache parse fail', e); }
+      }
+      // ── RECORDS: 캐시가 현재보다 풍부할 때만 덮어쓰기 ──
+      //   applyFinalData가 FINAL_RECORDS(9705건)로 RECORDS를 채워둔 뒤,
+      //   localStorage 캐시(과거 잘못된 로드에서 date 빈 레코드를 잃어 8063건)로
+      //   덮어써서 5/3(1618건)이 통째로 사라지던 버그 차단.
+      if(r){
+        try{
+          var cachedR = JSON.parse(r) || [];
+          // valid = id 와 date 가 모두 있는 레코드만
+          var cachedRValid = cachedR.filter(function(x){return x && x.id && x.date;}).length;
+          var currentRValid = Array.isArray(RECORDS) ? RECORDS.filter(function(x){return x && x.id && x.date;}).length : 0;
+          try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache RECORDS valid=', cachedRValid, ', current RECORDS valid=', currentRValid); }catch(e){}
+          if(cachedRValid > currentRValid){
+            // 캐시가 더 풍부 → 사용 (단, date 가 빈 레코드는 거름)
+            RECORDS = cachedR.filter(function(x){return x && x.id && x.date;});
+            hasLocal = true;
+            try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache used, RECORDS now=', RECORDS.length); }catch(e){}
+          } else if(currentRValid > 0){
+            // 현재 RECORDS 가 더 풍부함 (applyFinalData 결과) — 캐시로 덮어쓰지 않음
+            hasLocal = true;
+            try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache SKIPPED, keeping current RECORDS (', currentRValid, '건)'); }catch(e){}
+          }
+        }catch(e){ console.warn('[minjiFastLoad] RECORDS cache parse fail', e); }
+      }
       if(hasLocal){
         try{ if(typeof invalidateRecordIndex==='function')invalidateRecordIndex(); }catch(e){}
         try{ if(typeof populateSelects==='function')populateSelects(); }catch(e){}
@@ -11573,10 +11609,20 @@ window.addEventListener('load',function(){
           }
           if(rSnap.exists()){
             var rsn=typeof reasonDisplayLabel==='function'?reasonDisplayLabel:function(r){return r;};
-            RECORDS=(typeof fbRecordsFromVal==='function'?fbRecordsFromVal(rSnap.val()):Object.values(rSnap.val())).map(function(rr){
+            // Firebase 로드: fbRecordsFromVal 이 키 suffix 로 date 복구 처리
+            var fbRecs = (typeof fbRecordsFromVal==='function'?fbRecordsFromVal(rSnap.val()):Object.values(rSnap.val())).map(function(rr){
               return {id:rr.id,date:rr.date||'',wk:rr.wk||1,day:rr.day||'일',st:rr.st||'',rsn:rr.rsn||'',streak:rr.streak||0};
-            });
-            updated=true;
+            }).filter(function(rr){return rr && rr.id && rr.date;}); // valid 만
+            // Firebase 데이터가 현재 RECORDS 보다 풍부할 때만 덮어쓰기 — 누락 분 보호
+            var currentRValid2 = Array.isArray(RECORDS) ? RECORDS.filter(function(x){return x && x.id && x.date;}).length : 0;
+            try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase RECORDS valid=', fbRecs.length, ', current=', currentRValid2); }catch(e){}
+            if(fbRecs.length >= currentRValid2){
+              RECORDS = fbRecs;
+              updated = true;
+              try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase used, RECORDS now=', RECORDS.length); }catch(e){}
+            } else {
+              try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase SKIPPED (현재가 더 풍부), keeping current RECORDS'); }catch(e){}
+            }
           }
           if(eSnap.exists()){ try{localStorage.setItem('att_estage_data',JSON.stringify(eSnap.val()));}catch(e){} }
           if(updated){
