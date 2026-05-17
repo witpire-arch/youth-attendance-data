@@ -463,8 +463,29 @@ select.fc{cursor:pointer}
 }
 </style>
 
+<!-- Loading lifecycle: ensure cover is applied from the very first paint -->
+<style id="llf-early-style">
+body.llf-pin-loading #main{visibility:hidden !important;}
+body.llf-pin-loading #v97-loading-cover{display:flex !important;flex-direction:column;gap:14px;}
+body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
+#v97-loading-cover::before{
+  content:"";
+  width:36px;height:36px;
+  border:3px solid rgba(0,0,0,.10);
+  border-top-color:var(--text,#1c1b18);
+  border-radius:50%;
+  animation:llf-spin .7s linear infinite;
+}
+@keyframes llf-spin{to{transform:rotate(360deg);}}
+/* 페이지 자체에 cover div가 없을 수 있는 시점에도 #main이 보이지 않게 함 — 안전장치 */
+body.llf-pin-loading::before{
+  content:"";position:fixed;inset:0;background:var(--bg,#f5f4f0);z-index:9997;
+  pointer-events:none;
+}
+</style>
+
 </head>
-<body>
+<body class="llf-pin-loading">
 
 <!-- ── LOGIN ── -->
 <div id="login-screen" onclick="document.getElementById('pin-input-field').focus()">
@@ -12075,44 +12096,27 @@ console.log('[MFV2] Loaded');
 <!-- BUG_FIX_V28_END -->
 
 <!-- LOADING_LIFECYCLE_FIX_START -->
-<style id="loading-lifecycle-fix-style">
-/* 기존 #v97-loading-cover에 스피너 + 안정된 레이아웃 부여 */
-#v97-loading-cover{flex-direction:column;gap:14px;}
-#v97-loading-cover::before{
-  content:"";
-  width:36px;height:36px;
-  border:3px solid rgba(0,0,0,.10);
-  border-top-color:var(--text,#1c1b18);
-  border-radius:50%;
-  animation:llf-spin .7s linear infinite;
-}
-@keyframes llf-spin{to{transform:rotate(360deg);}}
-/* 페이지 로드부터 첫 렌더 커밋 전까지 #app 내부 깜빡임 차단 */
-body.llf-pin-loading #main{visibility:hidden !important;}
-body.llf-pin-loading #v97-loading-cover{display:flex !important;}
-/* overview-extra-analysis(연속결석 분석 섹션)가 본문 렌더 전에 단독으로
-   보이지 않도록, llf-pin-loading 동안 강제로 숨김 — visibility:hidden은
-   부모(#main)에서 이미 처리되지만 안전 강화 차원 */
-body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
-</style>
 <script id="loading-lifecycle-fix">
 (function(){
   'use strict';
   /* ════════════════════════════════════════════════════════════════
-     초기 로딩 깜빡임 완전 차단
-       증상: 앱을 처음 열면 '연속결석 분석' 섹션이 잠깐 보였다 사라지고
-             전체현황의 나머지 섹션이 채워지면서 화면이 바뀜
-       원인: #overview-extra-analysis(연속결석 분석 섹션)는 v78 패치가
-             DOMContentLoaded+100ms / load+400ms 시점에 단독으로 그려둠.
-             cover가 PIN 이전에 v28 polling에 의해 해제되거나, PIN 직후
-             cover 부착보다 paint가 먼저 일어나면 #main에서 유일하게
-             채워진 이 섹션만 노출되어 깜빡임 발생.
-       해결:
-         1) 스크립트 파싱 즉시 자체 클래스(llf-pin-loading)를 body에 부착
-            → 페이지 로드 시점부터 #main이 항상 visibility:hidden
-         2) 클래스는 v28의 release 영향을 받지 않음(독립 클래스)
-         3) PIN + loadFromDB 완료 + 동기 렌더(renderOverviewNow +
-            renderOverviewExtra) + 2 RAF 후에만 해제
+     초기 로딩 깜빡임 완전 차단 — 구조적 접근
+       증상: 대시보드 전체(연속결석 분석, 가족/가족외/일반 출석률 카드,
+             그 아래 차트 등)가 데이터 도착 전 빈 상태로 그려졌다가
+             데이터 도착 후 다시 그려지면서 깜빡임.
+       원인: 132개의 setTimeout 스케줄된 자동 렌더(v28/v77/v78/v85/v97/
+             v99/v107/v111/v115 등 다수 패치 누적)가 DCL/window.load
+             기준 +100ms~+4200ms에 걸쳐 발화. 각 호출은 데이터 상태와
+             무관하게 동작 → 데이터 도착 전엔 빈 값으로, 후엔 정상 값으로
+             다시 렌더하면서 깜빡임 발생.
+       해결 (구조적):
+         1) <body class="llf-pin-loading">을 정적 HTML에 박아 첫 paint
+            전부터 #main을 visibility:hidden으로 가림 (cover 표시).
+         2) PIN + loadFromDB 완료 + 데이터 준비 + window.load + 충분한
+            grace period(스케줄된 후속 렌더 흡수)가 모두 만족된 시점에만
+            cover 해제. 후속 setTimeout 렌더들은 cover 안에서 흡수됨.
+         3) v78의 renderOverviewExtra를 비롯한 모든 주요 렌더를 cover
+            해제 직전에 한 번 더 동기 호출하여 최종 상태 보장.
      ════════════════════════════════════════════════════════════════ */
   var PIN_CLASS = 'llf-pin-loading';
   var V97_CLASS = 'v97-data-loading';
@@ -12120,6 +12124,8 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
   var _pinSubmitted = false;
   var _loadCompleted = false;
   var _renderCommitted = false;
+  var _windowLoadAt = 0;
+  var _scheduled = false;
 
   function dataReady(){
     try{
@@ -12142,37 +12148,75 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
     }catch(e){}
   }
 
-  /* 스크립트 파싱 즉시 cover 부착 — body가 이미 존재하므로 동기로 가능.
-     이 시점부터 화면 전체가 cover 뒤에 가려져서, 첫 paint에서도 #main의
-     중간 상태(연속결석 분석만 채워진 화면 등)가 노출되지 않음. */
-  if(document.body){
+  // body 클래스는 정적 HTML에 박혀 있지만, 어떤 코드가 잘못 제거했을 경우 대비
+  if(document.body && !document.body.classList.contains(PIN_CLASS)){
     showCover();
-  } else {
-    // 만약 어떤 이유로 body가 아직 없으면 다음 microtask에 부착
-    setTimeout(showCover, 0);
+  }
+
+  window.addEventListener('load', function(){
+    _windowLoadAt = Date.now();
+  });
+
+  // 모든 주요 자동 렌더 함수를 한 번씩 동기 호출 — 최종 상태로 강제 합치기
+  function masterRender(){
+    var ov = document.getElementById('page-overview');
+    var isOverviewActive = ov && ov.classList.contains('active');
+    function call(name){
+      try{
+        if(typeof window[name] === 'function') window[name]();
+      }catch(e){ console.warn('[llf] '+name+' error', e); }
+    }
+    if(isOverviewActive){
+      // overview 본문: ov-metrics / ov-sections / type-cards
+      call('renderOverviewNow');
+      if(typeof window.renderOverviewNow !== 'function') call('renderOverview');
+      // v78의 연속결석 분석 섹션
+      call('renderOverviewExtra');
+    } else {
+      // 다른 페이지가 활성이면 그쪽도 동기 렌더 (드물지만 안전)
+      var p = ov && ov.classList ? '' : (document.querySelector('.page.active')?.id||'').replace('page-','');
+      try{ if(typeof window.renderPage === 'function' && p) window.renderPage(p); }catch(e){}
+    }
   }
 
   function commitRenderAndRelease(){
     if(!_pinSubmitted || !_loadCompleted) return;
     if(_renderCommitted) return;
-    // 동기 렌더 — overview 본문 + 연속결석 분석 섹션 모두 채운다
-    try{
-      var ov = document.getElementById('page-overview');
-      if(ov && ov.classList.contains('active')){
-        if(typeof window.renderOverviewNow === 'function') window.renderOverviewNow();
-        else if(typeof window.renderOverview === 'function') window.renderOverview();
-        // v78의 연속결석 분석 섹션을 명시적으로 동기 렌더 (window.renderOverview
-        // 체인이 후속 패치에 덮여 v78 wrapper가 끊긴 경우에도 보장)
-        if(typeof window.renderOverviewExtra === 'function'){
-          try{ window.renderOverviewExtra(); }catch(e){ console.warn('[llf] extra render', e); }
-        }
-      }
-    }catch(e){ console.warn('[llf] render error', e); }
+    if(_scheduled) return;
+    _scheduled = true;
+
+    // 1) 마스터 렌더 — 모든 섹션을 최종 데이터로 한 번에 그림
+    masterRender();
     _renderCommitted = true;
-    // 두 RAF 후 cover 해제 — DOM 업데이트가 paint에 반영된 뒤
-    requestAnimationFrame(function(){
-      requestAnimationFrame(hideCover);
-    });
+
+    // 2) Grace period — window.load 이후 스케줄된 후속 setTimeout 렌더들
+    //    (load+400ms / +1200ms / +1500ms / +2200ms / +3000ms / +4200ms 등)을
+    //    cover 안에서 흡수해야 깜빡임 없음. window.load + 1500ms 이상 대기.
+    //    동시에 commit 이후 최소 300ms 추가 grace.
+    function tryRelease(){
+      var now = Date.now();
+      var sinceLoad = _windowLoadAt ? (now - _windowLoadAt) : -1;
+      var needLoadFiredFor = 1500; // load 후 1.5초까지 발화하는 늦은 렌더 흡수
+      if(sinceLoad < 0){
+        // window.load 아직 안 발생 — 더 대기
+        setTimeout(tryRelease, 100);
+        return;
+      }
+      if(sinceLoad < needLoadFiredFor){
+        setTimeout(tryRelease, needLoadFiredFor - sinceLoad + 50);
+        return;
+      }
+      // 한 번 더 마스터 렌더로 최종 상태 확정 (grace 동안 후속 setTimeout이
+      // 무엇을 그렸든, 우리가 마지막으로 확정)
+      masterRender();
+      // 2 RAF로 paint 보장 후 해제
+      requestAnimationFrame(function(){
+        requestAnimationFrame(hideCover);
+      });
+    }
+    // commit 직후 최소 300ms는 무조건 대기 (즉시 release하면 v28 polling이
+    // 이미 호출한 비동기 렌더가 paint에 안 잡힐 수 있음)
+    setTimeout(tryRelease, 300);
   }
 
   // initApp 래핑 — 모든 PIN 변형(line 1184, 7211, 8892)이 결국 initApp을 호출함
@@ -12181,17 +12225,17 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
     if(typeof orig !== 'function') return false;
     if(orig.__llfWrapped) return true;
     window.initApp = function(){
-      // cover는 이미 body 부착 시 추가되었으므로 idempotent하게 재부착만
-      showCover();
+      showCover(); // idempotent
       _pinSubmitted = true;
       _renderCommitted = false;
+      _scheduled = false;
       return orig.apply(this, arguments);
     };
     window.initApp.__llfWrapped = true;
     return true;
   }
 
-  // loadFromDB 래핑 — 완료 후 동기 렌더 + cover 해제
+  // loadFromDB 래핑 — 완료 후 commit 트리거
   function wrapLoadFromDB(){
     var orig = window.loadFromDB;
     if(typeof orig !== 'function') return false;
@@ -12201,12 +12245,14 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
       try{ ret = await orig.apply(this, arguments); }
       catch(e){ console.error('[llf] loadFromDB error', e); }
       _loadCompleted = true;
-      // 데이터가 있으면 즉시 commit, 없으면 짧게 폴링
+      // 데이터가 들어왔는지 폴링 후 commit
       var t0 = Date.now();
-      (function tryCommit(){
-        if(dataReady()){ commitRenderAndRelease(); return; }
-        if(Date.now() - t0 > 3000){ commitRenderAndRelease(); return; } // 안전장치
-        setTimeout(tryCommit, 50);
+      (function waitData(){
+        if(dataReady() || Date.now() - t0 > 3000){
+          commitRenderAndRelease();
+          return;
+        }
+        setTimeout(waitData, 50);
       })();
       return ret;
     };
@@ -12214,7 +12260,7 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
     return true;
   }
 
-  // 두 함수 모두 늦게 정의/재정의될 수 있으니 폴링하며 wrap 유지
+  // initApp/loadFromDB가 후속 패치에 의해 교체되면 다시 wrap
   var tries = 0;
   var iv = setInterval(function(){
     var pinOk = wrapInitApp();
@@ -12224,10 +12270,10 @@ body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
     if((pinOk && loadOk) || ++tries > 200) clearInterval(iv);
   }, 30);
 
-  // 안전장치: 어떤 이유로든 20초 후엔 무조건 해제
+  // 안전장치: 어떤 이유로든 25초 후엔 무조건 해제
   setTimeout(function(){
     hideCover();
-  }, 20000);
+  }, 25000);
 
   console.log('[loading-lifecycle-fix] loaded');
 })();
