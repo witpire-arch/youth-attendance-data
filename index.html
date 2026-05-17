@@ -32,14 +32,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .login-box .logo svg{width:22px;height:22px;fill:white}
 .login-box h2{font-size:18px;font-weight:700;margin-bottom:4px}
 .login-box p{font-size:12px;color:var(--text3);margin-bottom:24px}
-.login-dots{display:flex;justify-content:center;gap:10px;margin-bottom:20px}
-.dot-inp{width:14px;height:14px;border-radius:50%;background:var(--surface2);border:2px solid var(--border-md);transition:.15s}
-.dot-inp.filled{background:var(--text);border-color:var(--text)}
-.pin-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
-.pin-btn{padding:18px 0;font-size:18px;font-weight:600;border:1px solid var(--border-md);border-radius:var(--r);background:var(--surface);cursor:pointer;font-family:var(--font);transition:.12s;-webkit-tap-highlight-color:transparent;touch-action:manipulation;user-select:none}
-.pin-btn:hover{background:var(--surface2)}
-.pin-btn:active{background:var(--text);color:#fff}
-.pin-error{font-size:12px;color:var(--red);height:16px;margin-top:4px}
 
 /* LAYOUT */
 #app{display:flex;height:100vh;overflow:hidden;display:none}
@@ -1074,7 +1066,6 @@ body.llf-pin-loading::before{
     <button class="adm-tab" onclick="admTab('target',this)" style="display:none">타겟 업로드</button>
     <button class="adm-tab" onclick="admTab('roster',this)">구성원 관리</button>
     <button class="adm-tab" onclick="admTab('allowedusers',this)">허용 사용자</button>
-    <button class="adm-tab" onclick="admTab('password',this)" style="display:none">비밀번호 설정</button>
   </div>
 
   <div id="adm-upload">
@@ -1198,32 +1189,6 @@ body.llf-pin-loading::before{
     </div>
   </div>
 
-  <div id="adm-password" style="display:none">
-    <div class="card" style="max-width:720px">
-      <div class="ct">로그인 비밀번호 설정 <span style="font-size:11px;font-weight:400;color:var(--text3)">관리자만 변경 가능</span></div>
-      <div class="info-box amber" style="font-size:11.5px">
-        변경한 비밀번호는 이 기기에는 즉시 저장되고, Firebase 연결 시 다른 기기에도 동기화됩니다.<br>
-        4자리 숫자로 입력해주세요.
-      </div>
-      <div class="g2" style="margin-top:12px">
-        <div class="fg"><label class="fl">관리자 비밀번호</label><input class="fc" id="pin-admin" maxlength="4" inputmode="numeric" placeholder="4자리 숫자"></div>
-        <div class="fg"><label class="fl">도봉</label><input class="fc pin-region" data-region="도봉" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">성북</label><input class="fc pin-region" data-region="성북" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">노원</label><input class="fc pin-region" data-region="노원" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">중랑</label><input class="fc pin-region" data-region="중랑" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">강북</label><input class="fc pin-region" data-region="강북" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">대학</label><input class="fc pin-region" data-region="대학" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">새신자</label><input class="fc pin-region" data-region="새신자" maxlength="4" inputmode="numeric"></div>
-        <div class="fg"><label class="fl">이음</label><input class="fc pin-region" data-region="이음" maxlength="4" inputmode="numeric"></div>
-      </div>
-      <div class="mf">
-        <button class="btn" onclick="renderPinSettings()">새로고침</button>
-        <button class="btn btn-primary" onclick="savePinSettings()">비밀번호 저장</button>
-      </div>
-      <div id="pin-settings-log" style="margin-top:10px;font-size:12px;color:var(--text3)"></div>
-    </div>
-  </div>
-
   <div id="adm-roster" style="display:none">
     <div style="display:flex;gap:7px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
       <input type="text" class="fc" id="roster-search" placeholder="이름/번호 검색..." oninput="renderRoster()" style="width:150px;height:30px">
@@ -1262,19 +1227,8 @@ body.llf-pin-loading::before{
 
 <script>
 // ══════════════════════════════════════════
-// PIN / 지역별 로그인
+// 로그인 (Google Sign-In) — 자세한 흐름은 파일 끝 GOOGLE_AUTH 블록 참조
 // ══════════════════════════════════════════
-const REGION_PINS = {
-  '0314': { role: 'admin', region: null,    label: '관리자' },
-  '0101': { role: 'region', region: '도봉', label: '도봉' },
-  '0202': { role: 'region', region: '성북', label: '성북' },
-  '0303': { role: 'region', region: '노원', label: '노원' },
-  '0404': { role: 'region', region: '중랑', label: '중랑' },
-  '0505': { role: 'region', region: '강북', label: '강북' },
-  '0606': { role: 'region', region: '대학', label: '대학' },
-  '0707': { role: 'region', region: '새신자', label: '새신자' },
-  '0808': { role: 'region', region: '이음', label: '이음' },
-};
 
 // 로그인 사용자 정보. Google 로그인 후 google-auth 스크립트가 채움.
 // shape: { role: 'admin'|'region', region: string|null, label, email, name }
@@ -1315,46 +1269,6 @@ function avgPct1(sum, count){
   if(!c || !Number.isFinite(s) || !Number.isFinite(c)) return 0;
   return Math.round((s / c) * 10) / 10;
 }
-
-function doPinSubmit() {
-  const val = (document.getElementById('pin-input-field').value || '').trim();
-  const user = REGION_PINS[val];
-  if (user) {
-    currentUser = user;
-    document.getElementById('login-screen').style.display = 'none';
-    document.getElementById('app').style.display = 'flex';
-    // 관리자 메뉴 표시 여부
-    const adminNav = document.getElementById('admin-nav-section');
-    if (adminNav) adminNav.style.display = user.role === 'admin' ? '' : 'none';
-    // 로그인 배지
-    const badge = document.getElementById('sb-login-badge');
-    if (badge) badge.textContent = user.role === 'admin' ? '👑 관리자' : `📍 ${user.label}`;
-    initApp();
-  } else {
-    const err = document.getElementById('pin-error');
-    err.textContent = val.length === 0 ? '번호를 입력하세요' : '핀 번호가 틀렸습니다';
-    document.getElementById('pin-input-field').value = '';
-    setTimeout(() => err.textContent = '', 1800);
-  }
-}
-
-window.addEventListener('load', function() {
-  // Firebase는 스크립트 로드 즉시 초기화됨 (위쪽 initSupabase() 호출). 여기서는 PIN UI만 바인딩
-  const btn = document.getElementById('pin-confirm-btn');
-  const inp = document.getElementById('pin-input-field');
-  if (btn) {
-    btn.addEventListener('click', doPinSubmit);
-    btn.addEventListener('touchend', function(e){ e.preventDefault(); doPinSubmit(); });
-  }
-  if (inp) {
-    inp.addEventListener('input', function(){
-      this.value = this.value.replace(/[^0-9]/g,'');
-      if(this.value.length===4) doPinSubmit();
-    });
-    inp.addEventListener('keydown', function(e){ if(e.key==='Enter') doPinSubmit(); });
-    inp.focus();
-  }
-});
 
 
 // ══════════════════════════════════════════
@@ -7414,62 +7328,9 @@ function renderWeekCompare() {
 
 
 <!-- V73_LOGIN_STREAK_FIXED_START -->
+<!-- PIN 로그인 부분(cleanPin/doPinSubmit/bindLogin)은 Google 로그인 전환과 함께 제거됨 -->
 <script>
 (function(){
-  // 1) 모바일 파일뷰어에서도 PIN 확인이 확실히 동작하도록 로그인 로직을 다시 고정
-  function cleanPin(){
-    var inp=document.getElementById('pin-input-field');
-    if(!inp) return '';
-    inp.value=String(inp.value||'').replace(/[^0-9]/g,'').slice(0,4);
-    return inp.value;
-  }
-  window.doPinSubmit=function(){
-    var val=cleanPin();
-    var pins=window.REGION_PINS || REGION_PINS;
-    var user=pins && pins[val];
-    var err=document.getElementById('pin-error');
-    if(!user){
-      if(err) err.textContent = val.length===0 ? '번호를 입력하세요' : '핀 번호가 틀렸습니다';
-      var inp=document.getElementById('pin-input-field'); if(inp) inp.value='';
-      setTimeout(function(){ if(err) err.textContent=''; },1600);
-      return false;
-    }
-    window.currentUser=user; currentUser=user;
-    var login=document.getElementById('login-screen'); if(login) login.style.display='none';
-    var app=document.getElementById('app'); if(app) app.style.display='flex';
-    var adminNav=document.getElementById('admin-nav-section'); if(adminNav) adminNav.style.display=user.role==='admin'?'':'none';
-    var badge=document.getElementById('sb-login-badge'); if(badge) badge.textContent=user.role==='admin'?'👑 관리자':'📍 '+user.label;
-    if(typeof initApp==='function'){
-    try{ initApp(); }catch(e){ 
-      console.error('initApp error', e);
-      // 비치명적 오류는 무시하고 계속 진행
-      try{ loadFromDB(); }catch(e2){}
-    }
-  } else {
-    // initApp 아직 로드 안됨 - 잠시 후 재시도
-    setTimeout(function(){
-      if(typeof initApp==='function') try{initApp();}catch(e){try{loadFromDB();}catch(e2){}}
-      else try{loadFromDB();}catch(e){}
-    }, 300);
-  }
-    return false;
-  };
-  function bindLogin(){
-    var btn=document.getElementById('pin-confirm-btn');
-    var inp=document.getElementById('pin-input-field');
-    if(btn){
-      btn.onclick=function(e){ if(e) e.preventDefault(); return window.doPinSubmit(); };
-      btn.ontouchend=function(e){ if(e) e.preventDefault(); return window.doPinSubmit(); };
-    }
-    if(inp){
-      inp.oninput=function(){ cleanPin(); if(this.value.length===4) setTimeout(window.doPinSubmit,80); };
-      inp.onkeydown=function(e){ if(e.key==='Enter') window.doPinSubmit(); };
-      setTimeout(function(){ try{inp.focus();}catch(_){} },200);
-    }
-  }
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',bindLogin); else bindLogin();
-  window.addEventListener('load',bindLogin);
-
   function latestRecordFor(id){
     return (RECORDS||[]).filter(function(r){return r.id===id && r.date;})
       .sort(function(a,b){return String(a.date).localeCompare(String(b.date));}).pop() || null;
@@ -9017,130 +8878,7 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
 <!-- V78_OVERVIEW_STREAK_REASON_NO_TAB_END -->
 
 
-<!-- V79_PASSWORD_SETTINGS_START -->
-<script>
-(function(){
-  var DEFAULT_PIN_SETTINGS = {
-    admin: '0314',
-    regions: {
-      '도봉':'0101','성북':'0202','노원':'0303','중랑':'0404',
-      '강북':'0505','대학':'0606','새신자':'0707','이음':'0808'
-    }
-  };
-  var LS_KEY='att_pin_settings_v1';
-  function clone(o){return JSON.parse(JSON.stringify(o));}
-  function only4(v){return String(v||'').replace(/[^0-9]/g,'').slice(0,4);}
-  function getPinSettings(){
-    var base=clone(DEFAULT_PIN_SETTINGS);
-    try{
-      var saved=JSON.parse(localStorage.getItem(LS_KEY)||'null');
-      if(saved){
-        if(only4(saved.admin).length===4) base.admin=only4(saved.admin);
-        if(saved.regions){ Object.keys(base.regions).forEach(function(r){ var v=only4(saved.regions[r]); if(v.length===4) base.regions[r]=v; }); }
-      }
-    }catch(e){}
-    return base;
-  }
-  function buildPins(){
-    var st=getPinSettings(), pins={};
-    pins[st.admin]={role:'admin',region:null,label:'관리자'};
-    Object.keys(st.regions).forEach(function(r){ pins[st.regions[r]]={role:'region',region:r,label:r}; });
-    return pins;
-  }
-  function applyPins(){ window.REGION_PINS=buildPins(); return window.REGION_PINS; }
-  function saveLocal(st){ localStorage.setItem(LS_KEY, JSON.stringify(st)); applyPins(); }
-  async function loadPinsFromDB(){
-    try{
-      if(!window.fbDB && typeof fbDB!=='undefined') window.fbDB=fbDB;
-      var db=window.fbDB || (typeof fbDB!=='undefined' ? fbDB : null);
-      if(!db) return;
-      var snap=await db.ref('settings/pins').once('value');
-      if(snap.exists()) { saveLocal(snap.val()); if(typeof window.renderPinSettings==='function') window.renderPinSettings(); }
-    }catch(e){ console.warn('PIN DB load failed',e); }
-  }
-  async function savePinsToDB(st){
-    try{
-      if(!window.fbDB && typeof fbDB!=='undefined') window.fbDB=fbDB;
-      var db=window.fbDB || (typeof fbDB!=='undefined' ? fbDB : null);
-      if(db) await db.ref('settings/pins').set(st);
-      return true;
-    }catch(e){ console.warn('PIN DB save failed',e); return false; }
-  }
-  window.renderPinSettings=function(){
-    var st=getPinSettings();
-    var admin=document.getElementById('pin-admin'); if(admin) admin.value=st.admin;
-    Array.prototype.forEach.call(document.querySelectorAll('.pin-region'),function(inp){ inp.value=st.regions[inp.dataset.region]||''; });
-    var log=document.getElementById('pin-settings-log'); if(log) log.textContent='현재 설정을 불러왔습니다.';
-  };
-  window.savePinSettings=async function(){
-    var st={admin:'',regions:{}};
-    var admin=only4((document.getElementById('pin-admin')||{}).value);
-    if(admin.length!==4){ alert('관리자 비밀번호는 4자리 숫자로 입력해주세요.'); return; }
-    st.admin=admin;
-    var dup={}; dup[admin]='관리자';
-    var ok=true, msg='';
-    Array.prototype.forEach.call(document.querySelectorAll('.pin-region'),function(inp){
-      var r=inp.dataset.region, v=only4(inp.value); inp.value=v;
-      if(v.length!==4){ ok=false; msg=r+' 비밀번호를 4자리 숫자로 입력해주세요.'; return; }
-      if(dup[v]){ ok=false; msg='비밀번호가 중복되었습니다: '+dup[v]+' / '+r; return; }
-      dup[v]=r; st.regions[r]=v;
-    });
-    if(!ok){ alert(msg); return; }
-    saveLocal(st);
-    var synced=await savePinsToDB(st);
-    var log=document.getElementById('pin-settings-log');
-    if(log) log.textContent=synced ? '저장 완료! Firebase에도 동기화되었습니다.' : '저장 완료! Firebase 연결 전이라 이 기기에 먼저 저장되었습니다.';
-    if(typeof toast==='function') toast('비밀번호 저장 완료');
-    else alert('비밀번호 저장 완료');
-  };
-  // admTab 확장: 비밀번호 설정 탭 추가
-  var prevAdm=window.admTab;
-  window.admTab=function(tab,btn){
-    ['upload','target','roster','password'].forEach(function(t){var el=document.getElementById('adm-'+t);if(el)el.style.display='none';});
-    document.querySelectorAll('.adm-tab').forEach(function(b){b.classList.remove('on');});
-    var el=document.getElementById('adm-'+tab); if(el) el.style.display='';
-    if(btn) btn.classList.add('on');
-    if(tab==='roster' && typeof renderRoster==='function') renderRoster();
-    if(tab==='password') setTimeout(window.renderPinSettings,0);
-  };
-  // 로그인 로직 확장: 변경된 비밀번호 우선 사용
-  applyPins();
-  window.doPinSubmit=function(){
-    var inp=document.getElementById('pin-input-field');
-    var val=only4(inp && inp.value); if(inp) inp.value=val;
-    var pins=applyPins();
-    var user=pins[val];
-    var err=document.getElementById('pin-error');
-    if(!user){
-      if(err) err.textContent = val.length===0 ? '번호를 입력하세요' : '핀 번호가 틀렸습니다';
-      if(inp) inp.value='';
-      setTimeout(function(){ if(err) err.textContent=''; },1600);
-      return false;
-    }
-    window.currentUser=user; try{ currentUser=user; }catch(e){}
-    var login=document.getElementById('login-screen'); if(login) login.style.display='none';
-    var app=document.getElementById('app'); if(app) app.style.display='flex';
-    var adminNav=document.getElementById('admin-nav-section'); if(adminNav) adminNav.style.display=user.role==='admin'?'':'none';
-    var badge=document.getElementById('sb-login-badge'); if(badge) badge.textContent=user.role==='admin'?'👑 관리자':'📍 '+user.label;
-    try{ initApp(); }catch(e){ console.error('initApp error', e); alert('초기화 오류: '+(e&&e.message?e.message:e)); }
-    return false;
-  };
-  function bindPwInputs(){
-    Array.prototype.forEach.call(document.querySelectorAll('#adm-password input'),function(inp){
-      inp.addEventListener('input',function(){ this.value=only4(this.value); });
-    });
-  }
-  function bindLogin(){
-    var btn=document.getElementById('pin-confirm-btn'), inp=document.getElementById('pin-input-field');
-    if(btn){ btn.onclick=function(e){ if(e)e.preventDefault(); return window.doPinSubmit(); }; btn.ontouchend=btn.onclick; }
-    if(inp){ inp.oninput=function(){ this.value=only4(this.value); if(this.value.length===4) setTimeout(window.doPinSubmit,60); }; inp.onkeydown=function(e){ if(e.key==='Enter') window.doPinSubmit(); }; }
-  }
-  // PIN 로그인 제거됨 — Google 로그인으로 교체. bindLogin/loadPinsFromDB 자동 호출 차단
-  // (관련 함수와 DOM 요소가 존재하지 않으므로 호출되어도 안전하지만, 명시적으로 비활성화)
-  if(false){bindLogin();bindPwInputs();}
-})();
-</script>
-<!-- V79_PASSWORD_SETTINGS_END -->
+<!-- V79_PASSWORD_SETTINGS (PIN 기능) — Google 로그인 전환으로 전체 제거됨 -->
 
 
 
@@ -12942,8 +12680,8 @@ console.log('[MFV2] Loaded');
     if(typeof orig !== 'function') return false;
     if(orig.__authWrapped) return true;
     window.admTab = function(tab, btn){
-      // 기존 탭 비활성화 (allowedusers 포함)
-      ['upload','target','roster','password','allowedusers'].forEach(function(t){
+      // 기존 탭 비활성화
+      ['upload','target','roster','allowedusers'].forEach(function(t){
         var el = document.getElementById('adm-' + t);
         if(el) el.style.display = 'none';
       });
@@ -12952,7 +12690,6 @@ console.log('[MFV2] Loaded');
       if(el) el.style.display = '';
       if(btn) btn.classList.add('on');
       if(tab === 'roster' && typeof window.renderRoster === 'function') window.renderRoster();
-      if(tab === 'password' && typeof window.renderPinSettings === 'function') setTimeout(window.renderPinSettings, 0);
       if(tab === 'allowedusers'){
         bindRoleRadios();
         setTimeout(window.renderAllowedUsers, 0);
