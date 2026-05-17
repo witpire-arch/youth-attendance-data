@@ -5585,8 +5585,8 @@ function renderWeekCompare() {
       const _qrCnt=_allRecs.filter(r=>r&&(selectedDate?r.date===selectedDate:r.date&&r.date.startsWith(mo))&&r.st==='QR인증');
       const _qrTotal=[...new Set(_qrCnt.map(r=>r.id))].length;
       summary.innerHTML=`
+        <div class="mc"><div class="lbl">인증출석 목표 대상 (총 인원수)</div><div class="val">${data.length}<span style="font-size:12px">명</span></div><div class="sub">${selectedDate || mo} 기준 · 사유출석자</div></div>
         <div class="mc"><div class="lbl">총 인증출석</div><div class="val">${_certTotal}<span style="font-size:12px">명</span></div><div class="sub">QR ${_qrTotal}명 + 사유출석 ${data.length}명</div></div>
-        <div class="mc"><div class="lbl">사유출석 인원</div><div class="val">${data.length}<span style="font-size:12px">명</span></div><div class="sub">${selectedDate || mo} 기준</div></div>
         <div class="mc"><div class="lbl">타겟 설정</div><div class="val">${targetCnt}</div></div>
         <div class="mc"><div class="lbl">타겟 미설정</div><div class="val">${data.length-targetCnt}</div></div>
       `;
