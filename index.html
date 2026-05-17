@@ -461,6 +461,11 @@ select.fc{cursor:pointer}
 body.llf-pin-loading #main{visibility:hidden !important;}
 body.llf-pin-loading #v97-loading-cover{display:flex !important;flex-direction:column;gap:14px;}
 body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
+/* 인증 상태가 결정될 때까지 로그인/접근거부/앱 화면 모두 강제로 숨김 */
+/* (cover만 보이게 함 — 무한 리다이렉트 루프 차단의 핵심) */
+body:not(.llf-auth-resolved) #login-screen{display:none !important;}
+body:not(.llf-auth-resolved) #access-denied-screen{display:none !important;}
+body:not(.llf-auth-resolved) #app{display:none !important;}
 #v97-loading-cover::before{
   content:"";
   width:36px;height:36px;
@@ -12363,17 +12368,25 @@ console.log('[MFV2] Loaded');
   var _bootstrapChecked = false; // 부트스트랩 체크를 한 번이라도 했는가
 
   function $(id){ return document.getElementById(id); }
+  function dropDataLoadingCovers(){
+    // 인증이 결정된 후 — 로그인 화면이나 접근거부 화면을 보여줄 때는
+    // 데이터 로딩 cover를 내려야 함 (initApp 경로가 아니므로 cover를 해제할 사람이 없음)
+    try{ document.body.classList.remove('llf-pin-loading'); }catch(e){}
+    try{ document.body.classList.remove('v97-data-loading'); }catch(e){}
+  }
   function showLoginScreen(){
     var l = $('login-screen'); if(l) l.style.display = 'flex';
     var d = $('access-denied-screen'); if(d) d.classList.remove('show');
     var a = $('app'); if(a) a.style.display = 'none';
     var box = $('sb-user-box'); if(box) box.style.display = 'none';
+    dropDataLoadingCovers();
   }
   function showAccessDenied(email){
     var l = $('login-screen'); if(l) l.style.display = 'none';
     var d = $('access-denied-screen'); if(d) d.classList.add('show');
     var a = $('app'); if(a) a.style.display = 'none';
     var e = $('denied-email'); if(e) e.textContent = email || '';
+    dropDataLoadingCovers();
   }
   function showApp(){
     var l = $('login-screen'); if(l) l.style.display = 'none';
@@ -12583,44 +12596,78 @@ console.log('[MFV2] Loaded');
   setTimeout(bindButtons, 100);
   setTimeout(bindButtons, 500);
 
-  // Firebase Auth SDK가 로드되면: (1) 리다이렉트 결과 먼저 처리 → (2) 인증 상태 리스너 등록
-  // 리다이렉트로 돌아온 직후엔 getRedirectResult가 user를 반환하고, 곧이어 onAuthStateChanged도
-  // 동일 user로 발화함. handleAuthChange는 _appStarted 가드로 중복 진입을 방지하므로 안전.
-  waitForAuthSDK(60)
-    .then(function(){
-      var btn = $('google-signin-btn');
-      // (1) 리다이렉트 복귀인지 먼저 판별 — 복귀 중엔 로그인 화면이 깜빡이지 않도록
-      //     로그인 버튼은 로딩 상태로 유지하고 cover는 lifecycle이 들고 있음.
-      try{
-        firebase.auth().getRedirectResult()
-          .then(function(result){
-            if(result && result.user){
-              console.log('[auth] redirect 복귀 — 로그인 성공:', result.user.email);
-              // 이후 onAuthStateChanged가 같은 user로 발화하여 handleAuthChange 진행
-              // 여기서는 화면 처리를 하지 않음 (단일 진입점 유지)
-            }
-            // result가 null이면 일반 페이지 로드 (리다이렉트 복귀 아님)
-          })
-          .catch(function(err){
-            // auth/no-auth-event 는 일반 로드 시 정상 — 로그하지 않음
-            if(err && err.code && err.code !== 'auth/no-auth-event'){
-              console.error('[auth] redirect 결과 오류:', err);
-              setLoginError('로그인 실패: ' + (err.message || err));
-              _signingIn = false;
-              if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
-            }
-          });
-      }catch(e){
-        console.error('[auth] getRedirectResult 호출 실패:', e);
-      }
-      // (2) 인증 상태 리스너 — 리다이렉트 복귀 시점에 자동 발화하여 앱 진입
+  // ════════════════════════════════════════════════════════════════
+  // 인증 초기화 — 무한 리다이렉트 루프 차단의 핵심
+  //   문제: 리다이렉트 복귀 시 Firebase의 auth 상태 복원은 비동기.
+  //         페이지 로드 직후 currentUser를 읽으면 null로 보여서
+  //         로그인 화면이 깜빡 → 사용자가 다시 누름 → 또 리다이렉트 → 루프.
+  //   해결: getRedirectResult()와 첫 onAuthStateChanged 발화 모두를
+  //         await한 뒤에야 비로소 'llf-auth-resolved' 클래스를 부착하고
+  //         화면을 결정. 그 전에는 로그인/앱/거부 화면 모두 CSS로 강제 숨김.
+  //   signInWithRedirect는 절대 자동 호출하지 않음 — 오직 버튼 클릭에서만.
+  // ════════════════════════════════════════════════════════════════
+  function applyAuthResolved(){
+    try{ document.body.classList.add('llf-auth-resolved'); }catch(e){}
+  }
+
+  function initAuth(){
+    // (1) 리다이렉트 결과 처리 — 복귀했으면 result.user가 채워짐
+    var rrPromise;
+    try{
+      rrPromise = firebase.auth().getRedirectResult()
+        .then(function(result){
+          if(result && result.user){
+            console.log('[auth] redirect 복귀 — 로그인 성공:', result.user.email);
+          }
+          return result;
+        })
+        .catch(function(err){
+          if(err && err.code && err.code !== 'auth/no-auth-event'){
+            console.error('[auth] redirect 결과 오류:', err);
+            setLoginError('로그인 실패: ' + (err.message || err));
+          }
+          return null;
+        });
+    }catch(e){
+      console.error('[auth] getRedirectResult 호출 실패:', e);
+      rrPromise = Promise.resolve(null);
+    }
+
+    // (2) 첫 onAuthStateChanged 발화를 기다림 — 이게 발화해야 auth가 완전히 복원된 것
+    //     첫 발화만 받고 구독 해제, 이후 (3)에서 본 리스너 등록.
+    var firstAuthPromise = new Promise(function(resolve){
+      var unsubscribe = firebase.auth().onAuthStateChanged(
+        function(user){
+          try{ unsubscribe(); }catch(e){}
+          resolve(user);
+        },
+        function(err){
+          console.error('[auth] onAuthStateChanged 초기 오류:', err);
+          resolve(null);
+        }
+      );
+    });
+
+    // (3) 둘 다 settle된 후에만 화면 결정 → 결과적으로 cover가 풀리고 로그인/앱 표시
+    Promise.all([rrPromise, firstAuthPromise]).then(function(){
+      applyAuthResolved();
+      var user = firebase.auth().currentUser; // 이 시점엔 최종 상태
+      handleAuthChange(user);
+      // 이후 변화(로그아웃/재로그인)는 일반 리스너로 처리
       firebase.auth().onAuthStateChanged(handleAuthChange, function(err){
         console.error('[auth] onAuthStateChanged 오류:', err);
       });
-    })
+    });
+  }
+
+  waitForAuthSDK(60)
+    .then(initAuth)
     .catch(function(err){
       console.error('[auth] Firebase Auth SDK 로드 실패:', err);
       setLoginError('Firebase Auth 로드 실패. 새로고침 해주세요.');
+      // SDK 자체가 안 떴을 때라도 로그인 화면을 보여줘서 사용자가 새로고침할 수 있게
+      applyAuthResolved();
+      showLoginScreen();
     });
 
   // 외부에서 호출 가능하도록 노출
