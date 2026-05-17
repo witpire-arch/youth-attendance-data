@@ -860,8 +860,9 @@ body.llf-pin-loading::before{
     <div class="card" style="margin-bottom:14px">
       <div class="ct">습관성 결석자 타겟 현황 <span style="font-size:11px;font-weight:400;color:var(--text3)">타겟 인원 요약</span>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          <select class="fc" id="hs-reg" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"><option value="">전체 지역</option></select>
-          <select class="fc" id="hs-month" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"></select>
+          <select class="fc" id="hs-reg" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto;min-width:110px"><option value="">전체 지역</option></select>
+          <select class="fc" id="hs-zone" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto;min-width:120px"><option value="">전체 팀-구역</option></select>
+          <select class="fc" id="hs-month" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto;min-width:110px"></select>
           <button class="btn btn-primary" onclick="renderHabitTargetStatus()">현황 조회</button>
         </div>
       </div>
@@ -4245,6 +4246,7 @@ function saveHabitDetailPlan(id) {
 function renderHabitTargetStatus(){
   const moSel = document.getElementById('hs-month');
   const regSel = document.getElementById('hs-reg');
+  const zoneSel = document.getElementById('hs-zone');
   if(!moSel || !regSel) return;
   const cur = curMonth();
   const allMo = [...new Set([cur, ...RECORDS.map(r => (r.date||'').slice(0,7))])].filter(Boolean).sort().reverse();
@@ -4262,18 +4264,49 @@ function renderHabitTargetStatus(){
   if(typeof currentUser !== 'undefined' && currentUser && currentUser.role !== 'admin' && currentUser.region){
     scoped = scoped.filter(m => m.region === currentUser.region);
   }
+
+  // 지역 옵션
   const regs = [...new Set(scoped.map(m=>m.region).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ko'));
   if(regSel.dataset.loaded !== regs.join('|')){
     const keep = regSel.value;
     regSel.innerHTML = '<option value="">전체 지역</option>' + regs.map(r=>`<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('');
     regSel.dataset.loaded = regs.join('|');
     if(regs.includes(keep)) regSel.value = keep;
+    // 지역 계정이고 옵션이 하나뿐이면 자동 선택
+    if((!regSel.value || !regs.includes(regSel.value)) && regs.length===1) regSel.value = regs[0];
   }
   const regFilter = regSel.value || '';
+
+  // 팀-구역 옵션 (선택된 지역 기준으로 동적 재구성)
+  function teamZoneKey(m){
+    const raw = (m.team||'') + '-' + (m.zone||'');
+    return (typeof normalizeTeamZone==='function') ? normalizeTeamZone(raw) : String(raw).trim();
+  }
+  if(zoneSel){
+    const zoneSrc = scoped.filter(m => !regFilter || m.region===regFilter);
+    const zones = [...new Set(zoneSrc.map(teamZoneKey).filter(Boolean))].sort((a,b) => {
+      const pa = a.split('-'), pb = b.split('-');
+      const ta = parseInt(pa[0],10), tb = parseInt(pb[0],10);
+      if(!isNaN(ta) && !isNaN(tb) && ta!==tb) return ta - tb;
+      const za = parseInt(pa[1],10), zb = parseInt(pb[1],10);
+      if(!isNaN(za) && !isNaN(zb) && za!==zb) return za - zb;
+      return a.localeCompare(b,'ko');
+    });
+    const zoneSig = regFilter + '||' + zones.join('|');
+    if(zoneSel.dataset.loaded !== zoneSig){
+      const keep = zoneSel.value;
+      zoneSel.innerHTML = '<option value="">전체 팀-구역</option>' + zones.map(z=>`<option value="${escapeHtml(z)}">${escapeHtml(z)}</option>`).join('');
+      zoneSel.dataset.loaded = zoneSig;
+      // 지역이 바뀌면 zone 선택값 초기화, 동일 지역이면 보존
+      if(zones.includes(keep)) zoneSel.value = keep; else zoneSel.value = '';
+    }
+  }
+  const zoneFilter = zoneSel ? (zoneSel.value || '') : '';
 
   const targets = (typeof getTargets==='function') ? getTargets() : {};
   let targetMembers = scoped.filter(m => targets[m.id+'_habit']);
   if(regFilter) targetMembers = targetMembers.filter(m => m.region===regFilter);
+  if(zoneFilter) targetMembers = targetMembers.filter(m => teamZoneKey(m)===zoneFilter);
 
   const totalCard = document.getElementById('hs-total-card');
   const detailGrid = document.getElementById('hs-detail-grid');
@@ -4283,7 +4316,7 @@ function renderHabitTargetStatus(){
 
   // 1. 총 타겟 인원
   if(totalCard){
-    totalCard.innerHTML = `<div class="mc"><div class="lbl">총 타겟 인원</div><div class="val">${targetMembers.length}<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">${mo} 기준${regFilter?' · '+escapeHtml(regFilter):''}</div></div>`;
+    totalCard.innerHTML = `<div class="mc"><div class="lbl">총 타겟 인원</div><div class="val">${targetMembers.length}<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">${mo} 기준${regFilter?' · '+escapeHtml(regFilter):''}${zoneFilter?' · '+escapeHtml(zoneFilter):''}</div></div>`;
   }
 
   if(!targetMembers.length){
