@@ -825,7 +825,7 @@ select.fc{cursor:pointer}
       <div id="habit-count-summary" class="mg" style="grid-template-columns:repeat(3,1fr);margin:10px 0 12px"></div>
       <div id="habit-list" style="display:none">
         <div class="tw"><table>
-          <thead><tr><th>타겟</th><th>지역</th><th>팀-구역</th><th>이름</th><th>유형</th><th>출석 유형 (세부 유형)</th><th>마지막 예배일</th></tr></thead>
+          <thead><tr><th>타겟</th><th>지역</th><th>팀-구역</th><th>이름</th><th>유형</th><th>출석 유형 (세부 유형)</th><th>월 목표</th></tr></thead>
           <tbody id="habit-body"></tbody>
         </table></div>
       </div>
@@ -7911,9 +7911,9 @@ body.v97-data-loading #login-screen{z-index:9999;}
     var note=document.querySelector('#rt-habit .ct span');
     if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·사유결석자 자동 제외';
     var ths=document.querySelectorAll('#rt-habit table thead th');
-    // 7컬럼: 타겟/지역/팀-구역/이름/유형/세부유형/마지막예배일
+    // 7컬럼: 타겟/지역/팀-구역/이름/유형/세부유형/월목표
     if(ths&&ths[5]) { ths[5].textContent='출석 유형 (세부 유형)'; ths[5].style.display=''; }
-    if(ths&&ths[6]) { ths[6].textContent='마지막 예배일'; ths[6].style.display=''; }
+    if(ths&&ths[6]) { ths[6].textContent='월 목표'; ths[6].style.display=''; }
     if(ths&&ths[7]) { ths[7].textContent=''; ths[7].style.display='none'; }
   }
   window.getHabitData=function(){
@@ -9170,7 +9170,7 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
   function ensureUI(){
     var s=document.getElementById('habit-st'); if(s)s.innerHTML=['','QR인증','인증안함','인증오류','대체예배','온라인예배','사유결석','전월 기록 없음'].map(function(v,i){return '<option value="'+esc(v)+'">'+(i?esc(v):'전체 출석 유형')+'</option>';}).join('');
     var note=document.querySelector('#rt-habit .ct span'); if(note)note.textContent='전월 기준 매주 QR인증·인증안함·인증오류·대체예배 제외';
-    var ths=document.querySelectorAll('#rt-habit table thead th'); if(ths[5]){ths[5].textContent='출석 유형 (세부 유형)';ths[5].style.display='';} if(ths[6]){ths[6].textContent='마지막 예배일';ths[6].style.display='';} if(ths[7]){ths[7].textContent='';ths[7].style.display='none';}
+    var ths=document.querySelectorAll('#rt-habit table thead th'); if(ths[5]){ths[5].textContent='출석 유형 (세부 유형)';ths[5].style.display='';} if(ths[6]){ths[6].textContent='월 목표';ths[6].style.display='';} if(ths[7]){ths[7].textContent='';ths[7].style.display='none';}
   }
   window.getHabitData=function(){
     ensureUI();
@@ -10632,7 +10632,7 @@ window.addEventListener('load',function(){
     if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·사유결석자 자동 제외';
     var ths=document.querySelectorAll('#rt-habit table thead th');
     if(ths&&ths[5]) ths[5].textContent='출석 유형 (세부 유형)';
-    if(ths&&ths[6]) ths[6].textContent='마지막 예배일';
+    if(ths&&ths[6]) ths[6].textContent='월 목표';
     var recoverBtn=document.getElementById('recover-prevmonth-v111');
     if(recoverBtn) recoverBtn.remove();
   }
@@ -10751,11 +10751,23 @@ window.addEventListener('load',function(){
     var body=document.getElementById('habit-body'), list=document.getElementById('habit-list');
     if(list) list.style.display='';
     if(!body) return;
+    var _plansForList = (typeof getPlans==='function')?getPlans():{};
     body.innerHTML=data.length?data.map(function(m){
       var r=latestPrevRec(m.id,got.mo), d=detail(r), mid=esc(m.id), cnt=prevRecordCount(m.id,got.mo);
-      var lastDate=nd((r||{}).date)||'';
-      return '<tr><td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td><td>'+esc(m.region)+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td><td style="font-weight:700;cursor:pointer;color:var(--blue)" onclick="openHabitDetail(\''+mid+'\',\''+esc(got.mo)+'\')">'+esc(m.name)+'</td><td>'+badgeType(m.type)+'</td><td>'+detailBadge(d)+'</td><td style="font-size:11.5px;color:var(--text2)">'+(lastDate?esc(lastDate):'<span style="color:var(--text3)">-</span>')+'</td></tr>';
+      var goal=((_plansForList[m.id]||{}).goal)||'';
+      return '<tr><td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td><td>'+esc(m.region)+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td><td style="font-weight:700;cursor:pointer;color:var(--blue)" onclick="openHabitDetail(\''+mid+'\',\''+esc(got.mo)+'\')">'+esc(m.name)+'</td><td>'+badgeType(m.type)+'</td><td>'+detailBadge(d)+'</td><td><input class="habit-goal-inp" data-id="'+mid+'" value="'+esc(goal)+'" placeholder="월 목표 입력" onchange="saveHabitGoalFromList(this.dataset.id,this.value)" style="width:100%;padding:3px 6px;font-size:11.5px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);font-family:inherit"></td></tr>';
     }).join(''):'<tr><td colspan="7" class="empty">해당 인원 없음</td></tr>';
+  };
+  // 리스트의 월목표 입력 → plans 저장 + 상세 화면의 hd-goal과 동기화
+  window.saveHabitGoalFromList=function(id, val){
+    if(!id) return;
+    var plans=(typeof getPlans==='function')?getPlans():(function(){try{return JSON.parse(localStorage.getItem('att_plans')||'{}');}catch(e){return {};}})();
+    plans[id]=plans[id]||{};
+    plans[id].goal=String(val||'').trim();
+    if(typeof savePlans==='function') savePlans(plans);
+    else { try{ localStorage.setItem('att_plans', JSON.stringify(plans)); }catch(e){} }
+    var hg=document.getElementById('hd-goal');
+    if(hg && window.currentHabitDetail && window.currentHabitDetail.id===id) hg.value=plans[id].goal;
   };
   function renderOverviewReasonColorFix(){
     var root=document.getElementById('overview-extra-analysis'); if(!root) return;
