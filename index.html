@@ -12190,24 +12190,34 @@ console.log('[MFV2] Loaded');
     _windowLoadAt = Date.now();
   });
 
+  // coalesce 래핑되기 전의 원본 함수를 보관해두고 masterRender에서 직접 호출.
+  // 동기 실행 보장이 필요한 cover 해제 직전 렌더는 coalesce 우회.
+  var _origByName = {};
+  function origOf(name){
+    return (_origByName[name] && typeof _origByName[name] === 'function')
+      ? _origByName[name]
+      : window[name];
+  }
+
   // 모든 주요 자동 렌더 함수를 한 번씩 동기 호출 — 최종 상태로 강제 합치기
   function masterRender(){
     var ov = document.getElementById('page-overview');
     var isOverviewActive = ov && ov.classList.contains('active');
     function call(name){
       try{
-        if(typeof window[name] === 'function') window[name]();
+        var fn = origOf(name);
+        if(typeof fn === 'function') fn();
       }catch(e){ console.warn('[llf] '+name+' error', e); }
     }
     if(isOverviewActive){
       // overview 본문: ov-metrics / ov-sections / type-cards
       call('renderOverviewNow');
-      if(typeof window.renderOverviewNow !== 'function') call('renderOverview');
+      if(typeof origOf('renderOverviewNow') !== 'function') call('renderOverview');
       // v78의 연속결석 분석 섹션
       call('renderOverviewExtra');
     } else {
-      // 다른 페이지가 활성이면 그쪽도 동기 렌더 (드물지만 안전)
-      var p = ov && ov.classList ? '' : (document.querySelector('.page.active')?.id||'').replace('page-','');
+      // 다른 페이지가 활성이면 그쪽도 동기 렌더
+      var p = (document.querySelector('.page.active')?.id||'').replace('page-','');
       try{ if(typeof window.renderPage === 'function' && p) window.renderPage(p); }catch(e){}
     }
   }
@@ -12307,6 +12317,70 @@ console.log('[MFV2] Loaded');
   setTimeout(function(){
     hideCover();
   }, 25000);
+
+  /* ════════════════════════════════════════════════════════════════
+     렌더 호출 coalesce — 속도 개선
+       다수의 setTimeout이 스케줄해놓은 자동 렌더(같은 함수가 80ms 안에
+       여러 번 호출되는 패턴)를 합쳐서 1회만 실행. Chart.js destroy/
+       recreate, innerHTML 재할당, RECORDS 전체 순회 등 무거운 작업을
+       크게 줄여 전반 반응 속도가 빨라짐.
+       원칙: 마지막 호출의 인자/this로 trailing edge에 한 번만 실행.
+       호출 측에서 보면 동기 반환은 undefined로 바뀌지만, 기존 코드도
+       반환값을 사용하지 않는 렌더 함수만 감싸므로 안전.
+     ════════════════════════════════════════════════════════════════ */
+  (function(){
+    var COALESCE_NAMES = [
+      'renderOverview',          // 전체현황 (가장 자주 호출됨)
+      'renderOverviewNow',       // 즉시 버전도 같이 coalesce (단, masterRender는 _origByName으로 우회)
+      'renderRegionCards',       // 지역 카드
+      'renderStatSum',           // 통계 요약
+      'renderTeamStat',          // 팀별
+      'renderZoneStat',          // 구역별
+      'renderFamilyWorship',     // 가족 예배현황
+      'renderLongAbsent',        // 8회 이상 결석자
+      'renderOverviewExtra'      // 연속결석 분석 섹션
+    ];
+    var WAIT = 80; // ms
+    function coalesce(name){
+      var orig = window[name];
+      if(typeof orig !== 'function') return false;
+      if(orig.__llfCoalesced) return true;
+      // masterRender가 동기 우회 호출할 수 있도록 원본 보관
+      _origByName[name] = orig;
+      var pending = null, latestArgs = null, latestThis = null;
+      var lastFiredAt = 0;
+      function wrapped(){
+        latestArgs = arguments; latestThis = this;
+        var now = Date.now();
+        if(pending){ clearTimeout(pending); }
+        if(now - lastFiredAt >= WAIT){
+          lastFiredAt = now;
+          try{ return orig.apply(latestThis, latestArgs); }
+          catch(e){ console.error('[llf coalesce] '+name+' error', e); }
+        } else {
+          pending = setTimeout(function(){
+            pending = null;
+            lastFiredAt = Date.now();
+            try{ orig.apply(latestThis, latestArgs); }
+            catch(e){ console.error('[llf coalesce] '+name+' error', e); }
+          }, WAIT);
+        }
+      }
+      wrapped.__llfCoalesced = true;
+      window[name] = wrapped;
+      return true;
+    }
+    function applyAll(){ COALESCE_NAMES.forEach(coalesce); }
+    applyAll();
+    // 후속 패치가 함수를 재할당하면 원본도 갱신하고 다시 wrap
+    var t = 0, iv = setInterval(function(){
+      var anyChanged = false;
+      COALESCE_NAMES.forEach(function(n){
+        if(window[n] && !window[n].__llfCoalesced){ coalesce(n); anyChanged = true; }
+      });
+      if(++t > 100 && !anyChanged) clearInterval(iv);
+    }, 100);
+  })();
 
   console.log('[loading-lifecycle-fix] loaded');
 })();
