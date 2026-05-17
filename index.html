@@ -12457,12 +12457,14 @@ console.log('[MFV2] Loaded');
        Step 2에서 Firebase RTDB의 /allowedUsers 기반 허용 목록으로 교체 예정
      ════════════════════════════════════════════════════════════════ */
 
-  // Step 1 하드코드 — Step 2에서 DB 조회로 교체
+  // 부트스트랩 관리자 — /allowedUsers가 비어 있을 때 자동 시드되는 최초 관리자
   var BOOTSTRAP_ADMIN_EMAIL = 'witpire@gmail.com';
+  var ALLOWED_USERS_PATH = 'allowedUsers';
 
   var _authReady = false;     // onAuthStateChanged 첫 콜백이 발화했는가
   var _signingIn = false;     // 로그인 중 (중복 클릭 차단)
   var _appStarted = false;    // initApp이 호출되었는가 (재호출 방지)
+  var _bootstrapChecked = false; // 부트스트랩 체크를 한 번이라도 했는가
 
   function $(id){ return document.getElementById(id); }
   function showLoginScreen(){
@@ -12566,22 +12568,78 @@ console.log('[MFV2] Loaded');
     try{ currentUser = null; }catch(e){}
   }
 
-  // 인증된 사용자가 허용된지 판단 (Step 1: 하드코드, Step 2에서 DB 조회로 교체)
-  function resolveUserAccess(firebaseUser){
-    var email = (firebaseUser.email || '').toLowerCase().trim();
-    if(!email) return null;
-    if(email === BOOTSTRAP_ADMIN_EMAIL){
-      return {
+  // RTDB 키 인코딩 — Firebase는 키에 `.` `#` `$` `[` `]` `/` 허용 안 함
+  function encodeEmailKey(email){
+    return String(email || '').toLowerCase().trim().replace(/[.#$\[\]/]/g, '_');
+  }
+  window.encodeEmailKey = encodeEmailKey;
+
+  // /allowedUsers가 비어 있으면 부트스트랩 관리자 시드
+  // (이 함수는 idempotent — 이미 entries가 있으면 아무것도 안 함)
+  function bootstrapInitialAdmin(db){
+    if(_bootstrapChecked) return Promise.resolve();
+    _bootstrapChecked = true;
+    return db.ref(ALLOWED_USERS_PATH).once('value').then(function(snap){
+      if(snap.exists() && snap.numChildren() > 0) return null;
+      // 비어있음 → witpire@gmail.com 자동 시드
+      var bootstrap = {
+        email: BOOTSTRAP_ADMIN_EMAIL,
         role: 'admin',
         region: null,
-        label: '관리자',
-        email: email,
-        name: firebaseUser.displayName || '관리자'
+        name: '관리자',
+        createdAt: Date.now()
       };
-    }
-    // Step 1 임시 정책: 외 사용자는 모두 거부
-    // Step 2에서 /allowedUsers 조회로 교체
-    return null;
+      return db.ref(ALLOWED_USERS_PATH).child(encodeEmailKey(BOOTSTRAP_ADMIN_EMAIL)).set(bootstrap)
+        .then(function(){
+          console.log('[auth] 초기 관리자 자동 등록:', BOOTSTRAP_ADMIN_EMAIL);
+        })
+        .catch(function(e){
+          console.error('[auth] 부트스트랩 시드 실패 (보안 규칙 확인 필요):', e);
+        });
+    }).catch(function(e){
+      console.error('[auth] allowlist 조회 실패:', e);
+    });
+  }
+
+  // 인증된 사용자가 허용된지 판단 — Firebase RTDB /allowedUsers 조회
+  function resolveUserAccess(firebaseUser){
+    var email = (firebaseUser.email || '').toLowerCase().trim();
+    if(!email) return Promise.resolve(null);
+
+    // DB 연결 대기
+    var dbPromise = (typeof waitForFbDB === 'function')
+      ? waitForFbDB(5000)
+      : Promise.resolve(window.fbDB || null);
+
+    return dbPromise.then(function(db){
+      if(!db){
+        console.error('[auth] Firebase DB 미연결 — 허용 목록 조회 불가');
+        return null;
+      }
+      return bootstrapInitialAdmin(db).then(function(){
+        return db.ref(ALLOWED_USERS_PATH).child(encodeEmailKey(email)).once('value');
+      }).then(function(userSnap){
+        if(!userSnap.exists()) return null;
+        var data = userSnap.val() || {};
+        var role = data.role === 'admin' ? 'admin' : 'region';
+        var region = data.region || null;
+        // 지역 계정인데 region이 없으면 거부 (잘못된 데이터)
+        if(role === 'region' && !region){
+          console.warn('[auth] region 역할인데 담당 지역이 없음:', email);
+          return null;
+        }
+        return {
+          role: role,
+          region: region,
+          label: role === 'admin' ? '관리자' : (region || ''),
+          email: data.email || email,
+          name: data.name || firebaseUser.displayName || ''
+        };
+      }).catch(function(e){
+        console.error('[auth] 사용자 조회 실패:', e);
+        return null;
+      });
+    });
   }
 
   function handleAuthChange(firebaseUser){
@@ -12594,21 +12652,28 @@ console.log('[MFV2] Loaded');
       if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
       return;
     }
-    var profile = resolveUserAccess(firebaseUser);
-    if(!profile){
-      // 인증은 됐지만 허용 목록에 없음
-      showAccessDenied(firebaseUser.email);
-      return;
-    }
-    // 허용된 사용자 → currentUser 세팅 후 앱 진입
-    window.currentUser = profile;
-    try{ currentUser = profile; }catch(e){}
-    showApp();
-    if(!_appStarted && typeof window.initApp === 'function'){
-      _appStarted = true;
-      try{ window.initApp(); }
-      catch(e){ console.error('[auth] initApp 오류:', e); }
-    }
+    // 허용 목록 조회 (비동기)
+    Promise.resolve(resolveUserAccess(firebaseUser))
+      .then(function(profile){
+        if(!profile){
+          // 인증은 됐지만 허용 목록에 없음
+          showAccessDenied(firebaseUser.email);
+          return;
+        }
+        // 허용된 사용자 → currentUser 세팅 후 앱 진입
+        window.currentUser = profile;
+        try{ currentUser = profile; }catch(e){}
+        showApp();
+        if(!_appStarted && typeof window.initApp === 'function'){
+          _appStarted = true;
+          try{ window.initApp(); }
+          catch(e){ console.error('[auth] initApp 오류:', e); }
+        }
+      })
+      .catch(function(e){
+        console.error('[auth] resolveUserAccess 오류:', e);
+        showAccessDenied(firebaseUser.email);
+      });
   }
 
   // 버튼 바인딩 (DOM은 이미 존재함 — 스크립트가 body 끝에 있음)
