@@ -1430,6 +1430,46 @@ const FB_CONFIG = {
   appId: "1:738084433336:web:d12f2b6084b7bb771eb34d"
 };
 
+// Firebase records 노드의 값에 date가 없을 때 키 suffix({id}_{YYYY-MM-DD})에서 복구.
+// 과거 잘못된 저장 경로로 인해 일부 레코드의 value.date가 빠진 경우가 있어,
+// 그대로 두면 _allDates / byDate 인덱스에서 통째로 누락되어 전주 대비 계산이
+// 잘못된 직전 예배일(예: 5/3 누락 시 5/10 vs 4/26)을 사용하게 됨.
+function fbRecordsFromVal(rawObj){
+  if(!rawObj || typeof rawObj !== 'object') return [];
+  var out = [];
+  var keys = Object.keys(rawObj);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var r = rawObj[key];
+    if (!r || typeof r !== 'object') continue;
+    // 1) 우선 value.date 사용
+    var date = (r.date != null && String(r.date).trim()) || '';
+    // 2) 비어있으면 키 suffix _YYYY-(M|MM)-(D|DD) 에서 복구
+    if (!date && key) {
+      var m = String(key).match(/_(\d{4}-\d{1,2}-\d{1,2})$/);
+      if (m) {
+        var p = m[1].split('-');
+        date = p[0] + '-' + String(parseInt(p[1],10)||0).padStart(2,'0') + '-' + String(parseInt(p[2],10)||0).padStart(2,'0');
+      }
+    }
+    // 3) id 도 동일하게 복구 (value.id 없으면 key에서 _date suffix를 떼고)
+    var id = (r.id != null && String(r.id).trim()) || '';
+    if (!id && key) id = String(key).replace(/_\d{4}-\d{1,2}-\d{1,2}$/, '');
+    if (!id || !date) continue;
+    out.push({
+      id: id,
+      date: date,
+      wk: r.wk || 1,
+      day: r.day || '일',
+      st: r.st || '',
+      rsn: r.rsn || '',
+      streak: r.streak || 0
+    });
+  }
+  return out;
+}
+window.fbRecordsFromVal = fbRecordsFromVal;
+
 let fbApp = null;
 let fbDB = null;
 const LS_MEMBERS = 'att_members_v1'; // 로컬 캐시용
@@ -1641,9 +1681,9 @@ async function loadFromDB() {
       }));
     }
     if (rSnap.exists()) {
-      RECORDS = Object.values(rSnap.val()).map(r => ({
-        id: r.id, date: r.date||'', wk: r.wk||1,
-        day: r.day||'일', st: r.st||'', rsn: reasonDisplayLabel(r.rsn||'', r.st||''), streak: r.streak||0
+      RECORDS = fbRecordsFromVal(rSnap.val()).map(r => ({
+        id: r.id, date: r.date, wk: r.wk,
+        day: r.day, st: r.st, rsn: reasonDisplayLabel(r.rsn||'', r.st||''), streak: r.streak
       }));
       invalidateRecordIndex();
     }
@@ -7867,7 +7907,7 @@ body.v97-data-loading #login-screen{z-index:9999;}
         var eSnap=await fbDB.ref('estage').once('value');
         if(mSnap.exists()) MEMBERS=Object.values(mSnap.val()).map(function(m){return {id:m.id,region:m.region||'',team:m.team||'',zone:m.zone||'',name:m.name||'',type:m.type||'일반',regType:m.regType||'총회등록'};});
         if(rSnap.exists()){
-          RECORDS=Object.values(rSnap.val()).map(function(r){return {id:r.id,date:r.date||'',wk:r.wk||1,day:r.day||'일',st:r.st||'',rsn:safe(function(){return reasonDisplayLabel(r.rsn||'',r.st||'');},r.rsn||''),streak:r.streak||0};});
+          RECORDS=(typeof fbRecordsFromVal==='function'?fbRecordsFromVal(rSnap.val()):Object.values(rSnap.val())).map(function(r){return {id:r.id,date:r.date||'',wk:r.wk||1,day:r.day||'일',st:r.st||'',rsn:safe(function(){return reasonDisplayLabel(r.rsn||'',r.st||'');},r.rsn||''),streak:r.streak||0};});
           safe(function(){invalidateRecordIndex();},null);
         }
         if(eSnap.exists()) safe(function(){localStorage.setItem('att_estage_data', JSON.stringify(eSnap.val()));},null);
@@ -8329,7 +8369,12 @@ body.v97-data-loading #login-screen{z-index:9999;}
     var incoming = uniqRecs(records||[]);
     var existing = [];
     if(window.fbDB){
-      try{ var snap=await fbDB.ref('records').once('value'); if(snap.exists()) existing=Object.values(snap.val()||{}); }catch(e){ console.warn('[v111] Firebase existing read fail', e); }
+      try{
+        var snap=await fbDB.ref('records').once('value');
+        if(snap.exists()){
+          existing = (typeof fbRecordsFromVal==='function') ? fbRecordsFromVal(snap.val()||{}) : Object.values(snap.val()||{});
+        }
+      }catch(e){ console.warn('[v111] Firebase existing read fail', e); }
     }
     existing = uniqRecs([].concat(existing, collectLocalRecords()));
     var mergedRecords = uniqRecs(existing.concat(incoming));
@@ -10073,7 +10118,7 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
           MEMBERS=Object.values(mSnap.val()).map(function(m){return {id:m.id,region:m.region||'',team:m.team||'',zone:m.zone||'',name:m.name||'',type:m.type||'일반',regType:m.regType||'총회등록'};});
         }
         if(rSnap.exists()){
-          RECORDS=Object.values(rSnap.val()).map(function(r){return {id:r.id,date:r.date||'',wk:r.wk||1,day:r.day||'일',st:r.st||'',rsn:safe(function(){return reasonDisplayLabel(r.rsn||'',r.st||'');},r.rsn||''),streak:r.streak||0};});
+          RECORDS=(typeof fbRecordsFromVal==='function'?fbRecordsFromVal(rSnap.val()):Object.values(rSnap.val())).map(function(r){return {id:r.id,date:r.date||'',wk:r.wk||1,day:r.day||'일',st:r.st||'',rsn:safe(function(){return reasonDisplayLabel(r.rsn||'',r.st||'');},r.rsn||''),streak:r.streak||0};});
           safe(function(){invalidateRecordIndex();},null);
         }
         if(eSnap.exists()) safe(function(){localStorage.setItem('att_estage_data', JSON.stringify(eSnap.val()));},null);
@@ -11344,7 +11389,7 @@ window.addEventListener('load',function(){
           }
           if(rSnap.exists()){
             var rsn=typeof reasonDisplayLabel==='function'?reasonDisplayLabel:function(r){return r;};
-            RECORDS=Object.values(rSnap.val()).map(function(rr){
+            RECORDS=(typeof fbRecordsFromVal==='function'?fbRecordsFromVal(rSnap.val()):Object.values(rSnap.val())).map(function(rr){
               return {id:rr.id,date:rr.date||'',wk:rr.wk||1,day:rr.day||'일',st:rr.st||'',rsn:rr.rsn||'',streak:rr.streak||0};
             });
             updated=true;
