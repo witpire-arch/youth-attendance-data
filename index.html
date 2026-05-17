@@ -3023,22 +3023,71 @@ function renderRegionCards(){
             var _dbg_winRecs53Other = 0;
             var _dbg_winRecsDohbong53 = 0;
             var _dbg_winRecsDate53Samples = [];
+            var _dbg_typeofDate53Samples = [];
             for (var _di=0; _di<_allR.length; _di++) {
               var _dr = _allR[_di];
-              var _drd = String(_dr && _dr.date || '');
+              if (!_dr) continue; // sparse array hole or null
+              var _drdRaw = _dr.date;
+              var _drd = String(_drdRaw == null ? '' : _drdRaw);
               if (_drd === '2026-05-03') {
                 _dbg_winRecs53++;
-                if (_dbg_winRecsDate53Samples.length < 2) _dbg_winRecsDate53Samples.push(_dr);
+                if (_dbg_winRecsDate53Samples.length < 2) {
+                  _dbg_winRecsDate53Samples.push(_dr);
+                  _dbg_typeofDate53Samples.push({typeof: typeof _drdRaw, raw: _drdRaw, length: _drd.length, sliced: _drd.slice(0,10), eqSliced: _drd.slice(0,10) === '2026-05-03'});
+                }
               } else if (_drd.indexOf('05-03') >= 0 || _drd.indexOf('5-3') >= 0) {
                 _dbg_winRecs53Other++;
-                if (_dbg_winRecsDate53Samples.length < 2) _dbg_winRecsDate53Samples.push(_dr);
+                if (_dbg_winRecsDate53Samples.length < 2) {
+                  _dbg_winRecsDate53Samples.push(_dr);
+                  _dbg_typeofDate53Samples.push({typeof: typeof _drdRaw, raw: _drdRaw, length: _drd.length, sliced: _drd.slice(0,10), eqSliced: _drd.slice(0,10) === '2026-05-03'});
+                }
               }
             }
+            // [TEMP DEBUG] _allDates 빌드: forEach 와 동일한 로직을 풀어쓰며 단계별 추적
             var _allDates=[];
-            _allR.forEach(function(r){var dd=String(r&&r.date||'').slice(0,10);if(dd&&_allDates.indexOf(dd)<0)_allDates.push(dd);});
+            var _dbg_forEach_iters = 0;
+            var _dbg_forEach_seen53 = 0;       // forEach 안에서 dd === '2026-05-03' 본 횟수
+            var _dbg_forEach_pushed53 = 0;     // 그 중 실제 push 된 횟수 (1이어야 정상)
+            var _dbg_forEach_skipEmpty = 0;
+            var _dbg_forEach_skipDup = 0;
+            _allR.forEach(function(r){
+              _dbg_forEach_iters++;
+              var dd=String(r&&r.date||'').slice(0,10);
+              if (!dd) { _dbg_forEach_skipEmpty++; return; }
+              if (dd === '2026-05-03') {
+                _dbg_forEach_seen53++;
+                if (_allDates.indexOf(dd) < 0) {
+                  _allDates.push(dd);
+                  _dbg_forEach_pushed53++;
+                } else {
+                  _dbg_forEach_skipDup++;
+                }
+                return;
+              }
+              if (_allDates.indexOf(dd) < 0) _allDates.push(dd);
+            });
             _allDates.sort();
             // [TEMP DEBUG] _allDates 안의 5/3 포함 여부
             var _dbg_allDatesHas53 = _allDates.indexOf('2026-05-03') >= 0;
+            // [TEMP DEBUG] 도봉 region card 진입 시점에 한 번 콘솔에 통째로 덤프
+            if (reg === '도봉') {
+              try {
+                console.log('[5/3 trace @renderRegionCards 도봉]',
+                  '_allR.length=', _dbg_winRecsAll,
+                  '| Array.isArray(window.RECORDS)=', Array.isArray(window.RECORDS),
+                  '| _allR===window.RECORDS?', _allR === window.RECORDS,
+                  '| date==="2026-05-03"건수=', _dbg_winRecs53,
+                  '| 다른5/3형식건수=', _dbg_winRecs53Other,
+                  '| forEach iters=', _dbg_forEach_iters,
+                  '| forEach saw 5/3=', _dbg_forEach_seen53,
+                  '| forEach pushed 5/3=', _dbg_forEach_pushed53,
+                  '| forEach skipEmpty=', _dbg_forEach_skipEmpty,
+                  '| _allDates.length=', _allDates.length,
+                  '| _allDates includes 2026-05-03?', _dbg_allDatesHas53,
+                  '| _allDates=', _allDates,
+                  '| sample 5/3 typeof=', _dbg_typeofDate53Samples);
+              } catch(e){}
+            }
             var _cur=d||(_allDates.length?_allDates[_allDates.length-1]:'');
             if(!_cur)return'';
             var _prev=''; for(var _pi=_allDates.length-1;_pi>=0;_pi--){if(_allDates[_pi]<_cur){_prev=_allDates[_pi];break;}}
@@ -3083,12 +3132,21 @@ function renderRegionCards(){
                       '  delta = ' + _curRate.toFixed(4) + ' - ' + _prevRate.toFixed(4) + ' = ' + (_curRate-_prevRate).toFixed(4) + '%\n' +
                       '  표시값 (반올림) = ' + (_delta>0?'+':'') + _delta.toFixed(1) + '%\n' +
                       '\n[5/3 트레이스]\n' +
+                      '  Array.isArray(window.RECORDS) = ' + Array.isArray(window.RECORDS) + '\n' +
+                      '  _allR === window.RECORDS ? ' + (_allR === window.RECORDS) + '\n' +
                       '  window.RECORDS 총 ' + _dbg_winRecsAll + '건 중\n' +
                       '    date === "2026-05-03" : ' + _dbg_winRecs53 + '건\n' +
                       '    date 다른 5/3 형식    : ' + _dbg_winRecs53Other + '건\n' +
                       '    그중 도봉 멤버      : ' + _dbg_winRecsDohbong53 + '건\n' +
+                      '  forEach 단계별:\n' +
+                      '    총 iter = ' + _dbg_forEach_iters + '\n' +
+                      '    dd === "2026-05-03" 본 횟수 = ' + _dbg_forEach_seen53 + '\n' +
+                      '    그 중 _allDates 에 push 한 횟수 = ' + _dbg_forEach_pushed53 + '\n' +
+                      '    빈 dd 로 skip = ' + _dbg_forEach_skipEmpty + '\n' +
+                      '    이미 들어있어 skip = ' + _dbg_forEach_skipDup + '\n' +
                       '  _allDates 안에 "2026-05-03" 포함? : ' + (_dbg_allDatesHas53 ? 'YES' : 'NO') + '\n' +
-                      '  Firebase 로더 통계 (fbRecordsFromVal):\n    ' + _stats + (_sampleRec ? '\n  샘플 레코드: ' + _sampleRec : '');
+                      '  _allDates (전체) = ' + _allDates.join(', ') + '\n' +
+                      '  Firebase 로더 통계 (fbRecordsFromVal):\n    ' + _stats + (_sampleRec ? '\n  샘플 레코드: ' + _sampleRec + (_dbg_typeofDate53Samples.length ? '\n  샘플 date 타입: ' + JSON.stringify(_dbg_typeofDate53Samples[0]) : '') : '');
                   }
                 }catch(e){}
               }
