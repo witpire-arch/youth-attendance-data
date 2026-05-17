@@ -837,22 +837,34 @@ select.fc{cursor:pointer}
   <!-- 습관성 결석자 타겟 현황 -->
   <div id="rt-habitStatus" style="display:none">
     <div class="card" style="margin-bottom:14px">
-      <div class="ct">습관성 결석자 타겟 현황 <span style="font-size:11px;font-weight:400;color:var(--text3)">타겟 인원의 선택 월 기준 출결 분포</span>
+      <div class="ct">습관성 결석자 타겟 현황 <span style="font-size:11px;font-weight:400;color:var(--text3)">타겟 인원 요약</span>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <select class="fc" id="hs-reg" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"><option value="">전체 지역</option></select>
           <select class="fc" id="hs-month" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"></select>
           <button class="btn btn-primary" onclick="renderHabitTargetStatus()">현황 조회</button>
         </div>
       </div>
-      <div id="hs-summary" class="mg" style="grid-template-columns:repeat(4,1fr);margin:10px 0 12px"></div>
-      <div id="hs-detail-card" class="card" style="margin-bottom:12px">
-        <div class="ct-sm">출석 세부 유형별 수치</div>
-        <div id="hs-detail-body"></div>
-      </div>
-      <div id="hs-weekly-card" class="card">
-        <div class="ct-sm">매주 예배 드린 인원 <span style="font-size:11px;font-weight:400;color:var(--text3)">QR인증·인증안함·인증오류·대체예배만 포함</span></div>
-        <div id="hs-weekly-body"></div>
-      </div>
+      <!-- 1. 총 타겟 인원 -->
+      <div id="hs-total-card" class="mg" style="grid-template-columns:1fr;margin:10px 0 14px"></div>
+      <!-- 2. 출석 세부 유형별 -->
+      <div class="ct-sm" style="margin:0 0 8px">출석 세부 유형별 인원 수 <span style="font-size:11px;font-weight:400;color:var(--text3)">선택 월 · 같은 사람이 여러 유형에 중복 집계될 수 있음</span></div>
+      <div id="hs-detail-grid" class="mg" style="grid-template-columns:repeat(6,1fr);margin-bottom:14px"></div>
+      <!-- 3. 주차별 예배 참석 인원 -->
+      <div class="ct-sm" style="margin:0 0 8px">주차별 예배 참석 인원 <span style="font-size:11px;font-weight:400;color:var(--text3)">QR인증·인증안함·인증오류·대체예배 합산</span></div>
+      <div id="hs-week-grid" class="mg" style="grid-template-columns:repeat(5,1fr);margin-bottom:14px"></div>
+      <!-- 4. 호전/정체/악화 -->
+      <div class="ct-sm" style="margin:0 0 8px">전월 대비 변화 <span style="font-size:11px;font-weight:400;color:var(--text3)">선택 월 vs 직전월 출석률 비교 (QR+사유출석 기준)</span></div>
+      <div id="hs-change-grid" class="mg" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px"></div>
+      <!-- 5. 미접촉 (클릭 시 명단 모달) -->
+      <div id="hs-untouched-card" class="mg" style="grid-template-columns:1fr"></div>
+    </div>
+  </div>
+
+  <!-- 미접촉 타겟 명단 모달 -->
+  <div class="modal-bg" id="modal-untouched" onclick="closeMbg(event,'modal-untouched')">
+    <div class="modal" style="max-width:640px">
+      <div class="mh"><h3>미접촉 타겟 명단</h3><button class="mc-btn" onclick="closeModal('modal-untouched')">×</button></div>
+      <div id="untouched-body" style="margin-top:10px"></div>
     </div>
   </div>
 
@@ -4210,7 +4222,6 @@ function saveHabitDetailPlan(id) {
 
 // ══ 습관성 결석자 타겟 현황 ══
 function renderHabitTargetStatus(){
-  // 월 옵션 채우기
   const moSel = document.getElementById('hs-month');
   const regSel = document.getElementById('hs-reg');
   if(!moSel || !regSel) return;
@@ -4225,8 +4236,11 @@ function renderHabitTargetStatus(){
   }
   const mo = moSel.value || cur;
 
-  // 지역 옵션 (currentUser 권한 반영)
-  const scoped = (typeof getFilteredMembers==='function') ? getFilteredMembers() : MEMBERS;
+  // 권한 필터링: getFilteredMembers (지역 계정이면 자기 지역만) + 추가 안전장치
+  let scoped = (typeof getFilteredMembers==='function') ? getFilteredMembers() : MEMBERS;
+  if(typeof currentUser !== 'undefined' && currentUser && currentUser.role !== 'admin' && currentUser.region){
+    scoped = scoped.filter(m => m.region === currentUser.region);
+  }
   const regs = [...new Set(scoped.map(m=>m.region).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ko'));
   if(regSel.dataset.loaded !== regs.join('|')){
     const keep = regSel.value;
@@ -4236,105 +4250,149 @@ function renderHabitTargetStatus(){
   }
   const regFilter = regSel.value || '';
 
-  // 타겟 인원 추출
   const targets = (typeof getTargets==='function') ? getTargets() : {};
   let targetMembers = scoped.filter(m => targets[m.id+'_habit']);
   if(regFilter) targetMembers = targetMembers.filter(m => m.region===regFilter);
 
-  const summary = document.getElementById('hs-summary');
-  const detailBody = document.getElementById('hs-detail-body');
-  const weeklyBody = document.getElementById('hs-weekly-body');
-  if(!targetMembers.length){
-    if(summary) summary.innerHTML = `<div class="mc"><div class="lbl">타겟 인원</div><div class="val">0<span style="font-size:12px">명</span></div><div class="sub">${mo} 기준</div></div>`;
-    if(detailBody) detailBody.innerHTML = '<div class="empty" style="padding:20px">타겟으로 지정된 인원이 없습니다.</div>';
-    if(weeklyBody) weeklyBody.innerHTML = '';
-    return;
+  const totalCard = document.getElementById('hs-total-card');
+  const detailGrid = document.getElementById('hs-detail-grid');
+  const weekGrid = document.getElementById('hs-week-grid');
+  const changeGrid = document.getElementById('hs-change-grid');
+  const untouchedCard = document.getElementById('hs-untouched-card');
+
+  // 1. 총 타겟 인원
+  if(totalCard){
+    totalCard.innerHTML = `<div class="mc"><div class="lbl">총 타겟 인원</div><div class="val">${targetMembers.length}<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">${mo} 기준${regFilter?' · '+escapeHtml(regFilter):''}</div></div>`;
   }
 
-  // 출석 세부 유형 추출 helper (v112 detail 로직과 동일)
-  function detailOf(r){
-    if(!r) return '';
-    const st = String(r.st||'').trim();
-    const rsn = String(r.rsn||'').trim();
-    if(st==='사유출석'){ const rv = rsn || '인증안함'; return (!rv || rv==='미입력') ? '인증안함' : rv; }
-    if(st==='QR인증') return 'QR인증';
-    if(st==='사유결석' || st==='결석' || st==='미출석') return '사유결석';
-    return st || rsn;
-  }
-  function weekOfDate(d){
-    const day = parseInt(String(d).slice(8,10),10);
-    return Math.ceil(day/7) || 1;
+  if(!targetMembers.length){
+    if(detailGrid) detailGrid.innerHTML = '<div class="mc" style="grid-column:1/-1"><div class="empty" style="padding:14px">타겟으로 지정된 인원이 없습니다.</div></div>';
+    if(weekGrid) weekGrid.innerHTML = '';
+    if(changeGrid) changeGrid.innerHTML = '';
+    if(untouchedCard) untouchedCard.innerHTML = '';
+    window._hsUntouchedCache = [];
+    return;
   }
 
   const targetIds = new Set(targetMembers.map(m=>m.id));
   const monthRecs = RECORDS.filter(r => r.id && targetIds.has(r.id) && (r.date||'').slice(0,7)===mo);
 
-  // 출석 세부 유형별 집계 (기록 수 기준)
-  const detailCounts = {};
-  // 같은 사람·같은 유형 중복 카운트하지 않기 위한 id-set도 함께 보관
-  const detailMembers = {};
+  // 출석 세부 유형 raw 분류 (사유결석 / 결석 별도)
+  function rawDetail(r){
+    if(!r) return '';
+    const st = String(r.st||'').trim();
+    const rsn = String(r.rsn||'').trim();
+    if(st==='QR인증') return 'QR인증';
+    if(st==='사유출석'){ const rv = rsn || '인증안함'; return (!rv || rv==='미입력') ? '인증안함' : rv; }
+    if(st==='사유결석') return '사유결석';
+    if(st==='결석' || st==='미출석') return '결석';
+    return st || rsn;
+  }
+  // 매주 예배 합산용 (사유결석/결석 제외)
+  function isWorship(r){
+    const d = rawDetail(r);
+    return d==='QR인증' || d==='인증안함' || d==='인증오류' || d==='대체예배';
+  }
+  function weekOfDate(d){ return Math.ceil(parseInt(String(d).slice(8,10),10)/7) || 1; }
+
+  // 2. 출석 세부 유형별 (인원 수)
+  const categories = ['QR인증','인증안함','인증오류','대체예배','사유결석','결석'];
+  const catMembers = {}; categories.forEach(c => catMembers[c] = new Set());
   monthRecs.forEach(r => {
-    const d = detailOf(r);
-    if(!d) return;
-    detailCounts[d] = (detailCounts[d]||0) + 1;
-    if(!detailMembers[d]) detailMembers[d] = new Set();
-    detailMembers[d].add(r.id);
+    const d = rawDetail(r);
+    if(catMembers[d]) catMembers[d].add(r.id);
   });
-
-  // 매주 예배 드린 인원 (QR인증·인증안함·인증오류·대체예배 4가지만 인정)
-  const WORSHIP = new Set(['QR인증','인증안함','인증오류','대체예배']);
-  const allDates = [...new Set(monthRecs.map(r=>r.date))].filter(Boolean);
-  const weeksInMonth = [...new Set(allDates.map(weekOfDate))].sort((a,b)=>a-b);
-  const everyWeekIds = [];
-  if(weeksInMonth.length){
-    targetMembers.forEach(m => {
-      const mine = monthRecs.filter(r => r.id===m.id);
-      const okWeeks = new Set();
-      mine.forEach(r => { if(WORSHIP.has(detailOf(r))) okWeeks.add(weekOfDate(r.date)); });
-      if(weeksInMonth.every(w => okWeeks.has(w))) everyWeekIds.push(m.id);
-    });
+  if(detailGrid){
+    const palette = {
+      'QR인증':'var(--green)','인증안함':'var(--blue)','인증오류':'var(--amber)',
+      '대체예배':'var(--purple)','사유결석':'var(--red)','결석':'var(--red)'
+    };
+    detailGrid.innerHTML = categories.map(c =>
+      `<div class="mc"><div class="lbl">${c}</div><div class="val" style="color:${palette[c]||'var(--text)'}">${catMembers[c].size}<span style="font-size:12px;font-weight:400;color:var(--text3)">명</span></div></div>`
+    ).join('');
   }
 
-  // 요약 카드
-  if(summary){
-    summary.innerHTML = `
-      <div class="mc"><div class="lbl">타겟 인원</div><div class="val">${targetMembers.length}<span style="font-size:12px">명</span></div><div class="sub">${mo} 기준${regFilter?' · '+escapeHtml(regFilter):''}</div></div>
-      <div class="mc"><div class="lbl">매주 예배 드린 인원</div><div class="val">${everyWeekIds.length}<span style="font-size:12px">명</span></div><div class="sub">QR/인증안함/인증오류/대체예배</div></div>
-      <div class="mc"><div class="lbl">월 내 기록 건수</div><div class="val">${monthRecs.length}<span style="font-size:12px">건</span></div></div>
-      <div class="mc"><div class="lbl">월 내 예배일 수</div><div class="val">${weeksInMonth.length}<span style="font-size:12px">주</span></div></div>
-    `;
+  // 3. 주차별 예배 참석 인원 (1~5주차)
+  const weekMembers = {1:new Set(),2:new Set(),3:new Set(),4:new Set(),5:new Set()};
+  monthRecs.forEach(r => {
+    if(!isWorship(r)) return;
+    const wk = Number(r.wk) || weekOfDate(r.date);
+    if(wk>=1 && wk<=5) weekMembers[wk].add(r.id);
+  });
+  if(weekGrid){
+    weekGrid.innerHTML = [1,2,3,4,5].map(w =>
+      `<div class="mc"><div class="lbl">${w}주차</div><div class="val">${weekMembers[w].size}<span style="font-size:12px;font-weight:400;color:var(--text3)">명</span></div></div>`
+    ).join('');
   }
 
-  // 출석 세부 유형별 표
-  if(detailBody){
-    const order = ['QR인증','인증안함','인증오류','대체예배','온라인예배','사유결석'];
-    const knownKeys = order.filter(k => detailCounts[k]);
-    const otherKeys = Object.keys(detailCounts).filter(k => !order.includes(k)).sort();
-    const rows = [...knownKeys, ...otherKeys];
-    if(!rows.length){
-      detailBody.innerHTML = '<div class="empty" style="padding:16px">해당 월 기록 없음</div>';
-    } else {
-      detailBody.innerHTML = `<div class="tw"><table>
-        <thead><tr><th>출석 세부 유형</th><th style="text-align:right">건수</th><th style="text-align:right">인원수</th></tr></thead>
-        <tbody>${rows.map(k => `<tr><td>${escapeHtml(k)}</td><td style="text-align:right">${detailCounts[k]}건</td><td style="text-align:right">${(detailMembers[k]||new Set()).size}명</td></tr>`).join('')}</tbody>
-      </table></div>`;
+  // 4. 호전 / 정체 / 악화 (전월 대비 출석률 변화)
+  function prevMonthOf(m){
+    const [y,mm] = m.split('-').map(Number);
+    const d = new Date(y, mm-2, 1);
+    return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+  }
+  function monthlyRate(id, mm){
+    const rs = RECORDS.filter(r => r.id===id && (r.date||'').slice(0,7)===mm);
+    if(!rs.length) return null;
+    const att = rs.filter(r => r.st==='QR인증' || r.st==='사유출석').length;
+    return att / rs.length * 100;
+  }
+  const pmo = prevMonthOf(mo);
+  let improved=0, sameCnt=0, worsened=0, noPrev=0;
+  targetMembers.forEach(m => {
+    const c = monthlyRate(m.id, mo);
+    const p = monthlyRate(m.id, pmo);
+    if(c===null || p===null){ noPrev++; return; }
+    const diff = c - p;
+    if(diff > 0.5) improved++;
+    else if(diff < -0.5) worsened++;
+    else sameCnt++;
+  });
+  if(changeGrid){
+    changeGrid.innerHTML =
+      `<div class="mc"><div class="lbl">호전</div><div class="val" style="color:var(--green)">${improved}<span style="font-size:12px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">전월 대비 +0.5%p 초과</div></div>` +
+      `<div class="mc"><div class="lbl">정체</div><div class="val" style="color:var(--text2)">${sameCnt}<span style="font-size:12px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">±0.5%p 이내</div></div>` +
+      `<div class="mc"><div class="lbl">악화</div><div class="val" style="color:var(--red)">${worsened}<span style="font-size:12px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">전월 대비 -0.5%p 초과${noPrev?` · 전월기록없음 ${noPrev}명`:''}</div></div>`;
+  }
+
+  // 5. 미접촉 타겟 — plans[id]가 없거나 1~5주차 모두 plan/date/done 비어있음
+  const plans = (typeof getPlans==='function') ? getPlans() : {};
+  function isUntouched(id){
+    const p = plans[id];
+    if(!p) return true;
+    for(let w=1; w<=5; w++){
+      const wk = p['w'+w];
+      if(wk && (String(wk.plan||'').trim() || String(wk.date||'').trim() || String(wk.done||'').trim())) return false;
     }
+    return true;
   }
+  const untouchedList = targetMembers.filter(m => isUntouched(m.id))
+    .sort((a,b) => (a.region||'').localeCompare(b.region||'','ko') || (a.team||'').localeCompare(b.team||'','ko') || (a.name||'').localeCompare(b.name||'','ko'));
+  window._hsUntouchedCache = untouchedList;
+  if(untouchedCard){
+    untouchedCard.innerHTML =
+      `<div class="mc" style="cursor:pointer" onclick="openUntouchedTargets()" title="클릭하면 명단 보기">` +
+        `<div class="lbl">미접촉 타겟 <span style="font-size:10px;color:var(--blue);font-weight:500;margin-left:4px">클릭 → 명단</span></div>` +
+        `<div class="val" style="color:var(--amber)">${untouchedList.length}<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div>` +
+        `<div class="sub">1~5주차 계획·실행이 한 건도 없는 타겟</div>` +
+      `</div>`;
+  }
+}
 
-  // 매주 예배 드린 인원 명단
-  if(weeklyBody){
-    if(!everyWeekIds.length){
-      weeklyBody.innerHTML = '<div class="empty" style="padding:16px">해당 인원 없음</div>';
-    } else {
-      const byId = new Map(MEMBERS.map(m=>[m.id,m]));
-      const list = everyWeekIds.map(id => byId.get(id)).filter(Boolean)
-        .sort((a,b) => (a.region||'').localeCompare(b.region||'','ko') || (a.team||'').localeCompare(b.team||'','ko') || (a.name||'').localeCompare(b.name||'','ko'));
-      weeklyBody.innerHTML = `<div class="tw"><table>
-        <thead><tr><th>지역</th><th>팀-구역</th><th>이름</th><th>유형</th></tr></thead>
-        <tbody>${list.map(m => `<tr><td>${escapeHtml(m.region||'')}</td><td>${escapeHtml((m.team||'')+'-'+(m.zone||''))}</td><td style="font-weight:600">${escapeHtml(m.name||'')}</td><td>${typeof typeBadge==='function'?typeBadge(m.type):escapeHtml(m.type||'')}</td></tr>`).join('')}</tbody>
+function openUntouchedTargets(){
+  const list = window._hsUntouchedCache || [];
+  const body = document.getElementById('untouched-body');
+  if(!body) return;
+  if(!list.length){
+    body.innerHTML = '<div class="empty" style="padding:20px">미접촉 타겟이 없습니다.</div>';
+  } else {
+    body.innerHTML = `<div style="font-size:11.5px;color:var(--text3);margin-bottom:8px">총 ${list.length}명</div>` +
+      `<div class="tw"><table>
+        <thead><tr><th>지역</th><th>팀-구역</th><th>이름</th></tr></thead>
+        <tbody>${list.map(m => `<tr><td>${escapeHtml(m.region||'')}</td><td>${escapeHtml((m.team||'')+'-'+(m.zone||''))}</td><td style="font-weight:600">${escapeHtml(m.name||'')}</td></tr>`).join('')}</tbody>
       </table></div>`;
-    }
   }
+  openModal('modal-untouched');
 }
 
 function exportHabitExcel() {
