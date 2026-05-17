@@ -2019,11 +2019,21 @@ function zoneNum(zoneStr) {
 // 지역 순서 고정
 const REGION_ORDER = ['도봉','성북','노원','중랑','강북','대학','이음','새신자'];
 function getRegions() {
+  // 지역 계정은 자신의 지역만 노출
+  if (typeof currentUser !== 'undefined' && currentUser && currentUser.role !== 'admin' && currentUser.region) {
+    return [currentUser.region];
+  }
   const inData = [...new Set(MEMBERS.map(m => m.region))];
   // 지정된 순서대로, 없는 지역은 뒤에 추가
   return [...REGION_ORDER.filter(r => inData.includes(r)), ...inData.filter(r => !REGION_ORDER.includes(r))];
 }
-function getTeams() { return [...new Set(MEMBERS.map(m => m.team))]; }
+function getTeams() {
+  // 지역 계정은 자신의 지역에 속한 팀만 노출
+  if (typeof currentUser !== 'undefined' && currentUser && currentUser.role !== 'admin' && currentUser.region) {
+    return [...new Set(MEMBERS.filter(m => m.region === currentUser.region).map(m => m.team))];
+  }
+  return [...new Set(MEMBERS.map(m => m.team))];
+}
 
 // ── Chart utils ──
 const PCT_TICK = { callback: v => fmtPct(v) + '%' };
@@ -2098,7 +2108,9 @@ function populateSelects() {
   const attMem = document.getElementById('att-member');
   if (attMem) {
     while (attMem.options.length > 1) attMem.remove(1);
-    MEMBERS.forEach(m => attMem.appendChild(new Option(`${m.name} (${m.id})`, m.id)));
+    // 지역 계정은 자신의 지역 멤버만 (관리자만 전체 명단 노출)
+    const memSource = (currentUser && currentUser.role === 'admin') ? MEMBERS : getFilteredMembers();
+    memSource.forEach(m => attMem.appendChild(new Option(`${m.name} (${m.id})`, m.id)));
   }
   rebuildMonthSelector(false);
 }
@@ -3578,7 +3590,9 @@ function exportCSV(){
   // Header: 날짜 컬럼 추가, 이달출석·이달총횟수 제거, 출석률은 자동계산 유지
   const rows=[['고유번호','지역','팀-구역','이름','유형','등록구분','출석유형','사유','날짜','연속결석횟수','출석률(%)','마지막출석일','습결자타겟','E단계타겟']];
   const targets = getTargets();
-  MEMBERS.forEach(m=>{
+  // 지역 계정은 자신의 지역 멤버만 내보냄
+  const exportMembers = (currentUser && currentUser.role === 'admin') ? MEMBERS : getFilteredMembers();
+  exportMembers.forEach(m=>{
     const r=latestRec(m.id)||{};
     const a=monthAttend(m.id),t=monthTotal(m.id),p=t?Math.round(a/t*100):0;
     const sk=latestStreak(m.id);
@@ -10540,8 +10554,9 @@ function patchStatSumDelta(){
 
 /* ══ 7. 8회 이상 결석자 전용 페이지 ══ */
 function getLongAbsentList(regFilter,typeFilter){
-  // MEMBERS 전체 사용 (_retired 제외, 현역만) — 지역 필터는 여기서만 적용
+  // 지역 계정은 자신의 지역만 (관리자만 전체 명단)
   var members = safe(function(){
+    if(typeof getFilteredMembers==='function') return getFilteredMembers().filter(function(m){return m && m.id;});
     var all = Array.isArray(window.MEMBERS) ? window.MEMBERS : (typeof MEMBERS!=='undefined' ? MEMBERS : []);
     return all.filter(function(m){ return m && m.id && !m._retired; });
   }, []);
