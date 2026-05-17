@@ -10,61 +10,6 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
-<!-- [TEMP DEBUG] window.RECORDS 모든 대입을 가로채서 길이, 5/3 카운트, stack을 콘솔에 출력 -->
-<!-- 어떤 코드가 9705(5/3 1618) → 8063(5/3 0)으로 덮어쓰는지 정확히 식별하기 위함 -->
-<script id="records-set-trace">
-(function(){
-  // 이미 존재하는 값이 있으면 보존 (없으면 undefined)
-  var _stored = (typeof window.RECORDS !== 'undefined') ? window.RECORDS : undefined;
-  var _setCount = 0;
-  function _count53(v){
-    if(!Array.isArray(v)) return 0;
-    var n = 0;
-    for(var i=0; i<v.length; i++){
-      var r = v[i];
-      if(r && r.date === '2026-05-03') n++;
-    }
-    return n;
-  }
-  function _logSet(v){
-    _setCount++;
-    try{
-      var len = Array.isArray(v) ? v.length : (v == null ? '(null/undef)' : '(not-array:'+typeof v+')');
-      var n53 = _count53(v);
-      var stack = '';
-      try{ throw new Error('trace'); }catch(e){ stack = (e.stack || '').split('\n').slice(2, 12).join('\n  '); }
-      console.log('[RECORDS-SET #' + _setCount + '] len=', len, ', date=2026-05-03 count=', n53, '\n  from:\n  ' + stack);
-    }catch(e){}
-  }
-  try{
-    Object.defineProperty(window, 'RECORDS', {
-      configurable: true,
-      enumerable: true,
-      get: function(){ return _stored; },
-      set: function(v){ _logSet(v); _stored = v; }
-    });
-    // 초기값이 있었으면 그 사실도 한 번 로그
-    if(typeof _stored !== 'undefined'){
-      try{ console.log('[RECORDS-TRACE] setter installed with pre-existing value, len=', Array.isArray(_stored)?_stored.length:'(not array)', ', 5/3=', _count53(_stored)); }catch(e){}
-    } else {
-      try{ console.log('[RECORDS-TRACE] setter installed (no pre-existing value)'); }catch(e){}
-    }
-  }catch(e){
-    console.error('[RECORDS-TRACE] failed to install setter:', e);
-  }
-  // 추가 안전망: 콘솔에서 검사 가능한 헬퍼
-  window._recordsTraceStats = function(){
-    var v = _stored;
-    return {
-      type: typeof v,
-      isArray: Array.isArray(v),
-      length: Array.isArray(v) ? v.length : null,
-      count_2026_05_03: _count53(v),
-      total_sets_so_far: _setCount
-    };
-  };
-})();
-</script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap');
 :root{
@@ -806,8 +751,6 @@ body.llf-pin-loading::before{
 <!-- ====== REGION ====== -->
 <div id="page-region" class="page">
   <div class="ph"><h2>지역·팀·구역별 현황</h2><p>계층별 출석률 비교</p></div>
-  <!-- [TEMP DEBUG] 도봉 전주 대비 계산 추적용. 원인 파악 후 제거 예정 -->
-  <div id="wow-debug-box" style="background:#fff3cd;border:2px solid #f0c040;border-radius:8px;padding:12px;margin-bottom:14px;font-family:var(--mono,monospace);font-size:11.5px;line-height:1.7;color:#7a5a00;white-space:pre-wrap"></div>
   <div class="tabs">
     <button class="tb on" onclick="regTab('region',this)">지역 비교</button>
     <button class="tb" onclick="regTab('team',this)">팀별</button>
@@ -1498,53 +1441,24 @@ function fbRecordsFromVal(rawObj){
   if(!rawObj || typeof rawObj !== 'object') return [];
   var out = [];
   var keys = Object.keys(rawObj);
-  // [TEMP DEBUG] 5/3 추적용 카운터
-  var c = {
-    totalKeys: keys.length,
-    nullValue: 0, nonObject: 0,
-    k53_total: 0,         // 키 suffix _2026-05-03인 항목 수
-    k53_valDateEq: 0,     // 위 중 value.date === '2026-05-03'
-    k53_valDateOther: 0,  // 위 중 value.date 가 있긴 한데 다른 값
-    k53_valDateEmpty: 0,  // 위 중 value.date가 비어 있음
-    k53_recovered: 0,     // 위 중 키 suffix에서 복구하여 최종 date='2026-05-03'된 수
-    k53_skipped: 0,       // 위 중 id/date 부족으로 skip
-    finalDate53: 0        // out 배열에 date='2026-05-03'로 들어간 최종 수
-  };
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
     var r = rawObj[key];
-    var isK53 = !!String(key).match(/_2026-05-03$/);
-    if (isK53) c.k53_total++;
-    if (!r) { if(isK53) c.k53_skipped++; c.nullValue++; continue; }
-    if (typeof r !== 'object') { if(isK53) c.k53_skipped++; c.nonObject++; continue; }
-
+    if (!r || typeof r !== 'object') continue;
     // 1) 우선 value.date 사용
-    var rawValDate = (r.date != null) ? String(r.date).trim() : '';
-    if (isK53) {
-      if (rawValDate === '2026-05-03') c.k53_valDateEq++;
-      else if (rawValDate) c.k53_valDateOther++;
-      else c.k53_valDateEmpty++;
-    }
-    var date = rawValDate || '';
-    var recoveredFromKey = false;
+    var date = (r.date != null) ? String(r.date).trim() : '';
     // 2) 비어있으면 키 suffix _YYYY-(M|MM)-(D|DD) 에서 복구
     if (!date && key) {
       var m = String(key).match(/_(\d{4}-\d{1,2}-\d{1,2})$/);
       if (m) {
         var p = m[1].split('-');
         date = p[0] + '-' + String(parseInt(p[1],10)||0).padStart(2,'0') + '-' + String(parseInt(p[2],10)||0).padStart(2,'0');
-        recoveredFromKey = true;
       }
     }
     // 3) id 도 동일하게 복구 (value.id 없으면 key에서 _date suffix를 떼고)
     var id = (r.id != null && String(r.id).trim()) || '';
     if (!id && key) id = String(key).replace(/_\d{4}-\d{1,2}-\d{1,2}$/, '');
-    if (!id || !date) {
-      if(isK53) c.k53_skipped++;
-      continue;
-    }
-    if (isK53 && recoveredFromKey && date === '2026-05-03') c.k53_recovered++;
-    if (date === '2026-05-03') c.finalDate53++;
+    if (!id || !date) continue;
     out.push({
       id: id,
       date: date,
@@ -1555,40 +1469,9 @@ function fbRecordsFromVal(rawObj){
       streak: r.streak || 0
     });
   }
-  // [TEMP DEBUG] 5/3 트레이스 콘솔 로그
-  try {
-    console.log('[5/3 trace] fbRecordsFromVal:', JSON.stringify(c));
-  } catch(e){}
-  // window 에 마지막 통계 노출 → dbg53() 에서 참조
-  try { window._fbVal53Stats = c; } catch(e){}
   return out;
 }
 window.fbRecordsFromVal = fbRecordsFromVal;
-
-// [TEMP DEBUG] 콘솔에서 dbg53() 호출 시 5/3 관련 상태 일괄 출력
-window.dbg53 = function(){
-  var w = window.RECORDS || [];
-  var l = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS : [];
-  var fr = window.FINAL_RECORDS || [];
-  function summarize(name, arr){
-    var total = arr.length;
-    var d53 = arr.filter(function(r){return r && r.date==='2026-05-03';}).length;
-    var d53Other = arr.filter(function(r){return r && r.date && r.date!=='2026-05-03' && (r.date.indexOf('05-03')>=0 || r.date.indexOf('5-3')>=0);}).length;
-    var datesSet = {};
-    arr.forEach(function(r){ if(r && r.date) datesSet[r.date]=(datesSet[r.date]||0)+1; });
-    return {name:name, total:total, date_2026_05_03:d53, other_5_3_format:d53Other, allDates:datesSet};
-  }
-  var report = {
-    fbRecordsFromVal_lastStats: window._fbVal53Stats || null,
-    window_RECORDS: summarize('window.RECORDS', w),
-    local_RECORDS: summarize('RECORDS (lexical)', l),
-    FINAL_RECORDS: summarize('FINAL_RECORDS', fr),
-    sample_window_5_03: w.filter(function(r){return r && r.date==='2026-05-03';}).slice(0,3),
-    sample_window_other_5_3: w.filter(function(r){return r && r.date && r.date!=='2026-05-03' && (r.date.indexOf('05-03')>=0 || r.date.indexOf('5-3')>=0);}).slice(0,3)
-  };
-  console.log('[5/3 dbg53]', report);
-  return report;
-};
 
 let fbApp = null;
 let fbDB = null;
@@ -1801,25 +1684,11 @@ async function loadFromDB() {
       }));
     }
     if (rSnap.exists()) {
-      // [TEMP DEBUG] rSnap의 raw key 통계
-      try {
-        var _rawObj = rSnap.val() || {};
-        var _rawKeys = Object.keys(_rawObj);
-        var _rawK53 = _rawKeys.filter(function(k){return /_2026-05-03$/.test(k);}).length;
-        console.log('[5/3 trace] loadFromDB rSnap raw keys total:', _rawKeys.length, ', keys ending _2026-05-03:', _rawK53);
-      } catch(e){}
-
       RECORDS = fbRecordsFromVal(rSnap.val()).map(r => ({
         id: r.id, date: r.date, wk: r.wk,
         day: r.day, st: r.st, rsn: reasonDisplayLabel(r.rsn||'', r.st||''), streak: r.streak
       }));
       invalidateRecordIndex();
-      // [TEMP DEBUG] mapping 후 RECORDS 내 5/3 카운트
-      try {
-        var _r53 = RECORDS.filter(function(r){return r.date==='2026-05-03';}).length;
-        var _r53Other = RECORDS.filter(function(r){return r.date && r.date.indexOf('05-03')>=0 && r.date!=='2026-05-03';}).length;
-        console.log('[5/3 trace] loadFromDB after fbRecordsFromVal: RECORDS count=', RECORDS.length, ', date=2026-05-03:', _r53, ', other-05-03-format:', _r53Other);
-      } catch(e){}
     }
     if (eSnap.exists()) {
       localStorage.setItem('att_estage_data', JSON.stringify(eSnap.val()));
@@ -2720,22 +2589,6 @@ function renderStatSum() {
               const cls=delta>0?'up':delta<0?'dn':'eq';
               const sign=delta>0?'+':'';
               deltaHtml=` <span class="v115-delta ${cls}" style="font-size:10px">${sign}${delta.toFixed(1)}%</span>`;
-              // [TEMP DEBUG] 도봉만 별도 디버그 박스에 누적 기록 (통계 페이지)
-              if(r==='도봉'){
-                try{
-                  const dbg=document.getElementById('wow-debug-box');
-                  if(dbg){
-                    dbg.textContent += '\n\n[통계 페이지 범례 — st-reg-legend @line ~2526]\n' +
-                      '도봉 전주 대비:\n' +
-                      '  statDate() = ' + _statD + '\n' +
-                      '  _cur = ' + _cur + '\n' +
-                      '  _prev = ' + _prev + '\n' +
-                      '  cur(statGs) = ' + cur + '%\n' +
-                      '  prev = ' + prev + '%\n' +
-                      '  delta = ' + delta + '%';
-                  }
-                }catch(e){}
-              }
             }
           }
         }
@@ -3072,153 +2925,28 @@ function renderRegionCards(){
             // 더 과거 날짜를 _prev로 잡는 버그가 발생함 (예: 도봉 5/10 vs 5/3 비교가
             // 5/3 누락 시 5/10 vs 4/26으로 계산되어 부호가 뒤집힘)
             var _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-            // [TEMP DEBUG] _allR(window.RECORDS) 안에 5/3이 몇 개 있는지 추적
-            var _dbg_winRecsAll = _allR.length;
-            var _dbg_winRecs53 = 0;
-            var _dbg_winRecs53Other = 0;
-            var _dbg_winRecsDohbong53 = 0;
-            var _dbg_winRecsDate53Samples = [];
-            var _dbg_typeofDate53Samples = [];
-            for (var _di=0; _di<_allR.length; _di++) {
-              var _dr = _allR[_di];
-              if (!_dr) continue; // sparse array hole or null
-              var _drdRaw = _dr.date;
-              var _drd = String(_drdRaw == null ? '' : _drdRaw);
-              if (_drd === '2026-05-03') {
-                _dbg_winRecs53++;
-                if (_dbg_winRecsDate53Samples.length < 2) {
-                  _dbg_winRecsDate53Samples.push(_dr);
-                  _dbg_typeofDate53Samples.push({typeof: typeof _drdRaw, raw: _drdRaw, length: _drd.length, sliced: _drd.slice(0,10), eqSliced: _drd.slice(0,10) === '2026-05-03'});
-                }
-              } else if (_drd.indexOf('05-03') >= 0 || _drd.indexOf('5-3') >= 0) {
-                _dbg_winRecs53Other++;
-                if (_dbg_winRecsDate53Samples.length < 2) {
-                  _dbg_winRecsDate53Samples.push(_dr);
-                  _dbg_typeofDate53Samples.push({typeof: typeof _drdRaw, raw: _drdRaw, length: _drd.length, sliced: _drd.slice(0,10), eqSliced: _drd.slice(0,10) === '2026-05-03'});
-                }
-              }
-            }
-            // [TEMP DEBUG] _allDates 빌드: forEach 와 동일한 로직을 풀어쓰며 단계별 추적
             var _allDates=[];
-            var _dbg_forEach_iters = 0;
-            var _dbg_forEach_seen53 = 0;       // forEach 안에서 dd === '2026-05-03' 본 횟수
-            var _dbg_forEach_pushed53 = 0;     // 그 중 실제 push 된 횟수 (1이어야 정상)
-            var _dbg_forEach_skipEmpty = 0;
-            var _dbg_forEach_skipDup = 0;
             _allR.forEach(function(r){
-              _dbg_forEach_iters++;
               var dd=String(r&&r.date||'').slice(0,10);
-              if (!dd) { _dbg_forEach_skipEmpty++; return; }
-              if (dd === '2026-05-03') {
-                _dbg_forEach_seen53++;
-                if (_allDates.indexOf(dd) < 0) {
-                  _allDates.push(dd);
-                  _dbg_forEach_pushed53++;
-                } else {
-                  _dbg_forEach_skipDup++;
-                }
-                return;
-              }
-              if (_allDates.indexOf(dd) < 0) _allDates.push(dd);
+              if(dd && _allDates.indexOf(dd) < 0) _allDates.push(dd);
             });
             _allDates.sort();
-            // [TEMP DEBUG] _allDates 안의 5/3 포함 여부
-            var _dbg_allDatesHas53 = _allDates.indexOf('2026-05-03') >= 0;
-            // [TEMP DEBUG] 도봉 region card 진입 시점에 한 번 콘솔에 통째로 덤프
-            if (reg === '도봉') {
-              try {
-                console.log('[5/3 trace @renderRegionCards 도봉]',
-                  '_allR.length=', _dbg_winRecsAll,
-                  '| Array.isArray(window.RECORDS)=', Array.isArray(window.RECORDS),
-                  '| _allR===window.RECORDS?', _allR === window.RECORDS,
-                  '| date==="2026-05-03"건수=', _dbg_winRecs53,
-                  '| 다른5/3형식건수=', _dbg_winRecs53Other,
-                  '| forEach iters=', _dbg_forEach_iters,
-                  '| forEach saw 5/3=', _dbg_forEach_seen53,
-                  '| forEach pushed 5/3=', _dbg_forEach_pushed53,
-                  '| forEach skipEmpty=', _dbg_forEach_skipEmpty,
-                  '| _allDates.length=', _allDates.length,
-                  '| _allDates includes 2026-05-03?', _dbg_allDatesHas53,
-                  '| _allDates=', _allDates,
-                  '| sample 5/3 typeof=', _dbg_typeofDate53Samples);
-              } catch(e){}
-            }
             var _cur=d||(_allDates.length?_allDates[_allDates.length-1]:'');
             if(!_cur)return'';
             var _prev=''; for(var _pi=_allDates.length-1;_pi>=0;_pi--){if(_allDates[_pi]<_cur){_prev=_allDates[_pi];break;}}
             if(!_prev)return'';
             var _mids=new Set(FM.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
-            // [TEMP DEBUG] 도봉 멤버 ID로 직접 필터한 5/3 레코드 수
-            if(reg==='도봉'){
-              _dbg_winRecsDohbong53 = _allR.filter(function(r){return r && r.date==='2026-05-03' && _mids.has(r.id);}).length;
-            }
             var _cR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_cur;});
             var _pR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_prev;});
             if(_cR.length&&_pR.length){
               // 표시값 pct1(qr+sa, t)과 동일한 공식 사용
               var _cA=_cR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
               var _pA=_pR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
-              var _curRate = _cA/_cR.length*100;
-              var _prevRate = _pA/_pR.length*100;
               var _delta=Math.round((_cA/_cR.length-_pA/_pR.length)*1000)/10;
               var _cls=_delta>0?'up':_delta<0?'dn':'eq';
-              // [TEMP DEBUG] 도봉만 디버그 박스에 기록
-              if(reg==='도봉'){
-                try{
-                  var dbg=document.getElementById('wow-debug-box');
-                  if(dbg){
-                    var sample=_allDates.slice(-6).join(', ');
-                    var _stats = window._fbVal53Stats ? JSON.stringify(window._fbVal53Stats) : '(아직 없음 — Firebase 로드 전이거나 fbRecordsFromVal 미발화)';
-                    var _sampleRec = '';
-                    if (_dbg_winRecsDate53Samples.length) {
-                      try { _sampleRec = JSON.stringify(_dbg_winRecsDate53Samples[0]); } catch(e){ _sampleRec='(stringify fail)'; }
-                    }
-                    dbg.textContent =
-                      '[지역 카드 헤더 — renderRegionCards inline @line ~2876]\n' +
-                      '도봉 전주 대비 계산:\n' +
-                      '  d (statDate) = ' + (d||'(없음)') + '\n' +
-                      '  _allDates (마지막 6개) = ' + sample + '\n' +
-                      '  _cur = ' + _cur + ' (이번 주)\n' +
-                      '    _cR.length = ' + _cR.length + ', _cA(QR+사유출석) = ' + _cA + '\n' +
-                      '    cur 출석률 = ' + _curRate.toFixed(4) + '%\n' +
-                      '  _prev = ' + _prev + ' (지난 주)\n' +
-                      '    _pR.length = ' + _pR.length + ', _pA(QR+사유출석) = ' + _pA + '\n' +
-                      '    prev 출석률 = ' + _prevRate.toFixed(4) + '%\n' +
-                      '  delta = ' + _curRate.toFixed(4) + ' - ' + _prevRate.toFixed(4) + ' = ' + (_curRate-_prevRate).toFixed(4) + '%\n' +
-                      '  표시값 (반올림) = ' + (_delta>0?'+':'') + _delta.toFixed(1) + '%\n' +
-                      '\n[5/3 트레이스]\n' +
-                      '  Array.isArray(window.RECORDS) = ' + Array.isArray(window.RECORDS) + '\n' +
-                      '  _allR === window.RECORDS ? ' + (_allR === window.RECORDS) + '\n' +
-                      '  window.RECORDS 총 ' + _dbg_winRecsAll + '건 중\n' +
-                      '    date === "2026-05-03" : ' + _dbg_winRecs53 + '건\n' +
-                      '    date 다른 5/3 형식    : ' + _dbg_winRecs53Other + '건\n' +
-                      '    그중 도봉 멤버      : ' + _dbg_winRecsDohbong53 + '건\n' +
-                      '  forEach 단계별:\n' +
-                      '    총 iter = ' + _dbg_forEach_iters + '\n' +
-                      '    dd === "2026-05-03" 본 횟수 = ' + _dbg_forEach_seen53 + '\n' +
-                      '    그 중 _allDates 에 push 한 횟수 = ' + _dbg_forEach_pushed53 + '\n' +
-                      '    빈 dd 로 skip = ' + _dbg_forEach_skipEmpty + '\n' +
-                      '    이미 들어있어 skip = ' + _dbg_forEach_skipDup + '\n' +
-                      '  _allDates 안에 "2026-05-03" 포함? : ' + (_dbg_allDatesHas53 ? 'YES' : 'NO') + '\n' +
-                      '  _allDates (전체) = ' + _allDates.join(', ') + '\n' +
-                      '  Firebase 로더 통계 (fbRecordsFromVal):\n    ' + _stats + (_sampleRec ? '\n  샘플 레코드: ' + _sampleRec + (_dbg_typeofDate53Samples.length ? '\n  샘플 date 타입: ' + JSON.stringify(_dbg_typeofDate53Samples[0]) : '') : '');
-                  }
-                }catch(e){}
-              }
               return '<span class="v115-delta '+_cls+'" style="font-size:11px;white-space:nowrap">'+((_delta>0)?'+':'')+_delta.toFixed(1)+'%</span>';
-            } else if(reg==='도봉'){
-              try{
-                var dbg2=document.getElementById('wow-debug-box');
-                if(dbg2){
-                  dbg2.textContent = '[지역 카드 헤더] 도봉 — _cR.length=' + _cR.length + ', _pR.length=' + _pR.length + ' → delta 계산 안 됨 (둘 중 하나가 비어있음)';
-                }
-              }catch(e){}
             }
-          }catch(e){
-            if(reg==='도봉'){
-              try{ var dbg3=document.getElementById('wow-debug-box'); if(dbg3) dbg3.textContent = '[지역 카드 헤더] 도봉 — 예외 발생: ' + (e.message||e); }catch(_){}
-            }
-          }
+          }catch(e){}
           return '';
         })()}
       </div>
@@ -8692,22 +8420,11 @@ body.v97-data-loading #login-screen{z-index:9999;}
     try {
       MEMBERS = FINAL_MEMBERS.map(function(m){ return Object.assign({}, m); });
       RECORDS = FINAL_RECORDS.map(function(r){ return Object.assign({}, r, {date:nd(r.date), st:status(r.st)}); });
-      // [TEMP DEBUG] FINAL_RECORDS 의 5/3 카운트
-      try {
-        var _fr53 = FINAL_RECORDS.filter(function(r){return r && r.date==='2026-05-03';}).length;
-        var _rec53 = RECORDS.filter(function(r){return r.date==='2026-05-03';}).length;
-        console.log('[5/3 trace] applyFinalData: FINAL_RECORDS total=', FINAL_RECORDS.length, ', FINAL_RECORDS date=2026-05-03:', _fr53, ', RECORDS after map date=2026-05-03:', _rec53);
-      } catch(e){}
       // 전역 RECORDS/MEMBERS도 업데이트
       if(Array.isArray(window.RECORDS)){window.RECORDS.length=0; RECORDS.forEach(function(r){window.RECORDS.push(r);});}
       else { window.RECORDS = RECORDS.slice(); }
       if(Array.isArray(window.MEMBERS)){window.MEMBERS.length=0; MEMBERS.forEach(function(m){window.MEMBERS.push(m);});}
       else { window.MEMBERS = MEMBERS.slice(); }
-      // [TEMP DEBUG] window.RECORDS 동기화 후 카운트
-      try {
-        var _w53 = (window.RECORDS||[]).filter(function(r){return r && r.date==='2026-05-03';}).length;
-        console.log('[5/3 trace] applyFinalData: window.RECORDS date=2026-05-03:', _w53);
-      } catch(e){}
       if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
       localStorage.setItem('att_members_v1', JSON.stringify(MEMBERS));
       localStorage.setItem('att_records_v1', JSON.stringify(RECORDS));
@@ -11618,16 +11335,13 @@ window.addEventListener('load',function(){
           // valid = id 와 date 가 모두 있는 레코드만
           var cachedRValid = cachedR.filter(function(x){return x && x.id && x.date;}).length;
           var currentRValid = Array.isArray(RECORDS) ? RECORDS.filter(function(x){return x && x.id && x.date;}).length : 0;
-          try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache RECORDS valid=', cachedRValid, ', current RECORDS valid=', currentRValid); }catch(e){}
           if(cachedRValid > currentRValid){
             // 캐시가 더 풍부 → 사용 (단, date 가 빈 레코드는 거름)
             RECORDS = cachedR.filter(function(x){return x && x.id && x.date;});
             hasLocal = true;
-            try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache used, RECORDS now=', RECORDS.length); }catch(e){}
           } else if(currentRValid > 0){
             // 현재 RECORDS 가 더 풍부함 (applyFinalData 결과) — 캐시로 덮어쓰지 않음
             hasLocal = true;
-            try{ console.log('[5/3 trace] minjiFastLoad Step 1: cache SKIPPED, keeping current RECORDS (', currentRValid, '건)'); }catch(e){}
           }
         }catch(e){ console.warn('[minjiFastLoad] RECORDS cache parse fail', e); }
       }
@@ -11676,13 +11390,9 @@ window.addEventListener('load',function(){
             }).filter(function(rr){return rr && rr.id && rr.date;}); // valid 만
             // Firebase 데이터가 현재 RECORDS 보다 풍부할 때만 덮어쓰기 — 누락 분 보호
             var currentRValid2 = Array.isArray(RECORDS) ? RECORDS.filter(function(x){return x && x.id && x.date;}).length : 0;
-            try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase RECORDS valid=', fbRecs.length, ', current=', currentRValid2); }catch(e){}
             if(fbRecs.length >= currentRValid2){
               RECORDS = fbRecs;
               updated = true;
-              try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase used, RECORDS now=', RECORDS.length); }catch(e){}
-            } else {
-              try{ console.log('[5/3 trace] minjiFastLoad Step 2: Firebase SKIPPED (현재가 더 풍부), keeping current RECORDS'); }catch(e){}
             }
           }
           if(eSnap.exists()){ try{localStorage.setItem('att_estage_data',JSON.stringify(eSnap.val()));}catch(e){} }
