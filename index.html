@@ -8369,11 +8369,17 @@ body.v97-data-loading #login-screen{z-index:9999;}
     if(!window.RECORDS.length && typeof FINAL_RECORDS!=='undefined' && Array.isArray(FINAL_RECORDS)) {
       FINAL_RECORDS.forEach(r=>window.RECORDS.push(Object.assign({},r)));
     }
-    // 기록은 4월 등 과거 기록은 보존, 5월은 업로드 기준으로 교체. 홍승혁/5-13/비재적 제거.
+    // 기록은 4월 등 과거 기록은 보존. MAY_RECORDS 가 커버하는 날짜만 원본에서 빼고 MAY_RECORDS 로 교체.
+    // (과거 버그: 전체 5월을 drop 하고 MAY_RECORDS=5/10 1616건만 다시 넣어서 5/3 1618건이 통째로 사라짐.
+    //  여기 _mayDates 로 정확히 MAY_RECORDS 가 가진 날짜 집합만 빼면 5/3 같은 다른 5월 날짜는 보존된다.)
+    const _mayDates = new Set();
+    if (typeof MAY_RECORDS !== 'undefined' && Array.isArray(MAY_RECORDS)) {
+      MAY_RECORDS.forEach(function(r){ if (r && r.date) _mayDates.add(nd(r.date)); });
+    }
     const out=[]; const seen=new Set();
     (window.RECORDS||[]).forEach(r=>{
       if(!r||isHong(r))return; let id=fixedId(r.id,r.name||r['이름'],r.region||r['지역']); if(!MASTER_IDS.has(id))return; let d=nd(r.date); if(!d||d==='2026-05-13')return;
-      if(d.startsWith('2026-05')) return; // 5월은 아래 MAY_RECORDS로 확정 교체
+      if(_mayDates.has(d)) return; // MAY_RECORDS 커버 날짜만 교체, 나머지 5월 날짜는 원본 보존
       let ns=normStatus(r.st||r['출석유형']||r['출결'],r.rsn||r['사유']); let key=id+'|'+d; if(seen.has(key))return; seen.add(key);
       out.push({id,date:d,wk:Number(r.wk)||Math.ceil(+d.slice(8,10)/7)||1,day:r.day||'일',st:ns.st,rsn:ns.rsn,streak:Number(r.streak)||0});
     });
