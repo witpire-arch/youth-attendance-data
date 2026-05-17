@@ -10,6 +10,61 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<!-- [TEMP DEBUG] window.RECORDS 모든 대입을 가로채서 길이, 5/3 카운트, stack을 콘솔에 출력 -->
+<!-- 어떤 코드가 9705(5/3 1618) → 8063(5/3 0)으로 덮어쓰는지 정확히 식별하기 위함 -->
+<script id="records-set-trace">
+(function(){
+  // 이미 존재하는 값이 있으면 보존 (없으면 undefined)
+  var _stored = (typeof window.RECORDS !== 'undefined') ? window.RECORDS : undefined;
+  var _setCount = 0;
+  function _count53(v){
+    if(!Array.isArray(v)) return 0;
+    var n = 0;
+    for(var i=0; i<v.length; i++){
+      var r = v[i];
+      if(r && r.date === '2026-05-03') n++;
+    }
+    return n;
+  }
+  function _logSet(v){
+    _setCount++;
+    try{
+      var len = Array.isArray(v) ? v.length : (v == null ? '(null/undef)' : '(not-array:'+typeof v+')');
+      var n53 = _count53(v);
+      var stack = '';
+      try{ throw new Error('trace'); }catch(e){ stack = (e.stack || '').split('\n').slice(2, 12).join('\n  '); }
+      console.log('[RECORDS-SET #' + _setCount + '] len=', len, ', date=2026-05-03 count=', n53, '\n  from:\n  ' + stack);
+    }catch(e){}
+  }
+  try{
+    Object.defineProperty(window, 'RECORDS', {
+      configurable: true,
+      enumerable: true,
+      get: function(){ return _stored; },
+      set: function(v){ _logSet(v); _stored = v; }
+    });
+    // 초기값이 있었으면 그 사실도 한 번 로그
+    if(typeof _stored !== 'undefined'){
+      try{ console.log('[RECORDS-TRACE] setter installed with pre-existing value, len=', Array.isArray(_stored)?_stored.length:'(not array)', ', 5/3=', _count53(_stored)); }catch(e){}
+    } else {
+      try{ console.log('[RECORDS-TRACE] setter installed (no pre-existing value)'); }catch(e){}
+    }
+  }catch(e){
+    console.error('[RECORDS-TRACE] failed to install setter:', e);
+  }
+  // 추가 안전망: 콘솔에서 검사 가능한 헬퍼
+  window._recordsTraceStats = function(){
+    var v = _stored;
+    return {
+      type: typeof v,
+      isArray: Array.isArray(v),
+      length: Array.isArray(v) ? v.length : null,
+      count_2026_05_03: _count53(v),
+      total_sets_so_far: _setCount
+    };
+  };
+})();
+</script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap');
 :root{
