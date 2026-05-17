@@ -1443,24 +1443,53 @@ function fbRecordsFromVal(rawObj){
   if(!rawObj || typeof rawObj !== 'object') return [];
   var out = [];
   var keys = Object.keys(rawObj);
+  // [TEMP DEBUG] 5/3 추적용 카운터
+  var c = {
+    totalKeys: keys.length,
+    nullValue: 0, nonObject: 0,
+    k53_total: 0,         // 키 suffix _2026-05-03인 항목 수
+    k53_valDateEq: 0,     // 위 중 value.date === '2026-05-03'
+    k53_valDateOther: 0,  // 위 중 value.date 가 있긴 한데 다른 값
+    k53_valDateEmpty: 0,  // 위 중 value.date가 비어 있음
+    k53_recovered: 0,     // 위 중 키 suffix에서 복구하여 최종 date='2026-05-03'된 수
+    k53_skipped: 0,       // 위 중 id/date 부족으로 skip
+    finalDate53: 0        // out 배열에 date='2026-05-03'로 들어간 최종 수
+  };
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
     var r = rawObj[key];
-    if (!r || typeof r !== 'object') continue;
+    var isK53 = !!String(key).match(/_2026-05-03$/);
+    if (isK53) c.k53_total++;
+    if (!r) { if(isK53) c.k53_skipped++; c.nullValue++; continue; }
+    if (typeof r !== 'object') { if(isK53) c.k53_skipped++; c.nonObject++; continue; }
+
     // 1) 우선 value.date 사용
-    var date = (r.date != null && String(r.date).trim()) || '';
+    var rawValDate = (r.date != null) ? String(r.date).trim() : '';
+    if (isK53) {
+      if (rawValDate === '2026-05-03') c.k53_valDateEq++;
+      else if (rawValDate) c.k53_valDateOther++;
+      else c.k53_valDateEmpty++;
+    }
+    var date = rawValDate || '';
+    var recoveredFromKey = false;
     // 2) 비어있으면 키 suffix _YYYY-(M|MM)-(D|DD) 에서 복구
     if (!date && key) {
       var m = String(key).match(/_(\d{4}-\d{1,2}-\d{1,2})$/);
       if (m) {
         var p = m[1].split('-');
         date = p[0] + '-' + String(parseInt(p[1],10)||0).padStart(2,'0') + '-' + String(parseInt(p[2],10)||0).padStart(2,'0');
+        recoveredFromKey = true;
       }
     }
     // 3) id 도 동일하게 복구 (value.id 없으면 key에서 _date suffix를 떼고)
     var id = (r.id != null && String(r.id).trim()) || '';
     if (!id && key) id = String(key).replace(/_\d{4}-\d{1,2}-\d{1,2}$/, '');
-    if (!id || !date) continue;
+    if (!id || !date) {
+      if(isK53) c.k53_skipped++;
+      continue;
+    }
+    if (isK53 && recoveredFromKey && date === '2026-05-03') c.k53_recovered++;
+    if (date === '2026-05-03') c.finalDate53++;
     out.push({
       id: id,
       date: date,
@@ -1471,9 +1500,40 @@ function fbRecordsFromVal(rawObj){
       streak: r.streak || 0
     });
   }
+  // [TEMP DEBUG] 5/3 트레이스 콘솔 로그
+  try {
+    console.log('[5/3 trace] fbRecordsFromVal:', JSON.stringify(c));
+  } catch(e){}
+  // window 에 마지막 통계 노출 → dbg53() 에서 참조
+  try { window._fbVal53Stats = c; } catch(e){}
   return out;
 }
 window.fbRecordsFromVal = fbRecordsFromVal;
+
+// [TEMP DEBUG] 콘솔에서 dbg53() 호출 시 5/3 관련 상태 일괄 출력
+window.dbg53 = function(){
+  var w = window.RECORDS || [];
+  var l = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS : [];
+  var fr = window.FINAL_RECORDS || [];
+  function summarize(name, arr){
+    var total = arr.length;
+    var d53 = arr.filter(function(r){return r && r.date==='2026-05-03';}).length;
+    var d53Other = arr.filter(function(r){return r && r.date && r.date!=='2026-05-03' && (r.date.indexOf('05-03')>=0 || r.date.indexOf('5-3')>=0);}).length;
+    var datesSet = {};
+    arr.forEach(function(r){ if(r && r.date) datesSet[r.date]=(datesSet[r.date]||0)+1; });
+    return {name:name, total:total, date_2026_05_03:d53, other_5_3_format:d53Other, allDates:datesSet};
+  }
+  var report = {
+    fbRecordsFromVal_lastStats: window._fbVal53Stats || null,
+    window_RECORDS: summarize('window.RECORDS', w),
+    local_RECORDS: summarize('RECORDS (lexical)', l),
+    FINAL_RECORDS: summarize('FINAL_RECORDS', fr),
+    sample_window_5_03: w.filter(function(r){return r && r.date==='2026-05-03';}).slice(0,3),
+    sample_window_other_5_3: w.filter(function(r){return r && r.date && r.date!=='2026-05-03' && (r.date.indexOf('05-03')>=0 || r.date.indexOf('5-3')>=0);}).slice(0,3)
+  };
+  console.log('[5/3 dbg53]', report);
+  return report;
+};
 
 let fbApp = null;
 let fbDB = null;
@@ -1686,11 +1746,25 @@ async function loadFromDB() {
       }));
     }
     if (rSnap.exists()) {
+      // [TEMP DEBUG] rSnap의 raw key 통계
+      try {
+        var _rawObj = rSnap.val() || {};
+        var _rawKeys = Object.keys(_rawObj);
+        var _rawK53 = _rawKeys.filter(function(k){return /_2026-05-03$/.test(k);}).length;
+        console.log('[5/3 trace] loadFromDB rSnap raw keys total:', _rawKeys.length, ', keys ending _2026-05-03:', _rawK53);
+      } catch(e){}
+
       RECORDS = fbRecordsFromVal(rSnap.val()).map(r => ({
         id: r.id, date: r.date, wk: r.wk,
         day: r.day, st: r.st, rsn: reasonDisplayLabel(r.rsn||'', r.st||''), streak: r.streak
       }));
       invalidateRecordIndex();
+      // [TEMP DEBUG] mapping 후 RECORDS 내 5/3 카운트
+      try {
+        var _r53 = RECORDS.filter(function(r){return r.date==='2026-05-03';}).length;
+        var _r53Other = RECORDS.filter(function(r){return r.date && r.date.indexOf('05-03')>=0 && r.date!=='2026-05-03';}).length;
+        console.log('[5/3 trace] loadFromDB after fbRecordsFromVal: RECORDS count=', RECORDS.length, ', date=2026-05-03:', _r53, ', other-05-03-format:', _r53Other);
+      } catch(e){}
     }
     if (eSnap.exists()) {
       localStorage.setItem('att_estage_data', JSON.stringify(eSnap.val()));
@@ -2943,13 +3017,37 @@ function renderRegionCards(){
             // 더 과거 날짜를 _prev로 잡는 버그가 발생함 (예: 도봉 5/10 vs 5/3 비교가
             // 5/3 누락 시 5/10 vs 4/26으로 계산되어 부호가 뒤집힘)
             var _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
-            var _allDates=[]; _allR.forEach(function(r){var dd=String(r&&r.date||'').slice(0,10);if(dd&&_allDates.indexOf(dd)<0)_allDates.push(dd);});
+            // [TEMP DEBUG] _allR(window.RECORDS) 안에 5/3이 몇 개 있는지 추적
+            var _dbg_winRecsAll = _allR.length;
+            var _dbg_winRecs53 = 0;
+            var _dbg_winRecs53Other = 0;
+            var _dbg_winRecsDohbong53 = 0;
+            var _dbg_winRecsDate53Samples = [];
+            for (var _di=0; _di<_allR.length; _di++) {
+              var _dr = _allR[_di];
+              var _drd = String(_dr && _dr.date || '');
+              if (_drd === '2026-05-03') {
+                _dbg_winRecs53++;
+                if (_dbg_winRecsDate53Samples.length < 2) _dbg_winRecsDate53Samples.push(_dr);
+              } else if (_drd.indexOf('05-03') >= 0 || _drd.indexOf('5-3') >= 0) {
+                _dbg_winRecs53Other++;
+                if (_dbg_winRecsDate53Samples.length < 2) _dbg_winRecsDate53Samples.push(_dr);
+              }
+            }
+            var _allDates=[];
+            _allR.forEach(function(r){var dd=String(r&&r.date||'').slice(0,10);if(dd&&_allDates.indexOf(dd)<0)_allDates.push(dd);});
             _allDates.sort();
+            // [TEMP DEBUG] _allDates 안의 5/3 포함 여부
+            var _dbg_allDatesHas53 = _allDates.indexOf('2026-05-03') >= 0;
             var _cur=d||(_allDates.length?_allDates[_allDates.length-1]:'');
             if(!_cur)return'';
             var _prev=''; for(var _pi=_allDates.length-1;_pi>=0;_pi--){if(_allDates[_pi]<_cur){_prev=_allDates[_pi];break;}}
             if(!_prev)return'';
             var _mids=new Set(FM.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
+            // [TEMP DEBUG] 도봉 멤버 ID로 직접 필터한 5/3 레코드 수
+            if(reg==='도봉'){
+              _dbg_winRecsDohbong53 = _allR.filter(function(r){return r && r.date==='2026-05-03' && _mids.has(r.id);}).length;
+            }
             var _cR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_cur;});
             var _pR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_prev;});
             if(_cR.length&&_pR.length){
@@ -2966,6 +3064,11 @@ function renderRegionCards(){
                   var dbg=document.getElementById('wow-debug-box');
                   if(dbg){
                     var sample=_allDates.slice(-6).join(', ');
+                    var _stats = window._fbVal53Stats ? JSON.stringify(window._fbVal53Stats) : '(아직 없음 — Firebase 로드 전이거나 fbRecordsFromVal 미발화)';
+                    var _sampleRec = '';
+                    if (_dbg_winRecsDate53Samples.length) {
+                      try { _sampleRec = JSON.stringify(_dbg_winRecsDate53Samples[0]); } catch(e){ _sampleRec='(stringify fail)'; }
+                    }
                     dbg.textContent =
                       '[지역 카드 헤더 — renderRegionCards inline @line ~2876]\n' +
                       '도봉 전주 대비 계산:\n' +
@@ -2978,7 +3081,14 @@ function renderRegionCards(){
                       '    _pR.length = ' + _pR.length + ', _pA(QR+사유출석) = ' + _pA + '\n' +
                       '    prev 출석률 = ' + _prevRate.toFixed(4) + '%\n' +
                       '  delta = ' + _curRate.toFixed(4) + ' - ' + _prevRate.toFixed(4) + ' = ' + (_curRate-_prevRate).toFixed(4) + '%\n' +
-                      '  표시값 (반올림) = ' + (_delta>0?'+':'') + _delta.toFixed(1) + '%';
+                      '  표시값 (반올림) = ' + (_delta>0?'+':'') + _delta.toFixed(1) + '%\n' +
+                      '\n[5/3 트레이스]\n' +
+                      '  window.RECORDS 총 ' + _dbg_winRecsAll + '건 중\n' +
+                      '    date === "2026-05-03" : ' + _dbg_winRecs53 + '건\n' +
+                      '    date 다른 5/3 형식    : ' + _dbg_winRecs53Other + '건\n' +
+                      '    그중 도봉 멤버      : ' + _dbg_winRecsDohbong53 + '건\n' +
+                      '  _allDates 안에 "2026-05-03" 포함? : ' + (_dbg_allDatesHas53 ? 'YES' : 'NO') + '\n' +
+                      '  Firebase 로더 통계 (fbRecordsFromVal):\n    ' + _stats + (_sampleRec ? '\n  샘플 레코드: ' + _sampleRec : '');
                   }
                 }catch(e){}
               }
@@ -8463,11 +8573,22 @@ body.v97-data-loading #login-screen{z-index:9999;}
     try {
       MEMBERS = FINAL_MEMBERS.map(function(m){ return Object.assign({}, m); });
       RECORDS = FINAL_RECORDS.map(function(r){ return Object.assign({}, r, {date:nd(r.date), st:status(r.st)}); });
+      // [TEMP DEBUG] FINAL_RECORDS 의 5/3 카운트
+      try {
+        var _fr53 = FINAL_RECORDS.filter(function(r){return r && r.date==='2026-05-03';}).length;
+        var _rec53 = RECORDS.filter(function(r){return r.date==='2026-05-03';}).length;
+        console.log('[5/3 trace] applyFinalData: FINAL_RECORDS total=', FINAL_RECORDS.length, ', FINAL_RECORDS date=2026-05-03:', _fr53, ', RECORDS after map date=2026-05-03:', _rec53);
+      } catch(e){}
       // 전역 RECORDS/MEMBERS도 업데이트
       if(Array.isArray(window.RECORDS)){window.RECORDS.length=0; RECORDS.forEach(function(r){window.RECORDS.push(r);});}
       else { window.RECORDS = RECORDS.slice(); }
       if(Array.isArray(window.MEMBERS)){window.MEMBERS.length=0; MEMBERS.forEach(function(m){window.MEMBERS.push(m);});}
       else { window.MEMBERS = MEMBERS.slice(); }
+      // [TEMP DEBUG] window.RECORDS 동기화 후 카운트
+      try {
+        var _w53 = (window.RECORDS||[]).filter(function(r){return r && r.date==='2026-05-03';}).length;
+        console.log('[5/3 trace] applyFinalData: window.RECORDS date=2026-05-03:', _w53);
+      } catch(e){}
       if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
       localStorage.setItem('att_members_v1', JSON.stringify(MEMBERS));
       localStorage.setItem('att_records_v1', JSON.stringify(RECORDS));
