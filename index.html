@@ -1073,7 +1073,8 @@ body.llf-pin-loading::before{
     <button class="adm-tab on" onclick="admTab('upload',this)">데이터 업로드</button>
     <button class="adm-tab" onclick="admTab('target',this)" style="display:none">타겟 업로드</button>
     <button class="adm-tab" onclick="admTab('roster',this)">구성원 관리</button>
-    <button class="adm-tab" onclick="admTab('password',this)">비밀번호 설정</button>
+    <button class="adm-tab" onclick="admTab('allowedusers',this)">허용 사용자</button>
+    <button class="adm-tab" onclick="admTab('password',this)" style="display:none">비밀번호 설정</button>
   </div>
 
   <div id="adm-upload">
@@ -1147,6 +1148,55 @@ body.llf-pin-loading::before{
     <div id="target-upload-log" style="margin-top:12px;max-width:680px"></div>
   </div>
 
+
+  <!-- 허용 사용자 관리 -->
+  <div id="adm-allowedusers" style="display:none">
+    <div class="card" style="max-width:760px;margin-bottom:14px">
+      <div class="ct">사용자 추가 <span style="font-size:11px;font-weight:400;color:var(--text3)">구글 계정 이메일을 등록하면 해당 사용자가 로그인할 수 있습니다</span></div>
+      <div class="g2" style="margin-top:8px">
+        <div class="fg"><label class="fl">이메일</label><input class="fc" id="au-email" type="email" placeholder="name@example.com" autocapitalize="off" autocorrect="off"></div>
+        <div class="fg"><label class="fl">이름</label><input class="fc" id="au-name" placeholder="홍길동"></div>
+      </div>
+      <div class="fg" style="margin-top:4px">
+        <label class="fl">역할</label>
+        <div style="display:flex;gap:14px;align-items:center;font-size:13px">
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+            <input type="radio" name="au-role" value="admin" id="au-role-admin"> 관리자
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+            <input type="radio" name="au-role" value="region" id="au-role-region" checked> 지역
+          </label>
+        </div>
+      </div>
+      <div class="fg" id="au-region-row">
+        <label class="fl">담당 지역</label>
+        <select class="fc" id="au-region">
+          <option value="">선택...</option>
+          <option value="도봉">도봉</option>
+          <option value="성북">성북</option>
+          <option value="노원">노원</option>
+          <option value="중랑">중랑</option>
+          <option value="강북">강북</option>
+          <option value="대학">대학</option>
+          <option value="새신자">새신자</option>
+          <option value="이음">이음</option>
+        </select>
+      </div>
+      <div class="mf">
+        <button class="btn" onclick="document.getElementById('au-email').value='';document.getElementById('au-name').value='';document.getElementById('au-region').value='';">초기화</button>
+        <button class="btn btn-primary" onclick="addAllowedUser()">사용자 추가</button>
+      </div>
+      <div id="au-log" style="margin-top:8px;font-size:12px;color:var(--text3)"></div>
+    </div>
+    <div class="card" style="max-width:760px">
+      <div class="ct">허용된 사용자 목록 <span id="au-count" style="font-size:11px;font-weight:400;color:var(--text3)"></span>
+        <button class="btn btn-sm" onclick="renderAllowedUsers()" style="margin-left:auto">새로고침</button>
+      </div>
+      <div id="au-list" class="tw">
+        <div class="empty" style="padding:16px;color:var(--text3);font-size:12px">불러오는 중...</div>
+      </div>
+    </div>
+  </div>
 
   <div id="adm-password" style="display:none">
     <div class="card" style="max-width:720px">
@@ -12729,6 +12779,195 @@ console.log('[MFV2] Loaded');
   // 외부에서 호출 가능하도록 노출
   window.signOutCurrentUser = signOut;
   window.signInWithGoogle = signInWithGoogle;
+
+  /* ════════════════════════════════════════════════════════════════
+     관리자 페이지 — 허용 사용자 관리 (Step 4)
+       /allowedUsers 에 사용자를 추가/삭제하고 역할(admin|region)·지역을 지정
+     ════════════════════════════════════════════════════════════════ */
+
+  function escAttr(s){ return String(s||'').replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function setAuLog(msg, type){
+    var el = document.getElementById('au-log');
+    if(!el) return;
+    var color = type === 'ok' ? 'var(--green)' : type === 'error' ? 'var(--red)' : 'var(--text3)';
+    el.textContent = msg || '';
+    el.style.color = color;
+  }
+
+  // 역할 라디오 변경에 따라 지역 선택 활성/비활성
+  function bindRoleRadios(){
+    var admin = document.getElementById('au-role-admin');
+    var region = document.getElementById('au-role-region');
+    var regionSel = document.getElementById('au-region');
+    var regionRow = document.getElementById('au-region-row');
+    function sync(){
+      var isAdmin = admin && admin.checked;
+      if(regionSel) regionSel.disabled = isAdmin;
+      if(regionRow) regionRow.style.opacity = isAdmin ? '0.45' : '1';
+      if(isAdmin && regionSel) regionSel.value = '';
+    }
+    if(admin && !admin._bound){ admin._bound = true; admin.addEventListener('change', sync); }
+    if(region && !region._bound){ region._bound = true; region.addEventListener('change', sync); }
+    sync();
+  }
+
+  window.renderAllowedUsers = function(){
+    var list = document.getElementById('au-list');
+    var countEl = document.getElementById('au-count');
+    if(!list) return;
+    list.innerHTML = '<div class="empty" style="padding:16px;color:var(--text3);font-size:12px">불러오는 중...</div>';
+    if(countEl) countEl.textContent = '';
+    var db = window.fbDB || (typeof fbDB !== 'undefined' ? fbDB : null);
+    if(!db){
+      list.innerHTML = '<div class="empty" style="padding:16px;color:var(--red);font-size:12px">Firebase 미연결</div>';
+      return;
+    }
+    db.ref('allowedUsers').once('value').then(function(snap){
+      var rows = [];
+      if(snap.exists()){
+        snap.forEach(function(child){
+          var key = child.key;
+          var v = child.val() || {};
+          rows.push({
+            key: key,
+            email: v.email || '',
+            name: v.name || '',
+            role: v.role || 'region',
+            region: v.region || ''
+          });
+        });
+      }
+      // 정렬: admin 먼저, 그 다음 지역명, 이메일
+      rows.sort(function(a, b){
+        if(a.role !== b.role) return a.role === 'admin' ? -1 : 1;
+        if(a.region !== b.region) return String(a.region||'').localeCompare(String(b.region||''),'ko');
+        return String(a.email||'').localeCompare(String(b.email||''));
+      });
+      if(countEl) countEl.textContent = '(' + rows.length + '명)';
+      if(!rows.length){
+        list.innerHTML = '<div class="empty" style="padding:16px;color:var(--text3);font-size:12px">등록된 사용자가 없습니다.</div>';
+        return;
+      }
+      var html = '<table><thead><tr><th>역할</th><th>이름</th><th>이메일</th><th>담당 지역</th><th></th></tr></thead><tbody>';
+      rows.forEach(function(r){
+        var roleBadge = r.role === 'admin'
+          ? '<span class="badge b-fam">👑 관리자</span>'
+          : '<span class="badge b-sa">📍 지역</span>';
+        html += '<tr>'
+          + '<td>' + roleBadge + '</td>'
+          + '<td style="font-weight:600">' + escAttr(r.name) + '</td>'
+          + '<td style="font-family:var(--mono);font-size:11px;color:var(--text2)">' + escAttr(r.email) + '</td>'
+          + '<td>' + escAttr(r.region || '-') + '</td>'
+          + '<td><button class="btn btn-danger btn-sm" onclick="deleteAllowedUser(\'' + escAttr(r.key) + '\',\'' + escAttr(r.email) + '\')">삭제</button></td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+      list.innerHTML = html;
+    }).catch(function(err){
+      console.error('[au] 목록 조회 실패:', err);
+      list.innerHTML = '<div class="empty" style="padding:16px;color:var(--red);font-size:12px">조회 실패: ' + escAttr(err.message || err) + '</div>';
+    });
+  };
+
+  window.addAllowedUser = function(){
+    var emailInp = document.getElementById('au-email');
+    var nameInp = document.getElementById('au-name');
+    var adminR = document.getElementById('au-role-admin');
+    var regionInp = document.getElementById('au-region');
+    var email = (emailInp && emailInp.value || '').trim().toLowerCase();
+    var name = (nameInp && nameInp.value || '').trim();
+    var role = (adminR && adminR.checked) ? 'admin' : 'region';
+    var region = role === 'region' ? (regionInp && regionInp.value || '').trim() : null;
+
+    // 검증
+    if(!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){
+      setAuLog('올바른 이메일 형식이 아닙니다.', 'error'); return;
+    }
+    if(!name){ setAuLog('이름을 입력하세요.', 'error'); return; }
+    if(role === 'region' && !region){ setAuLog('역할이 지역이면 담당 지역을 선택해야 합니다.', 'error'); return; }
+
+    var db = window.fbDB || (typeof fbDB !== 'undefined' ? fbDB : null);
+    if(!db){ setAuLog('Firebase 미연결.', 'error'); return; }
+
+    var key = (typeof window.encodeEmailKey === 'function') ? window.encodeEmailKey(email) : email.replace(/[.#$\[\]/]/g, '_');
+    var ref = db.ref('allowedUsers').child(key);
+    ref.once('value').then(function(existing){
+      var payload = {
+        email: email,
+        name: name,
+        role: role,
+        region: region,
+        updatedAt: Date.now()
+      };
+      if(!existing.exists()) payload.createdAt = Date.now();
+      return ref.set(payload);
+    }).then(function(){
+      setAuLog('저장 완료: ' + email, 'ok');
+      if(emailInp) emailInp.value = '';
+      if(nameInp) nameInp.value = '';
+      if(regionInp) regionInp.value = '';
+      window.renderAllowedUsers();
+    }).catch(function(err){
+      console.error('[au] 저장 실패:', err);
+      setAuLog('저장 실패: ' + (err.message || err), 'error');
+    });
+  };
+
+  window.deleteAllowedUser = function(key, email){
+    if(!key) return;
+    var msg = '정말 삭제하시겠습니까?\n\n' + (email || '') + '\n\n이 사용자는 다시 로그인해도 접근할 수 없게 됩니다.';
+    if(!confirm(msg)) return;
+    // 자기 자신은 삭제 못 하게 안전장치
+    if(window.currentUser && window.currentUser.email && email && window.currentUser.email.toLowerCase() === email.toLowerCase()){
+      setAuLog('자기 자신은 삭제할 수 없습니다.', 'error');
+      return;
+    }
+    var db = window.fbDB || (typeof fbDB !== 'undefined' ? fbDB : null);
+    if(!db){ setAuLog('Firebase 미연결.', 'error'); return; }
+    db.ref('allowedUsers').child(key).remove()
+      .then(function(){
+        setAuLog('삭제 완료: ' + (email || key), 'ok');
+        window.renderAllowedUsers();
+      })
+      .catch(function(err){
+        console.error('[au] 삭제 실패:', err);
+        setAuLog('삭제 실패: ' + (err.message || err), 'error');
+      });
+  };
+
+  // admTab 확장 — 'allowedusers' 탭 지원
+  function wrapAdmTab(){
+    var orig = window.admTab;
+    if(typeof orig !== 'function') return false;
+    if(orig.__authWrapped) return true;
+    window.admTab = function(tab, btn){
+      // 기존 탭 비활성화 (allowedusers 포함)
+      ['upload','target','roster','password','allowedusers'].forEach(function(t){
+        var el = document.getElementById('adm-' + t);
+        if(el) el.style.display = 'none';
+      });
+      document.querySelectorAll('.adm-tab').forEach(function(b){ b.classList.remove('on'); });
+      var el = document.getElementById('adm-' + tab);
+      if(el) el.style.display = '';
+      if(btn) btn.classList.add('on');
+      if(tab === 'roster' && typeof window.renderRoster === 'function') window.renderRoster();
+      if(tab === 'password' && typeof window.renderPinSettings === 'function') setTimeout(window.renderPinSettings, 0);
+      if(tab === 'allowedusers'){
+        bindRoleRadios();
+        setTimeout(window.renderAllowedUsers, 0);
+      }
+    };
+    window.admTab.__authWrapped = true;
+    return true;
+  }
+  // admTab은 V79가 늦게 정의/재정의하므로 폴링하며 wrap 유지
+  var _admTries = 0;
+  var _admIv = setInterval(function(){
+    var ok = wrapAdmTab();
+    if(window.admTab && !window.admTab.__authWrapped) wrapAdmTab();
+    if(ok || ++_admTries > 200) clearInterval(_admIv);
+  }, 50);
 
   console.log('[google-auth] loaded');
 })();
