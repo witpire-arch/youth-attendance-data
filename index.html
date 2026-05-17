@@ -12417,28 +12417,16 @@ console.log('[MFV2] Loaded');
     try{
       var provider = new firebase.auth.GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
-      firebase.auth().signInWithPopup(provider)
+      // 리다이렉트 후 돌아왔을 때도 로그인 유지되도록 LOCAL persistence 보장
+      // (기본값이지만 명시) — set 후 signInWithRedirect 호출
+      firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+        .then(function(){
+          // 이 호출은 페이지를 구글 로그인 화면으로 네비게이트시키므로 이후 코드는 실행되지 않음.
+          // 돌아왔을 때 페이지가 새로 로드되고 getRedirectResult + onAuthStateChanged가 처리.
+          return firebase.auth().signInWithRedirect(provider);
+        })
         .catch(function(err){
-          // 팝업 차단/실패 시 redirect로 폴백
-          var code = err && err.code || '';
-          var popupFailure = code === 'auth/popup-blocked'
-            || code === 'auth/popup-closed-by-user'
-            || code === 'auth/cancelled-popup-request'
-            || code === 'auth/operation-not-supported-in-this-environment';
-          if(popupFailure){
-            console.warn('[auth] popup 실패, redirect로 폴백:', code);
-            try{
-              firebase.auth().signInWithRedirect(provider);
-            }catch(e){
-              console.error('[auth] redirect 실패:', e);
-              setLoginError('로그인 실패: ' + (e.message || e));
-              _signingIn = false;
-              if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
-            }
-            return;
-          }
-          // 그 외 오류
-          console.error('[auth] 로그인 실패:', err);
+          console.error('[auth] redirect 로그인 실패:', err);
           setLoginError('로그인 실패: ' + (err && err.message || err));
           _signingIn = false;
           if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
@@ -12595,18 +12583,37 @@ console.log('[MFV2] Loaded');
   setTimeout(bindButtons, 100);
   setTimeout(bindButtons, 500);
 
-  // Firebase Auth SDK가 로드되면 인증 상태 리스너 등록
+  // Firebase Auth SDK가 로드되면: (1) 리다이렉트 결과 먼저 처리 → (2) 인증 상태 리스너 등록
+  // 리다이렉트로 돌아온 직후엔 getRedirectResult가 user를 반환하고, 곧이어 onAuthStateChanged도
+  // 동일 user로 발화함. handleAuthChange는 _appStarted 가드로 중복 진입을 방지하므로 안전.
   waitForAuthSDK(60)
     .then(function(){
-      // redirect 결과 처리 (모바일 fallback 경로)
+      var btn = $('google-signin-btn');
+      // (1) 리다이렉트 복귀인지 먼저 판별 — 복귀 중엔 로그인 화면이 깜빡이지 않도록
+      //     로그인 버튼은 로딩 상태로 유지하고 cover는 lifecycle이 들고 있음.
       try{
-        firebase.auth().getRedirectResult().catch(function(err){
-          if(err && err.code && err.code !== 'auth/no-auth-event'){
-            console.error('[auth] redirect 결과 오류:', err);
-            setLoginError('로그인 실패: ' + (err.message || err));
-          }
-        });
-      }catch(e){}
+        firebase.auth().getRedirectResult()
+          .then(function(result){
+            if(result && result.user){
+              console.log('[auth] redirect 복귀 — 로그인 성공:', result.user.email);
+              // 이후 onAuthStateChanged가 같은 user로 발화하여 handleAuthChange 진행
+              // 여기서는 화면 처리를 하지 않음 (단일 진입점 유지)
+            }
+            // result가 null이면 일반 페이지 로드 (리다이렉트 복귀 아님)
+          })
+          .catch(function(err){
+            // auth/no-auth-event 는 일반 로드 시 정상 — 로그하지 않음
+            if(err && err.code && err.code !== 'auth/no-auth-event'){
+              console.error('[auth] redirect 결과 오류:', err);
+              setLoginError('로그인 실패: ' + (err.message || err));
+              _signingIn = false;
+              if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+            }
+          });
+      }catch(e){
+        console.error('[auth] getRedirectResult 호출 실패:', e);
+      }
+      // (2) 인증 상태 리스너 — 리다이렉트 복귀 시점에 자동 발화하여 앱 진입
       firebase.auth().onAuthStateChanged(handleAuthChange, function(err){
         console.error('[auth] onAuthStateChanged 오류:', err);
       });
