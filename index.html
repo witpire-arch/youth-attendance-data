@@ -12013,3 +12013,139 @@ console.log('[MFV2] Loaded');
 })();
 </script>
 <!-- BUG_FIX_V28_END -->
+
+<!-- LOADING_LIFECYCLE_FIX_START -->
+<style id="loading-lifecycle-fix-style">
+/* 기존 #v97-loading-cover에 스피너 + 안정된 레이아웃 부여 */
+#v97-loading-cover{flex-direction:column;gap:14px;}
+#v97-loading-cover::before{
+  content:"";
+  width:36px;height:36px;
+  border:3px solid rgba(0,0,0,.10);
+  border-top-color:var(--text,#1c1b18);
+  border-radius:50%;
+  animation:llf-spin .7s linear infinite;
+}
+@keyframes llf-spin{to{transform:rotate(360deg);}}
+/* PIN 입력 직후, loadFromDB 완료 전까지 #app 내부 깜빡임 차단 */
+body.llf-pin-loading #main{visibility:hidden !important;}
+body.llf-pin-loading #v97-loading-cover{display:flex !important;}
+</style>
+<script id="loading-lifecycle-fix">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     초기 로딩 깜빡임 완전 차단
+       1) v28 polling은 PIN 입력 전에 cover를 해제함 → PIN 직후
+          #app이 표시되면 #main이 바로 보여서 깜빡임 발생
+       2) 해결: PIN 성공 시 cover 클래스를 재부착하고, loadFromDB가
+          끝나서 첫 렌더가 커밋된 후에만 해제
+       3) 추가: 기존 v97 cover에 스피너 부여, 자체 클래스(llf-pin-loading)로
+          v28 release 영향 회피
+     ════════════════════════════════════════════════════════════════ */
+  var PIN_CLASS = 'llf-pin-loading';
+  var V97_CLASS = 'v97-data-loading';
+
+  var _pinSubmitted = false;
+  var _loadCompleted = false;
+  var _renderCommitted = false;
+
+  function dataReady(){
+    try{
+      var r = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+      var m = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+      return r.length > 0 && m.length > 0;
+    }catch(e){ return false; }
+  }
+
+  function showCover(){
+    try{
+      document.body.classList.add(PIN_CLASS);
+      document.body.classList.add(V97_CLASS);
+    }catch(e){}
+  }
+  function hideCover(){
+    try{
+      document.body.classList.remove(PIN_CLASS);
+      document.body.classList.remove(V97_CLASS);
+    }catch(e){}
+  }
+
+  function commitRenderAndRelease(){
+    if(!_pinSubmitted || !_loadCompleted) return;
+    if(_renderCommitted) return;
+    // 동기 렌더 (debounce 회피)
+    try{
+      var ov = document.getElementById('page-overview');
+      if(ov && ov.classList.contains('active')){
+        if(typeof window.renderOverviewNow === 'function') window.renderOverviewNow();
+        else if(typeof window.renderOverview === 'function') window.renderOverview();
+      }
+    }catch(e){ console.warn('[llf] render error', e); }
+    _renderCommitted = true;
+    // 두 RAF 후 cover 해제 — DOM 업데이트가 paint에 반영된 뒤
+    requestAnimationFrame(function(){
+      requestAnimationFrame(hideCover);
+    });
+  }
+
+  // initApp 래핑 — 모든 PIN 변형(line 1184, 7211, 8892)이 결국 initApp을 호출함
+  function wrapInitApp(){
+    var orig = window.initApp;
+    if(typeof orig !== 'function') return false;
+    if(orig.__llfWrapped) return true;
+    window.initApp = function(){
+      // PIN 성공 직후 호출됨. 이 시점에 #app은 이미 display:flex.
+      // cover 클래스 재부착해서 #main을 숨김.
+      showCover();
+      _pinSubmitted = true;
+      _renderCommitted = false;
+      return orig.apply(this, arguments);
+    };
+    window.initApp.__llfWrapped = true;
+    return true;
+  }
+
+  // loadFromDB 래핑 — 완료 후 동기 렌더 + cover 해제
+  function wrapLoadFromDB(){
+    var orig = window.loadFromDB;
+    if(typeof orig !== 'function') return false;
+    if(orig.__llfWrapped) return true;
+    window.loadFromDB = async function(){
+      var ret;
+      try{ ret = await orig.apply(this, arguments); }
+      catch(e){ console.error('[llf] loadFromDB error', e); }
+      _loadCompleted = true;
+      // 데이터가 있으면 즉시 commit, 없으면 짧게 폴링
+      var t0 = Date.now();
+      (function tryCommit(){
+        if(dataReady()){ commitRenderAndRelease(); return; }
+        if(Date.now() - t0 > 3000){ commitRenderAndRelease(); return; } // 안전장치
+        setTimeout(tryCommit, 50);
+      })();
+      return ret;
+    };
+    window.loadFromDB.__llfWrapped = true;
+    return true;
+  }
+
+  // 두 함수 모두 늦게 정의/재정의될 수 있으니 폴링하며 wrap 유지
+  var tries = 0;
+  var iv = setInterval(function(){
+    var pinOk = wrapInitApp();
+    var loadOk = wrapLoadFromDB();
+    // initApp/loadFromDB가 wrap 후 다른 패치에 의해 교체되면 다시 wrap
+    if(window.initApp && !window.initApp.__llfWrapped) wrapInitApp();
+    if(window.loadFromDB && !window.loadFromDB.__llfWrapped) wrapLoadFromDB();
+    if((pinOk && loadOk) || ++tries > 200) clearInterval(iv);
+  }, 30);
+
+  // 안전장치: 어떤 이유로든 20초 후엔 무조건 해제
+  setTimeout(function(){
+    hideCover();
+  }, 20000);
+
+  console.log('[loading-lifecycle-fix] loaded');
+})();
+</script>
+<!-- LOADING_LIFECYCLE_FIX_END -->
