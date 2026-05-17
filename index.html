@@ -1181,9 +1181,7 @@ function doPinSubmit() {
 }
 
 window.addEventListener('load', function() {
-  // Firebase를 페이지 로드 시점에 미리 초기화 (PIN 로그인 전)
-  initSupabase();
-
+  // Firebase는 스크립트 로드 즉시 초기화됨 (위쪽 initSupabase() 호출). 여기서는 PIN UI만 바인딩
   const btn = document.getElementById('pin-confirm-btn');
   const inp = document.getElementById('pin-input-field');
   if (btn) {
@@ -1371,11 +1369,50 @@ function showDBStatus(msg, type) {
   el.style.color = clr;
 }
 
+// fbDB 준비 대기용 promise (prefetch에서 재사용)
+let _fbReadyPromise = null;
+function waitForFbDB(timeoutMs) {
+  if (fbDB) return Promise.resolve(fbDB);
+  if (_fbReadyPromise) return _fbReadyPromise;
+  _fbReadyPromise = new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (fbDB) return resolve(fbDB);
+      if (Date.now() - start > (timeoutMs||5000)) return resolve(null);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+  return _fbReadyPromise;
+}
+
+// Firebase에서 데이터를 미리 가져오는 prefetch (PIN 입력 중에 동시 진행)
+let _prefetchPromise = null;
+function prefetchFromDB() {
+  if (_prefetchPromise) return _prefetchPromise;
+  _prefetchPromise = (async () => {
+    const db = await waitForFbDB(5000);
+    if (!db) return null;
+    try {
+      const [mSnap, rSnap, eSnap] = await Promise.all([
+        db.ref('members').once('value'),
+        db.ref('records').once('value'),
+        db.ref('estage').once('value'),
+      ]);
+      return { mSnap, rSnap, eSnap };
+    } catch(e) {
+      console.error('prefetch 실패:', e);
+      return null;
+    }
+  })();
+  return _prefetchPromise;
+}
+
 function initSupabase() {
   const tryInit = (retries) => {
     try {
       if (typeof firebase === 'undefined') {
-        if (retries > 0) setTimeout(() => tryInit(retries-1), 500);
+        if (retries > 0) setTimeout(() => tryInit(retries-1), 100);
         else showDBStatus('Firebase 로드 실패', 'error');
         return;
       }
@@ -1386,13 +1423,17 @@ function initSupabase() {
       }
       fbDB = firebase.database();
       showDBStatus('Firebase 연결됨 ✓', 'ok');
+      // 연결되자마자 백그라운드 prefetch 시작 (로그인 대기 시간 활용)
+      prefetchFromDB();
     } catch(e) {
       console.error('Firebase 초기화 실패:', e);
       showDBStatus('Firebase 오류', 'error');
     }
   };
-  tryInit(10);
+  tryInit(50);
 }
+// 페이지 load까지 기다리지 않고 스크립트 실행 즉시 Firebase 초기화 시작
+initSupabase();
 
 // localStorage 캐시 저장 (오프라인 대비)
 function saveToLocal() {
@@ -1493,13 +1534,8 @@ async function loadFromDB() {
     showDBStatus(`캐시 ${MEMBERS.length}명 — Firebase 동기화 중...`, 'loading');
   }
 
-  // fbDB 없으면 잠깐 기다렸다 재시도 (최대 4초)
-  if (!fbDB) {
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  if (!fbDB) {
-    await new Promise(r => setTimeout(r, 2000));
-  }
+  // fbDB 준비 대기 — 폴링으로 즉시 감지 (최대 5초)
+  await waitForFbDB(5000);
 
   if (!fbDB) {
     if (cached) showDBStatus(`✓ 로컬 캐시 ${MEMBERS.length}명`, 'ok');
@@ -1510,9 +1546,18 @@ async function loadFromDB() {
   try {
     showDBStatus('Firebase에서 불러오는 중...', 'loading');
 
-    const mSnap = await fbDB.ref('members').once('value');
-    const rSnap = await fbDB.ref('records').once('value');
-    const eSnap = await fbDB.ref('estage').once('value');
+    // 백그라운드 prefetch 결과 재사용 (없으면 즉시 병렬 조회)
+    const pre = await prefetchFromDB();
+    let mSnap, rSnap, eSnap;
+    if (pre) {
+      ({ mSnap, rSnap, eSnap } = pre);
+    } else {
+      [mSnap, rSnap, eSnap] = await Promise.all([
+        fbDB.ref('members').once('value'),
+        fbDB.ref('records').once('value'),
+        fbDB.ref('estage').once('value'),
+      ]);
+    }
 
     if (mSnap.exists()) {
       MEMBERS = Object.values(mSnap.val()).map(m => ({
