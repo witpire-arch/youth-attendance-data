@@ -8841,6 +8841,8 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){hideStreakNav(); setTimeout(renderOverviewExtra,100);});
   else {hideStreakNav(); setTimeout(renderOverviewExtra,100);}
   window.addEventListener('load',function(){hideStreakNav(); setTimeout(renderOverviewExtra,400);});
+  // 외부 로딩 라이프사이클에서 호출할 수 있도록 노출
+  window.renderOverviewExtra = renderOverviewExtra;
 })();
 </script>
 <!-- V78_OVERVIEW_STREAK_REASON_NO_TAB_END -->
@@ -12085,21 +12087,32 @@ console.log('[MFV2] Loaded');
   animation:llf-spin .7s linear infinite;
 }
 @keyframes llf-spin{to{transform:rotate(360deg);}}
-/* PIN 입력 직후, loadFromDB 완료 전까지 #app 내부 깜빡임 차단 */
+/* 페이지 로드부터 첫 렌더 커밋 전까지 #app 내부 깜빡임 차단 */
 body.llf-pin-loading #main{visibility:hidden !important;}
 body.llf-pin-loading #v97-loading-cover{display:flex !important;}
+/* overview-extra-analysis(연속결석 분석 섹션)가 본문 렌더 전에 단독으로
+   보이지 않도록, llf-pin-loading 동안 강제로 숨김 — visibility:hidden은
+   부모(#main)에서 이미 처리되지만 안전 강화 차원 */
+body.llf-pin-loading #overview-extra-analysis{visibility:hidden !important;}
 </style>
 <script id="loading-lifecycle-fix">
 (function(){
   'use strict';
   /* ════════════════════════════════════════════════════════════════
      초기 로딩 깜빡임 완전 차단
-       1) v28 polling은 PIN 입력 전에 cover를 해제함 → PIN 직후
-          #app이 표시되면 #main이 바로 보여서 깜빡임 발생
-       2) 해결: PIN 성공 시 cover 클래스를 재부착하고, loadFromDB가
-          끝나서 첫 렌더가 커밋된 후에만 해제
-       3) 추가: 기존 v97 cover에 스피너 부여, 자체 클래스(llf-pin-loading)로
-          v28 release 영향 회피
+       증상: 앱을 처음 열면 '연속결석 분석' 섹션이 잠깐 보였다 사라지고
+             전체현황의 나머지 섹션이 채워지면서 화면이 바뀜
+       원인: #overview-extra-analysis(연속결석 분석 섹션)는 v78 패치가
+             DOMContentLoaded+100ms / load+400ms 시점에 단독으로 그려둠.
+             cover가 PIN 이전에 v28 polling에 의해 해제되거나, PIN 직후
+             cover 부착보다 paint가 먼저 일어나면 #main에서 유일하게
+             채워진 이 섹션만 노출되어 깜빡임 발생.
+       해결:
+         1) 스크립트 파싱 즉시 자체 클래스(llf-pin-loading)를 body에 부착
+            → 페이지 로드 시점부터 #main이 항상 visibility:hidden
+         2) 클래스는 v28의 release 영향을 받지 않음(독립 클래스)
+         3) PIN + loadFromDB 완료 + 동기 렌더(renderOverviewNow +
+            renderOverviewExtra) + 2 RAF 후에만 해제
      ════════════════════════════════════════════════════════════════ */
   var PIN_CLASS = 'llf-pin-loading';
   var V97_CLASS = 'v97-data-loading';
@@ -12129,15 +12142,30 @@ body.llf-pin-loading #v97-loading-cover{display:flex !important;}
     }catch(e){}
   }
 
+  /* 스크립트 파싱 즉시 cover 부착 — body가 이미 존재하므로 동기로 가능.
+     이 시점부터 화면 전체가 cover 뒤에 가려져서, 첫 paint에서도 #main의
+     중간 상태(연속결석 분석만 채워진 화면 등)가 노출되지 않음. */
+  if(document.body){
+    showCover();
+  } else {
+    // 만약 어떤 이유로 body가 아직 없으면 다음 microtask에 부착
+    setTimeout(showCover, 0);
+  }
+
   function commitRenderAndRelease(){
     if(!_pinSubmitted || !_loadCompleted) return;
     if(_renderCommitted) return;
-    // 동기 렌더 (debounce 회피)
+    // 동기 렌더 — overview 본문 + 연속결석 분석 섹션 모두 채운다
     try{
       var ov = document.getElementById('page-overview');
       if(ov && ov.classList.contains('active')){
         if(typeof window.renderOverviewNow === 'function') window.renderOverviewNow();
         else if(typeof window.renderOverview === 'function') window.renderOverview();
+        // v78의 연속결석 분석 섹션을 명시적으로 동기 렌더 (window.renderOverview
+        // 체인이 후속 패치에 덮여 v78 wrapper가 끊긴 경우에도 보장)
+        if(typeof window.renderOverviewExtra === 'function'){
+          try{ window.renderOverviewExtra(); }catch(e){ console.warn('[llf] extra render', e); }
+        }
       }
     }catch(e){ console.warn('[llf] render error', e); }
     _renderCommitted = true;
@@ -12153,8 +12181,7 @@ body.llf-pin-loading #v97-loading-cover{display:flex !important;}
     if(typeof orig !== 'function') return false;
     if(orig.__llfWrapped) return true;
     window.initApp = function(){
-      // PIN 성공 직후 호출됨. 이 시점에 #app은 이미 display:flex.
-      // cover 클래스 재부착해서 #main을 숨김.
+      // cover는 이미 body 부착 시 추가되었으므로 idempotent하게 재부착만
       showCover();
       _pinSubmitted = true;
       _renderCommitted = false;
@@ -12192,7 +12219,6 @@ body.llf-pin-loading #v97-loading-cover{display:flex !important;}
   var iv = setInterval(function(){
     var pinOk = wrapInitApp();
     var loadOk = wrapLoadFromDB();
-    // initApp/loadFromDB가 wrap 후 다른 패치에 의해 교체되면 다시 wrap
     if(window.initApp && !window.initApp.__llfWrapped) wrapInitApp();
     if(window.loadFromDB && !window.loadFromDB.__llfWrapped) wrapLoadFromDB();
     if((pinOk && loadOk) || ++tries > 200) clearInterval(iv);
