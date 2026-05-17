@@ -12710,3 +12710,57 @@ console.log('[MFV2] Loaded');
 })();
 </script>
 <!-- GOOGLE_AUTH_END -->
+
+<!-- CHART_REUSE_FIX_START -->
+<script id="chart-reuse-fix">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Chart canvas 재사용 에러 일괄 해결
+       증상: 콘솔에 "Canvas is already in use. Chart with ID '0' must be
+             destroyed before the canvas with ID 'c-ov-reason' can be
+             reused."
+       원인: 같은 canvas에 다른 코드 경로(v78 mc 헬퍼, v107
+             renderOverviewReasonColorFix, minji 패치)가 각자 다른 변수에
+             Chart 인스턴스를 보관하고, 자신이 만든 것만 destroy하므로,
+             다른 경로가 만든 인스턴스가 살아있으면 Chart.js가 에러.
+       해결: Chart 생성자를 Proxy로 감싸서, new Chart(canvas, ...) 호출 시
+             Chart.getChart(canvas)로 기존 인스턴스를 찾으면 destroy 후 새로
+             생성. 모든 차트 호출 지점에 동일하게 적용됨.
+     ════════════════════════════════════════════════════════════════ */
+  if (typeof window.Chart !== 'function') {
+    console.warn('[chart-reuse-fix] Chart.js 미로드 — 패치 생략');
+    return;
+  }
+  if (window.Chart.__autoDestroyWrapped) return;
+  var OrigChart = window.Chart;
+  function resolveCanvas(arg){
+    if (!arg) return null;
+    if (arg.canvas) return arg.canvas;         // CanvasRenderingContext2D
+    if (arg.nodeType === 1) return arg;        // HTMLCanvasElement
+    if (typeof arg === 'string'){
+      try { return document.getElementById(arg); } catch(e){ return null; }
+    }
+    return null;
+  }
+  var Patched = new Proxy(OrigChart, {
+    construct: function(target, args){
+      try {
+        var canvas = resolveCanvas(args[0]);
+        if (canvas && typeof target.getChart === 'function'){
+          var existing = target.getChart(canvas);
+          if (existing) {
+            try { existing.destroy(); }
+            catch(e){ console.warn('[chart-reuse-fix] destroy 실패:', e); }
+          }
+        }
+      } catch(e){ /* swallow — 생성 시도 자체는 계속 진행 */ }
+      return Reflect.construct(target, args);
+    }
+  });
+  Patched.__autoDestroyWrapped = true;
+  window.Chart = Patched;
+  console.log('[chart-reuse-fix] Chart 생성자 패치 적용');
+})();
+</script>
+<!-- CHART_REUSE_FIX_END -->
