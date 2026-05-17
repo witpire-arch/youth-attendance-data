@@ -795,6 +795,7 @@ select.fc{cursor:pointer}
   <div class="ph"><h2>보고 주제</h2><p>습관성 결석자 및 E단계 사유출석자 타겟 관리</p></div>
   <div class="tabs" id="report-tabs">
     <button class="tb on" onclick="reportTab('habit',this)">습관성 결석자</button>
+    <button class="tb" id="habit-status-tab" onclick="reportTab('habitStatus',this)">타겟 현황</button>
     <button class="tb" onclick="reportTab('estage',this)" style="display:none">E단계 사유출석자</button>
     <button class="tb" onclick="reportTab('cert',this)">인증출석 목표</button>
     <button class="tb" id="cert-detail-tab" onclick="reportTab('certDetail',this)">인증출석 상세</button>
@@ -832,6 +833,28 @@ select.fc{cursor:pointer}
     </div>
   </div>
 
+
+  <!-- 습관성 결석자 타겟 현황 -->
+  <div id="rt-habitStatus" style="display:none">
+    <div class="card" style="margin-bottom:14px">
+      <div class="ct">습관성 결석자 타겟 현황 <span style="font-size:11px;font-weight:400;color:var(--text3)">타겟 인원의 선택 월 기준 출결 분포</span>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select class="fc" id="hs-reg" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"><option value="">전체 지역</option></select>
+          <select class="fc" id="hs-month" onchange="renderHabitTargetStatus()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto"></select>
+          <button class="btn btn-primary" onclick="renderHabitTargetStatus()">현황 조회</button>
+        </div>
+      </div>
+      <div id="hs-summary" class="mg" style="grid-template-columns:repeat(4,1fr);margin:10px 0 12px"></div>
+      <div id="hs-detail-card" class="card" style="margin-bottom:12px">
+        <div class="ct-sm">출석 세부 유형별 수치</div>
+        <div id="hs-detail-body"></div>
+      </div>
+      <div id="hs-weekly-card" class="card">
+        <div class="ct-sm">매주 예배 드린 인원 <span style="font-size:11px;font-weight:400;color:var(--text3)">QR인증·인증안함·인증오류·대체예배만 포함</span></div>
+        <div id="hs-weekly-body"></div>
+      </div>
+    </div>
+  </div>
 
   <!-- 인증출석 목표 -->
   <div id="rt-cert" style="display:none">
@@ -3682,11 +3705,14 @@ function getTargets() {
 function saveTargets(t) { localStorage.setItem('att_targets', JSON.stringify(t)); }
 
 function reportTab(tab, btn) {
-  ['habit','habit-detail','estage'].forEach(t => { const el=document.getElementById('rt-'+t); if(el) el.style.display='none'; });
+  ['habit','habit-detail','habitStatus','estage','cert','cert-detail'].forEach(t => { const el=document.getElementById('rt-'+t); if(el) el.style.display='none'; });
   document.querySelectorAll('#report-tabs .tb').forEach(b=>b.classList.remove('on'));
-  const viewId = tab==='habitDetail' ? 'habit-detail' : tab;
+  const viewId = tab==='habitDetail' ? 'habit-detail' : (tab==='certDetail' ? 'cert-detail' : tab);
   const el=document.getElementById('rt-'+viewId); if(el) el.style.display='';
   if(btn) btn.classList.add('on');
+  if(tab==='habitStatus'){
+    try{ if(typeof renderHabitTargetStatus==='function') renderHabitTargetStatus(); }catch(e){ console.warn(e); }
+  }
   if(tab==='habit') {
     // window.RECORDS 확보 (v6 방식)
     try{
@@ -4164,6 +4190,135 @@ function saveHabitDetailPlan(id) {
   savePlans(plans);
   saveTargets(targets);
   showToast('상세 내용이 저장됐어요!');
+}
+
+// ══ 습관성 결석자 타겟 현황 ══
+function renderHabitTargetStatus(){
+  // 월 옵션 채우기
+  const moSel = document.getElementById('hs-month');
+  const regSel = document.getElementById('hs-reg');
+  if(!moSel || !regSel) return;
+  const cur = curMonth();
+  const allMo = [...new Set([cur, ...RECORDS.map(r => (r.date||'').slice(0,7))])].filter(Boolean).sort().reverse();
+  if(moSel.dataset.loaded !== allMo.join('|')){
+    const keep = moSel.value;
+    moSel.innerHTML = allMo.map(m => `<option value="${m}">${m.slice(0,4)}년 ${parseInt(m.slice(5,7))}월</option>`).join('');
+    moSel.dataset.loaded = allMo.join('|');
+    if(allMo.includes(keep)) moSel.value = keep;
+    else moSel.value = cur;
+  }
+  const mo = moSel.value || cur;
+
+  // 지역 옵션 (currentUser 권한 반영)
+  const scoped = (typeof getFilteredMembers==='function') ? getFilteredMembers() : MEMBERS;
+  const regs = [...new Set(scoped.map(m=>m.region).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ko'));
+  if(regSel.dataset.loaded !== regs.join('|')){
+    const keep = regSel.value;
+    regSel.innerHTML = '<option value="">전체 지역</option>' + regs.map(r=>`<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('');
+    regSel.dataset.loaded = regs.join('|');
+    if(regs.includes(keep)) regSel.value = keep;
+  }
+  const regFilter = regSel.value || '';
+
+  // 타겟 인원 추출
+  const targets = (typeof getTargets==='function') ? getTargets() : {};
+  let targetMembers = scoped.filter(m => targets[m.id+'_habit']);
+  if(regFilter) targetMembers = targetMembers.filter(m => m.region===regFilter);
+
+  const summary = document.getElementById('hs-summary');
+  const detailBody = document.getElementById('hs-detail-body');
+  const weeklyBody = document.getElementById('hs-weekly-body');
+  if(!targetMembers.length){
+    if(summary) summary.innerHTML = `<div class="mc"><div class="lbl">타겟 인원</div><div class="val">0<span style="font-size:12px">명</span></div><div class="sub">${mo} 기준</div></div>`;
+    if(detailBody) detailBody.innerHTML = '<div class="empty" style="padding:20px">타겟으로 지정된 인원이 없습니다.</div>';
+    if(weeklyBody) weeklyBody.innerHTML = '';
+    return;
+  }
+
+  // 출석 세부 유형 추출 helper (v112 detail 로직과 동일)
+  function detailOf(r){
+    if(!r) return '';
+    const st = String(r.st||'').trim();
+    const rsn = String(r.rsn||'').trim();
+    if(st==='사유출석'){ const rv = rsn || '인증안함'; return (!rv || rv==='미입력') ? '인증안함' : rv; }
+    if(st==='QR인증') return 'QR인증';
+    if(st==='사유결석' || st==='결석' || st==='미출석') return '사유결석';
+    return st || rsn;
+  }
+  function weekOfDate(d){
+    const day = parseInt(String(d).slice(8,10),10);
+    return Math.ceil(day/7) || 1;
+  }
+
+  const targetIds = new Set(targetMembers.map(m=>m.id));
+  const monthRecs = RECORDS.filter(r => r.id && targetIds.has(r.id) && (r.date||'').slice(0,7)===mo);
+
+  // 출석 세부 유형별 집계 (기록 수 기준)
+  const detailCounts = {};
+  // 같은 사람·같은 유형 중복 카운트하지 않기 위한 id-set도 함께 보관
+  const detailMembers = {};
+  monthRecs.forEach(r => {
+    const d = detailOf(r);
+    if(!d) return;
+    detailCounts[d] = (detailCounts[d]||0) + 1;
+    if(!detailMembers[d]) detailMembers[d] = new Set();
+    detailMembers[d].add(r.id);
+  });
+
+  // 매주 예배 드린 인원 (QR인증·인증안함·인증오류·대체예배 4가지만 인정)
+  const WORSHIP = new Set(['QR인증','인증안함','인증오류','대체예배']);
+  const allDates = [...new Set(monthRecs.map(r=>r.date))].filter(Boolean);
+  const weeksInMonth = [...new Set(allDates.map(weekOfDate))].sort((a,b)=>a-b);
+  const everyWeekIds = [];
+  if(weeksInMonth.length){
+    targetMembers.forEach(m => {
+      const mine = monthRecs.filter(r => r.id===m.id);
+      const okWeeks = new Set();
+      mine.forEach(r => { if(WORSHIP.has(detailOf(r))) okWeeks.add(weekOfDate(r.date)); });
+      if(weeksInMonth.every(w => okWeeks.has(w))) everyWeekIds.push(m.id);
+    });
+  }
+
+  // 요약 카드
+  if(summary){
+    summary.innerHTML = `
+      <div class="mc"><div class="lbl">타겟 인원</div><div class="val">${targetMembers.length}<span style="font-size:12px">명</span></div><div class="sub">${mo} 기준${regFilter?' · '+escapeHtml(regFilter):''}</div></div>
+      <div class="mc"><div class="lbl">매주 예배 드린 인원</div><div class="val">${everyWeekIds.length}<span style="font-size:12px">명</span></div><div class="sub">QR/인증안함/인증오류/대체예배</div></div>
+      <div class="mc"><div class="lbl">월 내 기록 건수</div><div class="val">${monthRecs.length}<span style="font-size:12px">건</span></div></div>
+      <div class="mc"><div class="lbl">월 내 예배일 수</div><div class="val">${weeksInMonth.length}<span style="font-size:12px">주</span></div></div>
+    `;
+  }
+
+  // 출석 세부 유형별 표
+  if(detailBody){
+    const order = ['QR인증','인증안함','인증오류','대체예배','온라인예배','사유결석'];
+    const knownKeys = order.filter(k => detailCounts[k]);
+    const otherKeys = Object.keys(detailCounts).filter(k => !order.includes(k)).sort();
+    const rows = [...knownKeys, ...otherKeys];
+    if(!rows.length){
+      detailBody.innerHTML = '<div class="empty" style="padding:16px">해당 월 기록 없음</div>';
+    } else {
+      detailBody.innerHTML = `<div class="tw"><table>
+        <thead><tr><th>출석 세부 유형</th><th style="text-align:right">건수</th><th style="text-align:right">인원수</th></tr></thead>
+        <tbody>${rows.map(k => `<tr><td>${escapeHtml(k)}</td><td style="text-align:right">${detailCounts[k]}건</td><td style="text-align:right">${(detailMembers[k]||new Set()).size}명</td></tr>`).join('')}</tbody>
+      </table></div>`;
+    }
+  }
+
+  // 매주 예배 드린 인원 명단
+  if(weeklyBody){
+    if(!everyWeekIds.length){
+      weeklyBody.innerHTML = '<div class="empty" style="padding:16px">해당 인원 없음</div>';
+    } else {
+      const byId = new Map(MEMBERS.map(m=>[m.id,m]));
+      const list = everyWeekIds.map(id => byId.get(id)).filter(Boolean)
+        .sort((a,b) => (a.region||'').localeCompare(b.region||'','ko') || (a.team||'').localeCompare(b.team||'','ko') || (a.name||'').localeCompare(b.name||'','ko'));
+      weeklyBody.innerHTML = `<div class="tw"><table>
+        <thead><tr><th>지역</th><th>팀-구역</th><th>이름</th><th>유형</th></tr></thead>
+        <tbody>${list.map(m => `<tr><td>${escapeHtml(m.region||'')}</td><td>${escapeHtml((m.team||'')+'-'+(m.zone||''))}</td><td style="font-weight:600">${escapeHtml(m.name||'')}</td><td>${typeof typeBadge==='function'?typeBadge(m.type):escapeHtml(m.type||'')}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+    }
+  }
 }
 
 function exportHabitExcel() {
