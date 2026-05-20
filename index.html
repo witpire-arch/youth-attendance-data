@@ -10,6 +10,110 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+
+<!-- LOGIN_GATE_DEFER_HEAVY_LOAD_START
+  목적: 로그인 화면이 즉시 뜨도록 무거운 초기 데이터 적용(applyFinalData)을
+        로그인 성공 이후로 미룬다. 로더의 내부 구조는 손대지 않고 '시점'만 미룸.
+  핵심:
+    - window.applyFinalData를 wrap → currentUser 없으면 no-op (보류 표시만)
+    - 로그인 성공 직후 한 번 호출하여 데이터 적용
+    - 호출만 미루므로 FINAL_MEMBERS/FINAL_RECORDS 정의 자체는 그대로 유지
+-->
+<script id="login-gate-defer-heavy-load">
+(function(){
+  'use strict';
+  var _pending = false;
+  var _appliedOnce = false;
+  function isAuthed(){
+    try { return !!(window.currentUser && (window.currentUser.role || window.currentUser.email)); }
+    catch(e){ return false; }
+  }
+  function wrapApply(fn){
+    if(!fn || fn.__loginGated) return fn;
+    var wrapped = function(){
+      if(!isAuthed()){
+        _pending = true;
+        return;  // 로그인 전엔 적용 보류 — 로그인 화면 표시를 막지 않음
+      }
+      _pending = false;
+      _appliedOnce = true;
+      return fn.apply(this, arguments);
+    };
+    wrapped.__loginGated = true;
+    wrapped.__originalApply = fn;
+    return wrapped;
+  }
+  // applyFinalData는 늦게 정의되므로 setter 트랩으로 자동 wrap
+  var _stored = undefined;
+  try {
+    Object.defineProperty(window, 'applyFinalData', {
+      configurable: true,
+      get: function(){ return _stored; },
+      set: function(v){
+        if(typeof v === 'function' && !v.__loginGated){
+          _stored = wrapApply(v);
+        } else {
+          _stored = v;
+        }
+      }
+    });
+  } catch(e){
+    // defineProperty 실패 시 (브라우저 호환) 폴링 폴백
+    var tries = 0;
+    var iv = setInterval(function(){
+      var f = window.applyFinalData;
+      if(typeof f === 'function' && !f.__loginGated){
+        window.applyFinalData = wrapApply(f);
+        clearInterval(iv);
+      }
+      if(++tries > 300) clearInterval(iv);
+    }, 50);
+  }
+
+  // 로그인 성공 감지 — 두 경로로 동시 감지:
+  //   (a) window.currentUser setter trap — handleAuthChange가 할당하는 순간 즉시 발화
+  //   (b) 50ms 폴링 — setter trap 실패 환경 폴백
+  // 둘 다 동일한 onAuth 핸들러를 호출하지만, _fired 가드로 한 번만 실행됨.
+  var _fired = false;
+  function fireOnAuth(){
+    if(_fired) return;
+    if(!isAuthed()) return;
+    _fired = true;
+    try { if(typeof window.applyFinalData === 'function') window.applyFinalData(); } catch(e){ console.warn('[login-gate] applyFinalData 실패:', e); }
+    setTimeout(function(){
+      try { if(typeof window.renderPage === 'function') {
+        var act = document.querySelector('.page.active');
+        var pid = act ? (act.id||'').replace('page-','') : 'overview';
+        window.renderPage(pid);
+      } } catch(e){}
+      try { if(typeof window.renderOverview === 'function') window.renderOverview(); } catch(e){}
+    }, 50);
+  }
+
+  // (a) currentUser setter trap
+  var _storedUser = undefined;
+  try {
+    Object.defineProperty(window, 'currentUser', {
+      configurable: true,
+      get: function(){ return _storedUser; },
+      set: function(v){
+        _storedUser = v;
+        if(v && (v.role || v.email)) fireOnAuth();
+      }
+    });
+  } catch(e){ /* 폴링으로 대체 */ }
+
+  // (b) 50ms 폴백 폴링
+  var authIv = setInterval(function(){
+    if(isAuthed()){ clearInterval(authIv); fireOnAuth(); }
+  }, 50);
+  setTimeout(function(){ try { clearInterval(authIv); } catch(e){} }, 30000);
+
+  console.log('[login-gate] heavy-load deferral installed');
+})();
+</script>
+<!-- LOGIN_GATE_DEFER_HEAVY_LOAD_END -->
+
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap');
 :root{
@@ -539,6 +643,193 @@ body.llf-pin-loading::before{
     <div id="login-error"></div>
   </div>
 </div>
+
+<!-- EARLY_AUTH_START — login 화면을 가장 빨리 띄우기 위해 #login-screen DOM 직후에 인라인 -->
+<script id="early-auth">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     EARLY AUTH 게이트
+       - Firebase Auth SDK + initializeApp + onAuthStateChanged 조기 등록.
+       - 첫 onAuthStateChanged 발화 전까지 cover 유지, user≠null 일 때만
+         dashboard, user=null 일 때만 로그인 화면.
+       - 캐시된 프로필이 있으면 resolveUserAccess 네트워크 wait 우회.
+     ════════════════════════════════════════════════════════════════ */
+
+  /* ── [임시 진단] cover 가 실제로 사라지는 시점 측정 ────────────────
+     모든 경로(cache-first dropCovers / minjiFastLoad 직접 제거 / early-auth
+     showLoginScreenNow / LLF hideCover / v27 releaseCover) 의 결과를 한 곳에서
+     캡쳐. body class 가 cover 클래스를 모두 잃는 첫 순간에 한 번 로그. */
+  (function trackCoverHide(){
+    var logged = false;
+    function check(){
+      if(logged) return;
+      var b = document.body;
+      if(!b) return;
+      var hasCover = b.classList.contains('llf-pin-loading')
+                  || b.classList.contains('v97-data-loading');
+      if(!hasCover){
+        logged = true;
+        try{ console.log('[perf] cover hidden @ '+Math.round(performance.now())+'ms'); }catch(e){}
+      }
+    }
+    check();
+    try{
+      var mo = new MutationObserver(check);
+      mo.observe(document.body, { attributes:true, attributeFilter:['class'] });
+      setTimeout(function(){ try{ mo.disconnect(); }catch(e){} }, 30000);
+    }catch(e){}
+  })();
+
+  /* FB_CONFIG 임베드 — 본문의 const FB_CONFIG (line 1620 부근) 가 TDZ 라 직접
+     참조 불가. initSupabase 가 나중에 firebase.apps.length 검사로 중복 init 방지. */
+  var FB_CONFIG = {
+    apiKey: "AIzaSyBgHgsdiTBiQWtD5xMq8eLIX61biy79zDE",
+    authDomain: "kmjj-90a2e.firebaseapp.com",
+    databaseURL: "https://kmjj-90a2e-default-rtdb.firebaseio.com",
+    projectId: "kmjj-90a2e",
+    storageBucket: "kmjj-90a2e.firebasestorage.app",
+    messagingSenderId: "738084433336",
+    appId: "1:738084433336:web:d12f2b6084b7bb771eb34d"
+  };
+
+  function ensureFirebaseInit(){
+    if(typeof firebase === 'undefined' || !firebase.auth) return false;
+    try{
+      if(!firebase.apps || !firebase.apps.length){
+        firebase.initializeApp(FB_CONFIG);
+      }
+      return true;
+    }catch(e){
+      var msg = String(e && e.message || e);
+      if(msg.indexOf('duplicate') >= 0 || msg.indexOf('already exists') >= 0) return true;
+      console.warn('[auth] initializeApp error:', e);
+      return false;
+    }
+  }
+
+  /* ── 불변 규칙: 로그인 여부는 오직 Firebase onAuthStateChanged 결과로만 판단 ── */
+  window.__authState = 'unknown'; /* 'unknown' | 'authed' | 'unauthed' */
+  /* cache-first 패치 가드 — 모든 bypass 는 onAuthStateChanged 이후에만. */
+  window.__cf_skipEarly = true;
+
+  var _loginVisible = false;
+  function showLoginScreenNow(){
+    if(_loginVisible) return;
+    try{
+      document.body.classList.add('llf-auth-resolved');
+      var ls = document.getElementById('login-screen');
+      if(ls){ ls.style.display = 'flex'; }
+      document.body.classList.remove('llf-pin-loading');
+      document.body.classList.remove('v97-data-loading');
+      _loginVisible = true;
+    }catch(e){ console.warn('[auth] showLoginScreenNow error', e); }
+  }
+
+  /* ── 사용자 프로필 캐시 (resolveUserAccess 네트워크 우회) ───────
+     첫 로그인 후 window.currentUser 가 세팅되면 localStorage 에 저장.
+     다음 로그인 시 같은 email 의 캐시가 있으면 google-auth 의
+     resolveUserAccess(Firebase 네트워크) 를 기다리지 않고 즉시 showApp+initApp. */
+  var USER_PROFILE_KEY = 'att_user_profile_v1';
+  function loadCachedProfile(email){
+    try{
+      var raw = localStorage.getItem(USER_PROFILE_KEY);
+      if(!raw) return null;
+      var p = JSON.parse(raw);
+      if(p && p.email && String(p.email).toLowerCase() === String(email).toLowerCase()) return p;
+    }catch(e){}
+    return null;
+  }
+  function saveCachedProfile(p){
+    try{
+      if(p && p.email){
+        localStorage.setItem(USER_PROFILE_KEY, JSON.stringify({
+          email: p.email, role: p.role, region: p.region,
+          label: p.label, name: p.name, savedAt: Date.now()
+        }));
+      }
+    }catch(e){}
+  }
+  /* google-auth 가 window.currentUser 를 설정하면 자동 캐시. polling 으로 감지. */
+  (function watchCurrentUser(){
+    var seen = null;
+    var tries = 0;
+    var iv = setInterval(function(){
+      var u = window.currentUser;
+      if(u && u.email && u !== seen){
+        seen = u;
+        saveCachedProfile(u);
+      }
+      if(++tries > 600){ clearInterval(iv); } /* 60s 후 종료 */
+    }, 100);
+  })();
+
+  /* showApp / initApp 의 빠른 트리거 — google-auth 의 .then 보다 먼저 실행 */
+  function fastShowAppAndInit(profile){
+    try{
+      window.currentUser = profile;
+      try{ if(typeof currentUser !== 'undefined') currentUser = profile; }catch(e){}
+      var ls = document.getElementById('login-screen'); if(ls) ls.style.display = 'none';
+      var ad = document.getElementById('access-denied-screen'); if(ad) ad.classList.remove('show');
+      var ap = document.getElementById('app'); if(ap) ap.style.display = 'flex';
+      document.body.classList.add('llf-auth-resolved');
+      /* initApp 호출 — cache-first 의 idempotent wrap 이 중복 호출 방지 */
+      if(typeof window.initApp === 'function'){
+        window.initApp();
+      }
+    }catch(e){ console.error('[auth] fastShowAppAndInit error', e); }
+  }
+
+  /* Firebase Auth SDK ready + initializeApp + onAuthStateChanged 등록 */
+  function whenSdkReady(retries){
+    if(typeof firebase !== 'undefined' && firebase.auth){
+      if(!ensureFirebaseInit()){
+        if(retries <= 0) return;
+        setTimeout(function(){ whenSdkReady(retries-1); }, 20);
+        return;
+      }
+      try{ firebase.auth(); }
+      catch(e){
+        if(retries <= 0) return;
+        setTimeout(function(){ whenSdkReady(retries-1); }, 20);
+        return;
+      }
+      try{
+        firebase.auth().onAuthStateChanged(function(user){
+          var isFirst = (window.__authState === 'unknown');
+          window.__authState = user ? 'authed' : 'unauthed';
+          if(!user){
+            if(!_loginVisible) showLoginScreenNow();
+            return;
+          }
+          /* 첫 발화이면서 user 가 있을 때만 fast-path 시도 — 인증 확정 후 */
+          if(isFirst){
+            window.__cf_skipEarly = false;
+            window.__cf_armed = true;
+            var hasCache = false;
+            try{
+              var mm = localStorage.getItem('att_members_v1');
+              var rr = localStorage.getItem('att_records_v1');
+              hasCache = !!(mm && rr);
+            }catch(e){}
+            var cachedProfile = loadCachedProfile(user.email);
+            if(cachedProfile && hasCache){
+              fastShowAppAndInit(cachedProfile);
+            }
+            /* cachedProfile 또는 cache 없으면 google-auth 의 정상 flow
+               (resolveUserAccess → showApp + initApp) 에 위임 */
+          }
+        });
+      }catch(e){ console.warn('[auth] early onAuthStateChanged register error:', e); }
+      return;
+    }
+    if(retries <= 0) return;
+    setTimeout(function(){ whenSdkReady(retries-1); }, 20);
+  }
+  whenSdkReady(500);
+})();
+</script>
+<!-- EARLY_AUTH_END -->
 
 <!-- ── ACCESS DENIED ── -->
 <div id="access-denied-screen">
@@ -1503,27 +1794,114 @@ function waitForFbDB(timeoutMs) {
   return _fbReadyPromise;
 }
 
-// Firebase에서 데이터를 미리 가져오는 prefetch (PIN 입력 중에 동시 진행)
+// Firebase prefetch — 단일 전체 다운로드를 백그라운드에서 실행.
+//   목적: 로그인 흐름과 병렬로 fbDB에서 members/records/estage를 한 번에 받아둠.
+//   minjiFastLoad Step 2 가 이 결과를 재사용해 추가 RTT 없이 갱신.
+//   로딩 커버는 캐시 렌더 완료 시점에 즉시 제거됨 (이 download 완료를 기다리지 않음).
+window._fullRecordsLoaded = false;
+
 let _prefetchPromise = null;
+let _prefetchTimings = null;
+
 function prefetchFromDB() {
   if (_prefetchPromise) return _prefetchPromise;
   _prefetchPromise = (async () => {
-    const db = await waitForFbDB(5000);
-    if (!db) return null;
+    const t0 = performance.now();
+    const db = await waitForFbDB(8000);
+    const tDB = performance.now();
+    if (!db) {
+      console.log('[perf] prefetch: fbDB 미준비 (' + (tDB-t0).toFixed(0) + 'ms 대기 후 포기)');
+      window._fullRecordsLoaded = true;
+      try { window.dispatchEvent(new Event('fullRecordsLoaded')); } catch(e){}
+      return null;
+    }
     try {
-      const [mSnap, rSnap, eSnap] = await Promise.all([
-        db.ref('members').once('value'),
-        db.ref('records').once('value'),
-        db.ref('estage').once('value'),
-      ]);
+      const pMembers = db.ref('members').once('value');
+      const pRecords = db.ref('records').once('value');
+      const pEstage  = db.ref('estage').once('value');
+      const tMembers = pMembers.then(() => performance.now());
+      const tRecords = pRecords.then(() => performance.now());
+      const tEstage  = pEstage .then(() => performance.now());
+      const [mSnap, rSnap, eSnap, _tM, _tR, _tE] = await Promise.all([pMembers, pRecords, pEstage, tMembers, tRecords, tEstage]);
+      _prefetchTimings = {
+        dbReadyMs: +(tDB-t0).toFixed(0),
+        membersMs: +(_tM-tDB).toFixed(0),
+        recordsMs: +(_tR-tDB).toFixed(0),
+        estageMs:  +(_tE-tDB).toFixed(0),
+        totalMs:   +(performance.now()-t0).toFixed(0)
+      };
+      console.log('[perf] prefetch 완료 (전체 1회)', _prefetchTimings);
+      window._fullRecordsLoaded = true;
+      try { window.dispatchEvent(new Event('fullRecordsLoaded')); } catch(e){}
       return { mSnap, rSnap, eSnap };
     } catch(e) {
-      console.error('prefetch 실패:', e);
+      console.error('[perf] prefetch 실패:', e);
+      window._fullRecordsLoaded = true;
+      try { window.dispatchEvent(new Event('fullRecordsLoaded')); } catch(e){}
       return null;
     }
   })();
   return _prefetchPromise;
 }
+
+// prefetch 시작 조건: (1) fbDB 준비됨 (2) currentUser 인증됨.
+// 로그인 화면에 있는 동안에는 네트워크/CPU 점유 회피 — 구글 로그인 팝업 속도 영향 차단.
+// 인증 완료 → 캐시로 대시보드 즉시 렌더 → 그 다음 prefetch 가 백그라운드 진행.
+(function autoStartPrefetch(){
+  function authed(){
+    try{ return !!(window.currentUser && (window.currentUser.role || window.currentUser.email)); }
+    catch(e){ return false; }
+  }
+  function fbReady(){
+    return (typeof fbDB !== 'undefined' && fbDB) ? true : false;
+  }
+  function startNow(){
+    prefetchFromDB();
+  }
+  var fired = false;
+  var tries = 0;
+  /* 폴링: fbDB & 인증 둘 다 준비되면 시작. 30초 폴링. */
+  var iv = setInterval(function(){
+    if(fired){ clearInterval(iv); return; }
+    if(fbReady() && authed()){
+      fired = true;
+      clearInterval(iv);
+      startNow();
+      return;
+    }
+    if(++tries > 300){ clearInterval(iv); } /* 30초 후 포기 — 그래도 인증되면 setter trap 으로 발화 */
+  }, 100);
+  /* currentUser setter trap (login-gate 와 같은 방식) — 인증 즉시 prefetch 시작 */
+  try{
+    var existingDesc = Object.getOwnPropertyDescriptor(window, 'currentUser');
+    /* login-gate 가 이미 setter trap 설치했을 수 있으므로 그 위에 한 번 더 wrap */
+    var prevGet = existingDesc && existingDesc.get;
+    var prevSet = existingDesc && existingDesc.set;
+    if(prevGet || prevSet){
+      Object.defineProperty(window, 'currentUser', {
+        configurable: true,
+        get: function(){ return prevGet ? prevGet.call(window) : undefined; },
+        set: function(v){
+          if(prevSet) prevSet.call(window, v); else { /* fallback */ }
+          if(!fired && v && (v.role || v.email)){
+            /* fbReady 가 아직 false 면 잠깐 폴링 후 시작 */
+            if(fbReady()){ fired = true; clearInterval(iv); startNow(); }
+            else {
+              var t = 0;
+              var iv2 = setInterval(function(){
+                if(fired){ clearInterval(iv2); return; }
+                if(fbReady()){ fired = true; clearInterval(iv2); clearInterval(iv); startNow(); }
+                else if(++t > 100){ clearInterval(iv2); }
+              }, 50);
+            }
+          }
+        }
+      });
+    }
+  }catch(e){
+    /* setter trap 못 걸면 폴링이 처리 */
+  }
+})();
 
 function initSupabase() {
   const tryInit = (retries) => {
@@ -1539,6 +1917,11 @@ function initSupabase() {
         fbApp = firebase.apps[0];
       }
       fbDB = firebase.database();
+      /* ★ window.fbDB 노출 — 19개 코드 지점이 window.fbDB 만 보고 있음 (특히
+           minjiFastLoad Step 2 의 gate). 미노출 시 Firebase fetch 영영 skip. */
+      window.fbDB = fbDB;
+      window.fbApp = fbApp;
+      console.log('[firebase-init] window.fbDB initialized @ '+Math.round(performance.now())+'ms');
       showDBStatus('Firebase 연결됨 ✓', 'ok');
       // 로그인 인증 완료 후에만 데이터 읽기 — prefetch는 auth 콜백에서 시작
     } catch(e) {
@@ -2935,9 +3318,17 @@ function renderRegionCards(){
             if(!_cur)return'';
             var _prev=''; for(var _pi=_allDates.length-1;_pi>=0;_pi--){if(_allDates[_pi]<_cur){_prev=_allDates[_pi];break;}}
             if(!_prev)return'';
-            var _mids=new Set(FM.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
-            var _cR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_cur;});
-            var _pR=_allR.filter(function(r){return _mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===_prev;});
+            // ── 1순위: 주별 스냅샷 (그 주 시점의 진짜 재적 — 지역 이동/퇴적 영향 없음) ──
+            if(typeof window.getSnapshotDelta==='function'){
+              var _snapDelta=window.getSnapshotDelta(_cur,_prev,{reg:reg});
+              if(_snapDelta!=null){
+                var _scls=_snapDelta>0?'up':_snapDelta<0?'dn':'eq';
+                return '<span class="v115-delta '+_scls+'" style="font-size:11px;white-space:nowrap" title="weeklySnapshots 기반">'+((_snapDelta>0)?'+':'')+_snapDelta.toFixed(1)+'%</span>';
+              }
+            }
+            // ── 폴백: 기록 기반 재계산 (스냅샷 없을 때만). 양 주에 _recBelongsToRegion 동일 적용. ──
+            var _cR=_allR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_cur && _recBelongsToRegion(r, reg);});
+            var _pR=_allR.filter(function(r){return String(r&&r.date||'').slice(0,10)===_prev && _recBelongsToRegion(r, reg);});
             if(_cR.length&&_pR.length){
               // 표시값 pct1(qr+sa, t)과 동일한 공식 사용
               var _cA=_cR.filter(function(r){return r.st==='QR인증'||r.st==='사유출석';}).length;
@@ -2979,14 +3370,24 @@ function renderRegionCards(){
             if(tCur){
               let tPrev=''; for(let _ti=allDates.length-1;_ti>=0;_ti--){if(allDates[_ti]<tCur){tPrev=allDates[_ti];break;}}
               if(tPrev){
-                const mids=new Set(tArr.map(m=>m.id));
-                const cR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tCur);
-                const pR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tPrev);
-                if(cR.length&&pR.length){
-                  // tgs.pct(표시값)가 not-사유결석 공식이므로 delta도 동일 공식 유지
-                  const dd=Math.round((cR.filter(r=>r.st!=='사유결석').length/cR.length-pR.filter(r=>r.st!=='사유결석').length/pR.length)*1000)/10;
-                  const dc=dd>0?'up':dd<0?'dn':'eq';
-                  dStr='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
+                // ── 1순위: 주별 스냅샷 ──
+                let _snapTypeDelta=null;
+                if(typeof window.getSnapshotDelta==='function'){
+                  _snapTypeDelta=window.getSnapshotDelta(tCur,tPrev,{reg:reg,type:t});
+                }
+                if(_snapTypeDelta!=null){
+                  const dc=_snapTypeDelta>0?'up':_snapTypeDelta<0?'dn':'eq';
+                  dStr='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px" title="weeklySnapshots 기반">'+(_snapTypeDelta>0?'+':'')+_snapTypeDelta.toFixed(1)+'%</span>';
+                } else {
+                  const mids=new Set(tArr.map(m=>m.id));
+                  const cR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tCur);
+                  const pR=allR.filter(r=>mids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tPrev);
+                  if(cR.length&&pR.length){
+                    // tgs.pct(표시값)가 not-사유결석 공식이므로 delta도 동일 공식 유지
+                    const dd=Math.round((cR.filter(r=>r.st!=='사유결석').length/cR.length-pR.filter(r=>r.st!=='사유결석').length/pR.length)*1000)/10;
+                    const dc=dd>0?'up':dd<0?'dn':'eq';
+                    dStr='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
+                  }
                 }
               }
             }
@@ -3014,14 +3415,24 @@ function renderRegionCards(){
             if(tmCur){
               let tmPrev=''; for(let _i=allDates.length-1;_i>=0;_i--){if(allDates[_i]<tmCur){tmPrev=allDates[_i];break;}}
               if(tmPrev){
-                const tmids=new Set(tmArr.map(m=>m.id));
-                const cR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmCur);
-                const pR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmPrev);
-                if(cR.length&&pR.length){
-                  // statGs 표시값(qr+sa/total)과 동일한 공식 사용
-                  const dd=Math.round((cR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/cR.length-pR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/pR.length)*1000)/10;
-                  const dc=dd>0?'up':dd<0?'dn':'eq';
-                  tmDelta='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
+                // ── 1순위: 주별 스냅샷 ──
+                let _snapTmDelta=null;
+                if(typeof window.getSnapshotDelta==='function'){
+                  _snapTmDelta=window.getSnapshotDelta(tmCur,tmPrev,{reg:reg,team:tm});
+                }
+                if(_snapTmDelta!=null){
+                  const dc=_snapTmDelta>0?'up':_snapTmDelta<0?'dn':'eq';
+                  tmDelta='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px" title="weeklySnapshots 기반">'+(_snapTmDelta>0?'+':'')+_snapTmDelta.toFixed(1)+'%</span>';
+                } else {
+                  const tmids=new Set(tmArr.map(m=>m.id));
+                  const cR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmCur);
+                  const pR=allR.filter(r=>tmids.has(r.id)&&String(r&&r.date||'').slice(0,10)===tmPrev);
+                  if(cR.length&&pR.length){
+                    // statGs 표시값(qr+sa/total)과 동일한 공식 사용
+                    const dd=Math.round((cR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/cR.length-pR.filter(r=>r.st==='QR인증'||r.st==='사유출석').length/pR.length)*1000)/10;
+                    const dc=dd>0?'up':dd<0?'dn':'eq';
+                    tmDelta='<span class="v115-delta '+dc+'" style="font-size:8px;margin-left:2px">'+(dd>0?'+':'')+dd.toFixed(1)+'%</span>';
+                  }
                 }
               }
             }
@@ -4198,7 +4609,33 @@ function openHabitDetail(id, mo, alreadyOnTab=false) {
   const targets = getTargets();
   const plans = getPlans();
   const plan = plans[id] || {};
-  const recs = RECORDS.filter(r=>r.id===id && r.date.startsWith(mo)).sort((a,b)=>a.date.localeCompare(b.date));
+
+  /* 사이클 컨텍스트 확인 — habitualPlan 에서 mo 가 속한 cycle 검색.
+     baseMonth / cycleStart / cycleEnd 중 어느 필드와 매칭되든 같은 cycle 로 봄. */
+  let monthsToShow = [mo];
+  let cycleInfo = null;
+  try{
+    if(typeof window.habitualPlan !== 'undefined' && typeof window.habitualPlan.getAll === 'function'){
+      const allPlans = window.habitualPlan.getAll();
+      Object.keys(allPlans).some(k => {
+        const p = allPlans[k];
+        if(!p) return false;
+        if(p.cycleStart === mo || p.cycleEnd === mo || p.baseMonth === mo){
+          cycleInfo = p;
+          return true;
+        }
+        return false;
+      });
+      if(cycleInfo){
+        const arr = [cycleInfo.baseMonth, cycleInfo.cycleStart, cycleInfo.cycleEnd].filter(Boolean);
+        const uniq = [];
+        arr.forEach(mm => { if(uniq.indexOf(mm) < 0) uniq.push(mm); });
+        uniq.sort();
+        monthsToShow = uniq;
+      }
+    }
+  }catch(e){ console.warn('[habit-detail] cycle lookup error', e); }
+
   const planRows = Array.from({length:5},(_,i)=>{
     const w=i+1, wk=plan[`w${w}`]||{};
     return `<tr>
@@ -4213,7 +4650,37 @@ function openHabitDetail(id, mo, alreadyOnTab=false) {
       <td style="white-space:normal;min-width:180px"><input class="fc" id="hd-w${w}-reason" value="${escapeHtml(wk.reason||'')}" placeholder="미이행 사유"></td>
     </tr>`;
   }).join('');
-  const recordRows = recs.length ? recs.map(r=>`<tr><td>${r.date}</td><td>${r.wk}주</td><td>${stBadge(r.st)}</td><td>${rsnBadge(r.rsn, r.st)}</td><td>${skPill(r.streak,m.type)}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">해당 월 출결 기록 없음</td></tr>';
+
+  /* 월별 출결 섹션 — monthsToShow 의 각 월마다 별도 헤더 + 표 생성.
+     각 월별 records 가 비어있으면 "해당 월 출결 기록 없음" 표시. */
+  function buildAttendanceSection(monthStr, isCycleSection){
+    const monthRecs = RECORDS
+      .filter(r => r.id === id && r.date && r.date.startsWith(monthStr))
+      .sort((a,b) => a.date.localeCompare(b.date));
+    const rows = monthRecs.length
+      ? monthRecs.map(r => `<tr><td>${r.date}</td><td>${r.wk}주</td><td>${stBadge(r.st)}</td><td>${rsnBadge(r.rsn, r.st)}</td><td>${skPill(r.streak,m.type)}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="empty">해당 월 출결 기록 없음</td></tr>';
+    /* 사이클 컨텍스트에서 baseMonth / cycleStart / cycleEnd 라벨 부착 */
+    let roleLabel = '';
+    if(cycleInfo){
+      if(monthStr === cycleInfo.baseMonth) roleLabel = ' <span style="font-size:11px;color:var(--text3);font-weight:400">(기준월)</span>';
+      else if(monthStr === cycleInfo.cycleStart) roleLabel = ' <span style="font-size:11px;color:var(--blue);font-weight:400">(사이클 시작월)</span>';
+      else if(monthStr === cycleInfo.cycleEnd) roleLabel = ' <span style="font-size:11px;color:var(--blue);font-weight:400">(사이클 종료월)</span>';
+    }
+    return `
+      <div class="ct-sm" style="margin:14px 0 8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <span>${monthStr} 출결 기록${roleLabel} <span style="font-size:11px;color:var(--text3);font-weight:400">· ${monthRecs.length}건</span></span>
+        <button class="btn btn-sm" onclick="addHabitAttendanceRow('${id}','${monthStr}')">+ ${monthStr} 출결 입력 추가</button>
+      </div>
+      <div class="tw" style="margin-bottom:6px"><table>
+        <thead><tr><th>날짜</th><th>주차</th><th>출결</th><th>세부사유</th><th>연속결석</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+  }
+  const attendanceSectionsHTML = monthsToShow.map(mm => buildAttendanceSection(mm, !!cycleInfo)).join('');
+  const cycleHeader = cycleInfo
+    ? `${(parseInt(cycleInfo.cycleStart.slice(5,7),10))}-${(parseInt(cycleInfo.cycleEnd.slice(5,7),10))}월 사이클 출결 기록 <span style="font-size:11px;color:var(--text3);font-weight:400">· 기준월 ${cycleInfo.baseMonth} + 사이클 ${cycleInfo.cycleStart}~${cycleInfo.cycleEnd}</span>`
+    : `${mo} 출결 기록`;
   el.innerHTML = `<div class="ph-row" style="margin-bottom:12px">
     <div class="ph" style="margin-bottom:0"><h2>${escapeHtml(m.name)} 상세</h2><p>습관성 결석자 타겟 및 1~5주차 계획 관리</p></div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
@@ -4240,14 +4707,10 @@ function openHabitDetail(id, mo, alreadyOnTab=false) {
     </table></div>
   </div>
   <div class="card">
-    <div class="ct">${mo} 출결 기록
-      <button class="btn btn-sm" onclick="addHabitAttendanceRow('${id}','${mo}')">+ 출결 입력 추가</button>
-    </div>
-    <div id="hd-att-inputs" style="margin-bottom:10px"></div><div style="font-size:11px;color:var(--text3);margin-bottom:8px">위의 + 출결 입력 추가 버튼으로 이 화면에서 바로 출결을 입력/저장할 수 있습니다.</div>
-    <div class="tw"><table>
-      <thead><tr><th>날짜</th><th>주차</th><th>출결</th><th>세부사유</th><th>연속결석</th></tr></thead>
-      <tbody>${recordRows}</tbody>
-    </table></div>
+    <div class="ct">${cycleHeader}</div>
+    <div id="hd-att-inputs" style="margin-bottom:10px"></div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:8px">월별 [+ 출결 입력 추가] 버튼으로 해당 월의 출결을 바로 입력/저장할 수 있습니다.</div>
+    ${attendanceSectionsHTML}
   </div>`;
 }
 
@@ -8119,7 +8582,7 @@ body.v97-data-loading #login-screen{z-index:9999;}
     try{ if(typeof _v112cache!=='undefined') _v112cache={key:null,result:{}}; }catch(e){}
   }
   window.syncData = syncData;
-  function verify(){syncData(); let v={total:MEMBERS.length,family:MEMBERS.filter(m=>m.type==='가족').length,familyOut:MEMBERS.filter(m=>m.type==='가족외').length,famSum:MEMBERS.filter(m=>m.type==='가족'||m.type==='가족외').length,may13:RECORDS.filter(r=>nd(r.date)==='2026-05-13').length,hong:MEMBERS.filter(isHong).length,records:RECORDS.length}; console.log('[v106 검산]',v); return v;}
+  function verify(){syncData(); let v={total:MEMBERS.length,family:MEMBERS.filter(m=>m.type==='가족').length,familyOut:MEMBERS.filter(m=>m.type==='가족외').length,famSum:MEMBERS.filter(m=>m.type==='가족'||m.type==='가족외').length,may13:RECORDS.filter(r=>nd(r.date)==='2026-05-13').length,hong:MEMBERS.filter(isHong).length,records:RECORDS.length}; return v;}
   window.__v106Verify=verify;
   function rateBar(p){let col=p>=80?'var(--green)':p>=60?'var(--amber)':'var(--red)'; return '<div class="rb-wrap"><div class="rb"><div class="rf" style="width:'+Math.max(0,Math.min(100,p)).toFixed(1)+'%;background:'+col+'"></div></div><span style="font-size:11px;color:'+col+';font-weight:700">'+p.toFixed(1)+'%</span></div>';}
   function typeBadge(t){t=normType(t); let cls=t==='가족'?'b-fam':t==='가족외'?'b-famx':'b-gen'; return '<span class="badge '+cls+'">'+t+'</span>';}
@@ -10899,9 +11362,6 @@ window.addEventListener('load',function(){
     var _afterV112=_allM.filter(function(m){return !window.v112excluded(m.id,mo);});
     var _prevT=0;
     _allM.forEach(function(m){ if(hasPrevRec(m.id))_prevT++; });
-    var _afterPrev=_afterV112.filter(function(m){return hasPrevRec(m.id);});
-    var _aprCount=allRecs.filter(function(r){return String(r.date||'').slice(0,7)===pm;}).length;
-    console.log('[습관성결석디버그] allMembers='+_allM.length+' v112제외='+_v112T+' v112통과='+_v112F+' 전월기록보유='+_prevT+' 최종='+_afterPrev.length+' allRecs='+allRecs.length+' 4월레코드='+_aprCount+' mo='+mo+' pm='+pm);
     var data=allMembers()
       .filter(function(m){return !window.v112excluded(m.id,mo);})
       .filter(function(m){return hasPrevRec(m.id);})
@@ -11306,8 +11766,11 @@ window.addEventListener('load',function(){
   'use strict';
   /* 빠른 로딩: 로컬 캐시 즉시 표시 → Firebase 백그라운드 동기화 */
   async function minjiFastLoad(){
+    var _tStart = performance.now();
+    console.log('[perf] minjiFastLoad start');
     try{
       /* ── Step 1: 로컬 캐시 즉시 표시 ── */
+      var _t1=performance.now();
       var m=localStorage.getItem('att_members_v1'), r=localStorage.getItem('att_records_v1');
       var hasLocal = false;
       // ── MEMBERS: 캐시가 현재보다 풍부할 때만 덮어쓰기 ──
@@ -11346,6 +11809,15 @@ window.addEventListener('load',function(){
         }catch(e){ console.warn('[minjiFastLoad] RECORDS cache parse fail', e); }
       }
       if(hasLocal){
+        /* ── 직접 cover 제거 (hook/poll 우회) ──
+           hasLocal=true 이면 캐시로 즉시 dashboard 렌더 가능 → 그 자리에서
+           바로 body 의 cover 클래스를 제거. cache-first 패치의 hideLoading hook /
+           polling 을 기다리지 않음. classList.add interceptor 가 재추가 차단. */
+        try{
+          document.body.classList.remove('llf-pin-loading');
+          document.body.classList.remove('v97-data-loading');
+          document.body.classList.add('cf-released');
+        }catch(e){}
         try{ if(typeof invalidateRecordIndex==='function')invalidateRecordIndex(); }catch(e){}
         try{ if(typeof populateSelects==='function')populateSelects(); }catch(e){}
         var dates=[]; try{ dates=Array.from(new Set((RECORDS||[]).map(function(x){return x&&x.date;}).filter(Boolean))).sort(); }catch(e){}
@@ -11359,9 +11831,16 @@ window.addEventListener('load',function(){
           if(typeof renderPage==='function') renderPage(_pid);
           else if(typeof window.renderOverview==='function') window.renderOverview();
         }catch(e){}
+        /* 한 번 더 보장 — renderPage 가 cover 를 다시 추가했을 수도 있음 */
+        try{
+          document.body.classList.remove('llf-pin-loading');
+          document.body.classList.remove('v97-data-loading');
+        }catch(e){}
       }
+      console.log('[perf] Step1 (cache+render):', (performance.now()-_t1).toFixed(0)+'ms', 'hasLocal=', hasLocal, '@', Math.round(performance.now())+'ms');
       /* ── Step 2: Firebase 백그라운드 동기화 ── */
       setTimeout(async function(){
+        var _t0 = performance.now();
         try{
           /* fbDB 대기 (최대 5초) */
           var waited=0;
@@ -11372,9 +11851,25 @@ window.addEventListener('load',function(){
             return;
           }
           try{ if(typeof showDBStatus==='function')showDBStatus('Firebase 동기화 중...','loading'); }catch(e){}
-          var mSnap=await window.fbDB.ref('members').once('value');
-          var rSnap=await window.fbDB.ref('records').once('value');
-          var eSnap=await window.fbDB.ref('estage').once('value');
+          // ── 최적화: 페이지 로드 시 자동 시작된 prefetch 결과 재사용 ──
+          //   로그인/팝업 동안 이미 다운로드 진행 중이었으면 여기서 추가 RTT 없이 즉시 결과 사용.
+          //   prefetch가 없거나 실패했으면 폴백으로 3개 노드를 Promise.all로 병렬 다운로드.
+          var mSnap, rSnap, eSnap;
+          var _tFetch0 = performance.now();
+          var _src = 'parallel';
+          var pre = (typeof prefetchFromDB === 'function') ? await prefetchFromDB() : null;
+          if(pre && pre.mSnap){
+            mSnap = pre.mSnap; rSnap = pre.rSnap; eSnap = pre.eSnap;
+            _src = 'prefetch';
+          } else {
+            var arr = await Promise.all([
+              window.fbDB.ref('members').once('value'),
+              window.fbDB.ref('records').once('value'),
+              window.fbDB.ref('estage').once('value')
+            ]);
+            mSnap = arr[0]; rSnap = arr[1]; eSnap = arr[2];
+          }
+          console.log('[perf] minjiFastLoad Step2 fetch ('+_src+'):', (performance.now()-_tFetch0).toFixed(0)+'ms');
           var updated=false;
           if(mSnap.exists()){
             MEMBERS=Object.values(mSnap.val()).map(function(mm){
@@ -11397,6 +11892,7 @@ window.addEventListener('load',function(){
           }
           if(eSnap.exists()){ try{localStorage.setItem('att_estage_data',JSON.stringify(eSnap.val()));}catch(e){} }
           if(updated){
+            var _tProc=performance.now();
             try{ if(typeof invalidateRecordIndex==='function')invalidateRecordIndex(); }catch(e){}
             try{ localStorage.setItem('att_members_v1',JSON.stringify(MEMBERS)); localStorage.setItem('att_records_v1',JSON.stringify(RECORDS)); }catch(e){}
             try{ if(typeof populateSelects==='function')populateSelects(); }catch(e){}
@@ -11411,9 +11907,11 @@ window.addEventListener('load',function(){
             try{ if(typeof showDBStatus==='function')showDBStatus('✓ '+MEMBERS.length+'명 · '+RECORDS.length+'건 로드됨','ok'); }catch(e){}
             /* MFV2 날짜카운트 재건 */
             try{ if(typeof window.rebuildDateCountsFromRecords==='function')window.rebuildDateCountsFromRecords(); }catch(e){}
+            console.log('[perf] Step2 process+save+render:', (performance.now()-_tProc).toFixed(0)+'ms', '| MEMBERS=', MEMBERS.length, 'RECORDS=', RECORDS.length);
           } else if(hasLocal){
             try{ if(typeof showDBStatus==='function')showDBStatus('✓ 로컬 캐시 '+MEMBERS.length+'명','ok'); }catch(e){}
           }
+          console.log('[perf] minjiFastLoad TOTAL Step2:', (performance.now()-_t0).toFixed(0)+'ms');
         }catch(err){
           console.error('[FastLoad Firebase]',err);
           if(hasLocal){ try{ if(typeof showDBStatus==='function')showDBStatus('✓ 로컬 캐시 '+MEMBERS.length+'명 (Firebase 오류)','ok'); }catch(e){} }
@@ -11737,7 +12235,10 @@ console.log('[MFV2] Loaded');
   var _finishStarted=false;
   function finishLoadingWhenReady(maxWait){
     if(_finishStarted) return;
-    showCover();   // 확실히 커버 유지
+    /* 캐시 fast-path 가 켜져 있으면 cover 를 다시 띄우지 않는다 — 캐시 렌더로
+       이미 대시보드가 보이므로 cover 가 다시 올라오면 사용자가 로딩 상태로
+       오해함. cache-first 패치 (파일 끝)가 _armed 플래그를 세팅. */
+    if(!window.__cf_armed) showCover();
     _finishStarted=true;
     var start=Date.now();
     (function check(){
@@ -12224,7 +12725,10 @@ console.log('[MFV2] Loaded');
     if(typeof orig !== 'function') return false;
     if(orig.__llfWrapped) return true;
     window.initApp = function(){
-      showCover(); // idempotent
+      /* 캐시 fast-path 가 켜져 있으면 cover 를 다시 띄우지 않는다 —
+         캐시 렌더가 곧 끝나면서 대시보드가 1초 이내 표시되므로 그 위에 cover
+         를 다시 덮으면 사용자가 계속 로딩 상태로 느낌. */
+      if(!window.__cf_armed) showCover();
       _pinSubmitted = true;
       _renderCommitted = false;
       _scheduled = false;
@@ -12426,17 +12930,27 @@ console.log('[MFV2] Loaded');
     try{
       var provider = new firebase.auth.GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
-      // 리다이렉트 후 돌아왔을 때도 로그인 유지되도록 LOCAL persistence 보장
-      // (기본값이지만 명시) — set 후 signInWithRedirect 호출
-      firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
-        .then(function(){
-          // 이 호출은 페이지를 구글 로그인 화면으로 네비게이트시키므로 이후 코드는 실행되지 않음.
-          // 돌아왔을 때 페이지가 새로 로드되고 getRedirectResult + onAuthStateChanged가 처리.
-          return firebase.auth().signInWithRedirect(provider);
+      // ★ 중요: signInWithPopup은 클릭 핸들러 동기 컨텍스트에서 '바로' 호출해야 함.
+      //   앞에 await/Promise를 두면 브라우저가 user-gesture를 잃어 팝업이 차단됨.
+      //   persistence는 initAuth에서 미리 설정해둠 (LOCAL).
+      firebase.auth().signInWithPopup(provider)
+        .then(function(result){
+          // onAuthStateChanged가 후속 처리(허용 목록 조회 + 앱 진입)를 담당
+          if(result && result.user){
+            console.log('[auth] 팝업 로그인 성공:', result.user.email);
+          }
         })
         .catch(function(err){
-          console.error('[auth] redirect 로그인 실패:', err);
-          setLoginError('로그인 실패: ' + (err && err.message || err));
+          console.error('[auth] popup 로그인 실패:', err);
+          var code = err && err.code ? err.code : '';
+          var msg;
+          if(code === 'auth/popup-closed-by-user')         msg = '로그인 창이 닫혔습니다. 다시 시도해주세요.';
+          else if(code === 'auth/popup-blocked')           msg = '브라우저가 팝업을 차단했습니다. 주소창 옆 팝업 아이콘에서 이 사이트를 허용해주세요.';
+          else if(code === 'auth/cancelled-popup-request') msg = '이전 로그인 요청이 취소되었습니다. 다시 눌러주세요.';
+          else if(code === 'auth/unauthorized-domain')     msg = '이 도메인은 Firebase 인증에 등록되어 있지 않습니다.';
+          else if(code === 'auth/network-request-failed')  msg = '네트워크 오류 — 연결을 확인하고 다시 시도해주세요.';
+          else                                              msg = '로그인 실패: ' + (err && (err.message || err.code) || err);
+          setLoginError(msg);
           _signingIn = false;
           if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
         });
@@ -12593,67 +13107,61 @@ console.log('[MFV2] Loaded');
   setTimeout(bindButtons, 500);
 
   // ════════════════════════════════════════════════════════════════
-  // 인증 초기화 — 무한 리다이렉트 루프 차단의 핵심
-  //   문제: 리다이렉트 복귀 시 Firebase의 auth 상태 복원은 비동기.
-  //         페이지 로드 직후 currentUser를 읽으면 null로 보여서
-  //         로그인 화면이 깜빡 → 사용자가 다시 누름 → 또 리다이렉트 → 루프.
-  //   해결: getRedirectResult()와 첫 onAuthStateChanged 발화 모두를
-  //         await한 뒤에야 비로소 'llf-auth-resolved' 클래스를 부착하고
-  //         화면을 결정. 그 전에는 로그인/앱/거부 화면 모두 CSS로 강제 숨김.
-  //   signInWithRedirect는 절대 자동 호출하지 않음 — 오직 버튼 클릭에서만.
+  // 인증 초기화 — 팝업 방식 (서드파티 쿠키 차단에도 안전)
+  //   - persistence는 init에서 한 번만 LOCAL로 설정. 이후 popup은 await 없이 즉시 호출.
+  //   - getRedirectResult/redirect 복귀 로직은 더 이상 필요 없음 — popup은 페이지 이동 없음.
+  //   - 첫 onAuthStateChanged 발화를 기다린 후에만 'llf-auth-resolved' 클래스를 붙임
+  //     → 그 전에는 CSS로 로그인/앱/거부 화면 모두 숨김 (깜빡임 방지).
   // ════════════════════════════════════════════════════════════════
   function applyAuthResolved(){
     try{ document.body.classList.add('llf-auth-resolved'); }catch(e){}
   }
 
   function initAuth(){
-    // (1) 리다이렉트 결과 처리 — 복귀했으면 result.user가 채워짐
-    var rrPromise;
-    try{
-      rrPromise = firebase.auth().getRedirectResult()
-        .then(function(result){
-          if(result && result.user){
-            console.log('[auth] redirect 복귀 — 로그인 성공:', result.user.email);
-          }
-          return result;
-        })
-        .catch(function(err){
-          if(err && err.code && err.code !== 'auth/no-auth-event'){
-            console.error('[auth] redirect 결과 오류:', err);
-            setLoginError('로그인 실패: ' + (err.message || err));
-          }
-          return null;
-        });
-    }catch(e){
-      console.error('[auth] getRedirectResult 호출 실패:', e);
-      rrPromise = Promise.resolve(null);
+    // (1) LOCAL persistence를 사전에 설정 — 클릭 핸들러에서 await 없이 popup 호출하기 위해.
+    //     기본값이 이미 LOCAL이지만 명시 (새로고침/재방문 후에도 로그인 유지).
+    try {
+      firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+        .catch(function(err){ console.warn('[auth] setPersistence 실패(무시):', err); });
+    } catch(e){ console.warn('[auth] setPersistence 호출 실패(무시):', e); }
+
+    // (2) onAuthStateChanged 리스너 — 매 발화마다 handleAuthChange 호출.
+    //   ★ 중요: 게이트는 'applyAuthResolved'(첫 발화 1회) 에만 적용하고,
+    //     handleAuthChange는 매번 실행해야 함. 그래야 새로고침(세션 복원)·팝업
+    //     로그인 성공·로그아웃·재로그인 등 모든 상태 변화에서 화면이 갱신됨.
+    //     이전 버그: 단일 게이트로 두 번째 발화(=팝업 성공)를 무시 → 대시보드 진입 실패.
+    var resolvedOnce = false;
+    function resolveScreenOnce(){
+      if(resolvedOnce) return;
+      resolvedOnce = true;
+      applyAuthResolved();
     }
 
-    // (2) 첫 onAuthStateChanged 발화를 기다림 — 이게 발화해야 auth가 완전히 복원된 것
-    //     첫 발화만 받고 구독 해제, 이후 (3)에서 본 리스너 등록.
-    var firstAuthPromise = new Promise(function(resolve){
-      var unsubscribe = firebase.auth().onAuthStateChanged(
+    try {
+      firebase.auth().onAuthStateChanged(
         function(user){
-          try{ unsubscribe(); }catch(e){}
-          resolve(user);
+          resolveScreenOnce();   // 첫 발화 시 1회만 화면 잠금 해제
+          handleAuthChange(user); // 매 발화 실행 — 로그인/로그아웃/세션복원 전부 처리
         },
         function(err){
-          console.error('[auth] onAuthStateChanged 초기 오류:', err);
-          resolve(null);
+          console.error('[auth] onAuthStateChanged 오류:', err);
+          resolveScreenOnce();
+          handleAuthChange(null);
         }
       );
-    });
+    } catch(e) {
+      console.error('[auth] onAuthStateChanged 등록 실패:', e);
+      resolveScreenOnce();
+      handleAuthChange(null);
+    }
 
-    // (3) 둘 다 settle된 후에만 화면 결정 → 결과적으로 cover가 풀리고 로그인/앱 표시
-    Promise.all([rrPromise, firstAuthPromise]).then(function(){
-      applyAuthResolved();
-      var user = firebase.auth().currentUser; // 이 시점엔 최종 상태
-      handleAuthChange(user);
-      // 이후 변화(로그아웃/재로그인)는 일반 리스너로 처리
-      firebase.auth().onAuthStateChanged(handleAuthChange, function(err){
-        console.error('[auth] onAuthStateChanged 오류:', err);
-      });
-    });
+    // 안전망: SDK가 어떤 이유로 onAuthStateChanged를 발화시키지 않을 때 8초 후 강제 해제
+    setTimeout(function(){
+      if(!resolvedOnce){
+        resolveScreenOnce();
+        try { handleAuthChange(firebase.auth().currentUser); } catch(e){ handleAuthChange(null); }
+      }
+    }, 8000);
   }
 
   waitForAuthSDK(60)
@@ -12916,3 +13424,3009 @@ console.log('[MFV2] Loaded');
 })();
 </script>
 <!-- CHART_REUSE_FIX_END -->
+
+
+<!-- WEEKLY_SNAPSHOTS_START
+  목적: 전주 대비(%) 계산을 위해, 매주 시점의 지역/유형/팀별 출석·재적 인원수를
+  Firebase weeklySnapshots/{YYYY-MM-DD} 에 박제. 한 번 저장된 과거 스냅샷은
+  '더 새로운 주가 존재'하면 동결(자동 갱신 금지). 가장 최신 주는 데이터 갱신 시
+  자동 재계산. 관리자만 보이는 보정 UI 제공.
+
+  공개 API:
+    window.WeeklySnapshots.build(date)            현재 RECORDS/MEMBERS로 스냅샷 객체 생성
+    window.WeeklySnapshots.save(date, snap)       Firebase 저장
+    window.WeeklySnapshots.loadAll()              Firebase에서 전체 로드 (캐시)
+    window.WeeklySnapshots.get(date)              캐시된 스냅샷 (없으면 null)
+    window.WeeklySnapshots.autoSaveLatest()       최신 주만 자동 저장(동결 규칙 준수)
+    window.getSnapshotDelta(curDate, prevDate, scope)  전주 대비 % 계산
+      scope: {reg}|{reg,type}|{reg,team}|{total:true}
+-->
+<style id="weekly-snapshots-style">
+#adm-snapshot .ss-row { display:grid; grid-template-columns: 110px 70px 70px 70px 70px 70px; gap:6px; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); }
+#adm-snapshot .ss-row.ss-head { font-size:11px; color:var(--text3); font-weight:700; border-bottom:1px solid var(--border); padding-bottom:4px; }
+#adm-snapshot .ss-row.ss-tot  { background:var(--surface2); font-weight:700; padding:8px 6px; border-radius:6px; margin-bottom:4px; }
+#adm-snapshot .ss-row.ss-reg  { background:rgba(20,80,160,0.05); font-weight:700; padding:8px 6px; margin-top:8px; border-radius:6px; }
+#adm-snapshot .ss-row.ss-sub  { padding-left:18px; font-size:12px; }
+#adm-snapshot input.ss-in { width:100%; padding:3px 6px; font-size:12px; border:1px solid var(--border); border-radius:4px; text-align:right; font-variant-numeric:tabular-nums; }
+#adm-snapshot input.ss-in.ss-edited { border-color:#d35400; background:#fff5e6; }
+#adm-snapshot .ss-label { font-size:12px; }
+#adm-snapshot .ss-sub-label { color:var(--text3); }
+#adm-snapshot .ss-blank { color:var(--text3); text-align:right; font-size:11px; }
+#adm-snapshot details > summary { cursor:pointer; padding:6px 0; font-size:13px; font-weight:700; }
+#adm-snapshot .ss-tag { display:inline-block; padding:2px 7px; border-radius:10px; font-size:10.5px; font-weight:700; margin-left:6px; }
+#adm-snapshot .ss-tag.auto   { background:#e8f0ee; color:#1a7a54; }
+#adm-snapshot .ss-tag.manual { background:#fde9d2; color:#b35a00; }
+#adm-snapshot .ss-tag.none   { background:#f0eee9; color:var(--text3); }
+</style>
+
+<script id="weekly-snapshots">
+(function(){
+  'use strict';
+
+  /* ─────────── 유틸 ─────────── */
+  function safe(fn, fb){ try { return fn(); } catch(e){ console.warn('[weekly-snap]',e); return fb; } }
+  function clean(v){ return String(v==null?'':v).trim(); }
+  function nd(d){
+    var x=clean(d); if(!x) return '';
+    if(/^\d{4}-\d{2}-\d{2}$/.test(x)) return x;
+    var m=x.match(/(\d{4})[.\/-](\d{1,2})[.\/-](\d{1,2})/);
+    return m ? m[1]+'-'+String(+m[2]).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0') : x.slice(0,10);
+  }
+  function isAdmin(){
+    try { return !!(window.currentUser && window.currentUser.role === 'admin'); } catch(e){ return false; }
+  }
+  function getAllMembers(){
+    return safe(function(){
+      if (Array.isArray(window.MEMBERS)) return window.MEMBERS;
+      if (typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) return MEMBERS;
+      return [];
+    }, []);
+  }
+  function getRecs(){
+    return safe(function(){
+      if (Array.isArray(window.RECORDS)) return window.RECORDS;
+      if (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) return RECORDS;
+      return [];
+    }, []);
+  }
+  function normT(t){
+    return safe(function(){
+      if (typeof normType === 'function') return normType(t);
+      var s = clean(t);
+      if (s.indexOf('가족외')>-1) return '가족외';
+      if (s.indexOf('가족')>-1)   return '가족';
+      return '일반';
+    }, '일반');
+  }
+  function getDB(){
+    return safe(function(){
+      return window.fbDB || (typeof fbDB !== 'undefined' ? fbDB : null);
+    }, null);
+  }
+  function allDates(){
+    var set = {};
+    getRecs().forEach(function(r){ var d=nd(r && r.date); if(d) set[d]=1; });
+    return Object.keys(set).sort();
+  }
+
+  /* ─────────── 상태 ─────────── */
+  var SNAPSHOTS = {};         // {date: snap}
+  var LOADED = false;
+  var LOAD_PROMISE = null;
+  window.WEEKLY_SNAPSHOTS = SNAPSHOTS;
+
+  /* ─────────── 빌더 ─────────── */
+  function buildSnapshot(date){
+    var d = nd(date); if(!d) return null;
+    var members = getAllMembers();
+    var memById = {};
+    members.forEach(function(m){ if(m && m.id) memById[m.id] = m; });
+    var recs = getRecs().filter(function(r){ return nd(r && r.date) === d; });
+    if(!recs.length) return null;
+
+    // id 중복 제거 (마지막 우선)
+    var byId = {};
+    recs.forEach(function(r){ if(r && r.id) byId[r.id] = r; });
+    var uniq = Object.keys(byId).map(function(k){ return byId[k]; });
+
+    var snap = {
+      date: d,
+      generatedAt: Date.now(),
+      manual: false,
+      total: { att:0, tot:0, qr:0, sa:0, ab:0 },
+      regions: {}
+    };
+
+    snap.total.tot = uniq.length;
+    snap.total.qr  = uniq.filter(function(r){ return r.st === 'QR인증'; }).length;
+    snap.total.sa  = uniq.filter(function(r){ return r.st === '사유출석'; }).length;
+    snap.total.ab  = uniq.filter(function(r){ return r.st === '사유결석'; }).length;
+    snap.total.att = snap.total.qr + snap.total.sa;
+
+    uniq.forEach(function(r){
+      var m = memById[r.id]; if(!m) return;
+      var reg = clean(m.region); if(!reg) return;
+      var ent = snap.regions[reg];
+      if(!ent){ ent = snap.regions[reg] = { att:0, tot:0, qr:0, sa:0, ab:0, types:{}, teams:{} }; }
+      ent.tot++;
+      if(r.st==='QR인증'){      ent.qr++;  ent.att++; }
+      else if(r.st==='사유출석'){ ent.sa++; ent.att++; }
+      else if(r.st==='사유결석'){ ent.ab++; }
+
+      var t = normT(m.type) || '일반';
+      var tEnt = ent.types[t] || (ent.types[t] = { att:0, tot:0 });
+      tEnt.tot++;
+      if(r.st !== '사유결석') tEnt.att++;
+
+      var tm = clean(m.team) || '미분류';
+      var teEnt = ent.teams[tm];
+      if(!teEnt){ teEnt = ent.teams[tm] = { att:0, tot:0, qr:0, sa:0, ab:0 }; }
+      teEnt.tot++;
+      if(r.st==='QR인증'){      teEnt.qr++;  teEnt.att++; }
+      else if(r.st==='사유출석'){ teEnt.sa++; teEnt.att++; }
+      else if(r.st==='사유결석'){ teEnt.ab++; }
+    });
+
+    return snap;
+  }
+
+  /* ─────────── Firebase I/O ─────────── */
+  function loadAll(){
+    if (LOAD_PROMISE) return LOAD_PROMISE;
+    LOAD_PROMISE = (async function(){
+      var db = getDB();
+      if(!db){
+        LOADED = true;
+        return SNAPSHOTS;
+      }
+      try {
+        var snap = await db.ref('weeklySnapshots').once('value');
+        if(snap.exists()){
+          var val = snap.val() || {};
+          Object.keys(val).forEach(function(k){
+            // Firebase에 점·슬래시 못 들어가니 키는 그대로 YYYY-MM-DD
+            if(val[k] && typeof val[k] === 'object') SNAPSHOTS[k] = val[k];
+          });
+        }
+      } catch(e){
+        console.warn('[weekly-snap] loadAll 실패:', e);
+      }
+      LOADED = true;
+      return SNAPSHOTS;
+    })();
+    return LOAD_PROMISE;
+  }
+
+  async function saveOne(date, snapObj){
+    var db = getDB();
+    if(!db) throw new Error('Firebase 미연결');
+    var d = nd(date); if(!d) throw new Error('잘못된 날짜');
+    var payload = JSON.parse(JSON.stringify(snapObj || {}));
+    payload.date = d;
+    if(!payload.generatedAt) payload.generatedAt = Date.now();
+    await db.ref('weeklySnapshots/' + d).set(payload);
+    SNAPSHOTS[d] = payload;
+    return payload;
+  }
+
+  async function autoSaveLatest(){
+    var dates = allDates();
+    if(!dates.length) return null;
+    var latest = dates[dates.length - 1];
+    await loadAll();
+    var existing = SNAPSHOTS[latest];
+    // 동결 규칙: 더 새 날짜가 없는 latest는 자동 갱신 OK.
+    // manual:true 라도 latest인 동안은 데이터 갱신 시 재계산 (사양: "최신 주는 갱신돼도 된다").
+    // 단, 너무 시끄럽지 않게 — 값이 같으면 skip.
+    var fresh = buildSnapshot(latest);
+    if(!fresh) return null;
+    if(existing && shallowEqualSnap(existing, fresh)){
+      return existing;
+    }
+    // 기존이 manual인 경우 manual 플래그 보존 (사용자가 latest를 수동 보정해뒀을 수 있음)
+    // → 자동 재계산은 'manual=false'면 덮고, 'manual=true'면 건드리지 않음.
+    if(existing && existing.manual === true){
+      return existing;
+    }
+    try {
+      await saveOne(latest, fresh);
+      console.log('[weekly-snap] 자동 저장:', latest);
+      return fresh;
+    } catch(e){
+      console.warn('[weekly-snap] 자동 저장 실패:', e);
+      return null;
+    }
+  }
+
+  function shallowEqualSnap(a, b){
+    if(!a || !b) return false;
+    try {
+      // total 비교
+      var ka = ['att','tot','qr','sa','ab'];
+      for(var i=0;i<ka.length;i++){
+        if((a.total||{})[ka[i]] !== (b.total||{})[ka[i]]) return false;
+      }
+      var regs = Object.keys(b.regions||{});
+      if(regs.length !== Object.keys(a.regions||{}).length) return false;
+      for(var i2=0;i2<regs.length;i2++){
+        var rA = a.regions[regs[i2]], rB = b.regions[regs[i2]];
+        if(!rA || !rB) return false;
+        for(var j=0;j<ka.length;j++){ if(rA[ka[j]] !== rB[ka[j]]) return false; }
+      }
+      return true;
+    } catch(e){ return false; }
+  }
+
+  /* ─────────── Delta lookup (인라인에서 호출) ─────────── */
+  function getDelta(curDate, prevDate, scope){
+    var c = SNAPSHOTS[nd(curDate)], p = SNAPSHOTS[nd(prevDate)];
+    if(!c || !p) return null;
+    function pick(snap){
+      if(!snap) return null;
+      if(scope && scope.total) return { att: snap.total && snap.total.att, tot: snap.total && snap.total.tot };
+      if(!scope || !scope.reg) return null;
+      var reg = snap.regions && snap.regions[scope.reg];
+      if(!reg) return null;
+      if(scope.type){
+        var t = reg.types && reg.types[scope.type];
+        return t ? { att: t.att, tot: t.tot } : null;
+      }
+      if(scope.team){
+        var tm = reg.teams && reg.teams[scope.team];
+        return tm ? { att: tm.att, tot: tm.tot } : null;
+      }
+      return { att: reg.att, tot: reg.tot };
+    }
+    var cv = pick(c), pv = pick(p);
+    if(!cv || !pv) return null;
+    if(!cv.tot || !pv.tot) return null;
+    return Math.round((cv.att/cv.tot - pv.att/pv.tot) * 1000) / 10;
+  }
+
+  /* ─────────── 데이터 로드 후 자동 저장 훅 ─────────── */
+  function bootstrapAfterLoad(){
+    if(!getDB()) return;
+    // 약간 지연: RECORDS/MEMBERS가 window에 미러될 시간 확보
+    setTimeout(async function(){
+      // 캐시 보장 (autoSaveLatest 내부에서도 loadAll 호출하나 명시적으로)
+      try { await loadAll(); } catch(e){}
+      try { await autoSaveLatest(); } catch(e){}
+      // 스냅샷 캐시가 채워졌으니 카드를 다시 렌더 — 첫 렌더는 캐시 없이 그려졌을 수 있음
+      try { if(typeof window.renderRegionCards === 'function') window.renderRegionCards(); } catch(e){}
+    }, 800);
+  }
+
+  // 기존 loadFromDB 래핑
+  function wrapLoad(){
+    var orig = window.loadFromDB;
+    if(typeof orig !== 'function') return false;
+    if(orig.__weeklySnapWrapped) return true;
+    window.loadFromDB = async function(){
+      var r = await orig.apply(this, arguments);
+      bootstrapAfterLoad();
+      return r;
+    };
+    window.loadFromDB.__weeklySnapWrapped = true;
+    return true;
+  }
+  var _wrapTries = 0;
+  var _wrapIv = setInterval(function(){
+    if(wrapLoad() || ++_wrapTries > 200) clearInterval(_wrapIv);
+  }, 50);
+
+  // 이미 데이터가 로드된 상태에서 모듈이 늦게 로드되는 경우를 대비
+  setTimeout(function(){
+    if(getRecs().length && getDB()){
+      loadAll().then(bootstrapAfterLoad);
+    }
+  }, 1500);
+
+  /* ─────────── 공개 API ─────────── */
+  window.WeeklySnapshots = {
+    build: buildSnapshot,
+    save: saveOne,
+    loadAll: loadAll,
+    get: function(date){ return SNAPSHOTS[nd(date)] || null; },
+    all: function(){ return SNAPSHOTS; },
+    autoSaveLatest: autoSaveLatest,
+    rebuildAndSaveLatest: async function(){
+      var dates = allDates();
+      if(!dates.length) throw new Error('데이터 없음');
+      var latest = dates[dates.length - 1];
+      var fresh = buildSnapshot(latest);
+      if(!fresh) throw new Error('빌드 실패: ' + latest);
+      fresh.manual = false;
+      return await saveOne(latest, fresh);
+    }
+  };
+  window.getSnapshotDelta = getDelta;
+
+  /* ═══════════════════ 관리자 UI: 주별 스냅샷 보정 ═══════════════════ */
+
+  function ensureAdminTab(){
+    if(!isAdmin()) return;
+    var tabsRow = document.querySelector('#page-admin .admin-tabs');
+    if(!tabsRow) return;
+    if(document.getElementById('adm-snapshot-tab-btn')) return;
+
+    // 탭 버튼
+    var btn = document.createElement('button');
+    btn.id = 'adm-snapshot-tab-btn';
+    btn.className = 'adm-tab';
+    btn.textContent = '주별 스냅샷';
+    btn.onclick = function(){ openSnapshotTab(this); };
+    tabsRow.appendChild(btn);
+
+    // 컨테이너
+    if(!document.getElementById('adm-snapshot')){
+      var pageAdmin = document.getElementById('page-admin');
+      if(!pageAdmin) return;
+      var box = document.createElement('div');
+      box.id = 'adm-snapshot';
+      box.style.display = 'none';
+      box.innerHTML =
+        '<div class="card" style="max-width:980px">' +
+          '<div class="ct">주별 스냅샷 보정 ' +
+            '<span style="font-size:11px;font-weight:400;color:var(--text3);margin-left:6px">' +
+              '전주 대비(%) 계산의 \'그 주 시점 재적·출석\'을 박제. 공식 출결표와 다른 값만 수정 후 저장.' +
+            '</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">' +
+            '<label style="font-size:12px;color:var(--text3)">날짜</label>' +
+            '<select class="fc" id="ss-date-sel" style="width:auto;height:30px"></select>' +
+            '<span id="ss-date-status" style="font-size:11px"></span>' +
+            '<button class="btn btn-sm" id="ss-recalc-btn" type="button" style="margin-left:auto">현재 기록으로 다시 채우기</button>' +
+            '<button class="btn btn-sm btn-primary" id="ss-save-btn" type="button">저장</button>' +
+          '</div>' +
+          '<div id="ss-form" style="margin-top:12px"></div>' +
+        '</div>' +
+        '<div class="card" style="max-width:980px;margin-top:10px">' +
+          '<div class="ct">유틸리티</div>' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">' +
+            '<button class="btn btn-sm" id="ss-rebuild-latest" type="button">이번 주 스냅샷 저장/갱신 (자동 계산값으로)</button>' +
+            '<button class="btn btn-sm" id="ss-reload" type="button">Firebase에서 다시 로드</button>' +
+          '</div>' +
+          '<div id="ss-util-log" style="font-size:11px;color:var(--text3);margin-top:8px"></div>' +
+        '</div>';
+      pageAdmin.appendChild(box);
+
+      // 핸들러
+      document.getElementById('ss-date-sel').onchange = function(){ renderSnapshotForm(); };
+      document.getElementById('ss-recalc-btn').onclick = function(){ renderSnapshotForm({reset:true}); };
+      document.getElementById('ss-save-btn').onclick = function(){ saveFromForm(); };
+      document.getElementById('ss-rebuild-latest').onclick = async function(){
+        var log = document.getElementById('ss-util-log');
+        log.textContent = '저장 중...';
+        try {
+          var saved = await window.WeeklySnapshots.rebuildAndSaveLatest();
+          log.textContent = '✓ 저장 완료: ' + saved.date;
+          populateDateOptions();
+          renderSnapshotForm();
+          try { if(typeof window.renderRegionCards === 'function') window.renderRegionCards(); } catch(e){}
+        } catch(e){
+          log.textContent = '✗ 실패: ' + (e.message || e);
+        }
+      };
+      document.getElementById('ss-reload').onclick = async function(){
+        LOAD_PROMISE = null;
+        var log = document.getElementById('ss-util-log');
+        log.textContent = '로드 중...';
+        try {
+          await loadAll();
+          log.textContent = '✓ ' + Object.keys(SNAPSHOTS).length + '개 스냅샷 로드';
+          populateDateOptions();
+          renderSnapshotForm();
+        } catch(e){
+          log.textContent = '✗ 실패: ' + (e.message || e);
+        }
+      };
+    }
+  }
+
+  function openSnapshotTab(btn){
+    // 다른 탭 숨기기
+    ['upload','target','roster','allowedusers','snapshot'].forEach(function(t){
+      var el = document.getElementById('adm-'+t);
+      if(el) el.style.display = 'none';
+    });
+    document.querySelectorAll('#page-admin .adm-tab').forEach(function(b){ b.classList.remove('on'); });
+    var box = document.getElementById('adm-snapshot');
+    if(box) box.style.display = '';
+    if(btn) btn.classList.add('on');
+    loadAll().then(function(){
+      populateDateOptions();
+      renderSnapshotForm();
+    });
+  }
+
+  function populateDateOptions(){
+    var sel = document.getElementById('ss-date-sel');
+    if(!sel) return;
+    var dates = allDates();
+    if(!dates.length){
+      sel.innerHTML = '<option value="">데이터 없음</option>';
+      return;
+    }
+    // 최신 → 과거 순
+    var sorted = dates.slice().reverse();
+    var prev = sel.value;
+    sel.innerHTML = sorted.map(function(d){
+      var has = !!SNAPSHOTS[d];
+      var manual = has && SNAPSHOTS[d].manual === true;
+      var tag = manual ? ' [수동]' : (has ? ' [자동]' : ' [없음]');
+      return '<option value="'+d+'">'+d+tag+'</option>';
+    }).join('');
+    if(prev && sorted.indexOf(prev) >= 0) sel.value = prev;
+  }
+
+  function getRegionsOrdered(){
+    return safe(function(){
+      if (typeof getRegions === 'function') return getRegions();
+      var set = {}; getAllMembers().forEach(function(m){ if(m && m.region) set[m.region] = 1; });
+      return Object.keys(set);
+    }, []);
+  }
+
+  function teamNumSafe(t){
+    return safe(function(){
+      if (typeof teamNum === 'function') return teamNum(t);
+      var m = String(t||'').match(/(\d+)/);
+      return m ? +m[1] : 999;
+    }, 999);
+  }
+
+  function renderSnapshotForm(opts){
+    opts = opts || {};
+    var sel = document.getElementById('ss-date-sel');
+    var form = document.getElementById('ss-form');
+    var status = document.getElementById('ss-date-status');
+    if(!sel || !form) return;
+    var date = sel.value;
+    if(!date){ form.innerHTML = '<div class="empty" style="padding:16px">날짜 없음</div>'; return; }
+
+    // 자동 계산 값 (그 시점의 RECORDS 기준)
+    var computed = buildSnapshot(date);
+    var stored   = SNAPSHOTS[date];
+
+    var src;
+    if(opts.reset){
+      src = computed;
+      if(status){ status.innerHTML = '<span class="ss-tag auto">현재 기록 기준 재계산</span>'; }
+    } else if(stored){
+      src = stored;
+      var tag = stored.manual ? 'manual' : 'auto';
+      var label = stored.manual ? '수동 저장됨' : '자동 저장됨';
+      if(status){
+        status.innerHTML = '<span class="ss-tag '+tag+'">'+label+'</span>' +
+          (stored.generatedAt ? '<span style="color:var(--text3);margin-left:6px">'+new Date(stored.generatedAt).toLocaleString()+'</span>' : '');
+      }
+    } else {
+      src = computed;
+      if(status){ status.innerHTML = '<span class="ss-tag none">저장된 스냅샷 없음 — 현재 기록 기준</span>'; }
+    }
+
+    if(!src){
+      form.innerHTML = '<div class="empty" style="padding:16px">해당 날짜에 기록이 없습니다.</div>';
+      return;
+    }
+
+    var regions = getRegionsOrdered().filter(function(r){ return src.regions[r] || (computed && computed.regions[r]); });
+    // 누락된 region 추가 (저장된 스냅샷에만 있는 지역)
+    Object.keys(src.regions||{}).forEach(function(r){ if(regions.indexOf(r)<0) regions.push(r); });
+
+    var html = '';
+    // ── 교회 전체 ──
+    html += '<div class="ss-row ss-head"><div>구분</div><div>출석</div><div>재적</div><div>QR</div><div>사유출석</div><div>사유결석</div></div>';
+    html += '<div class="ss-row ss-tot">' +
+      '<div class="ss-label">교회 전체</div>' +
+      inp('total','att', src.total && src.total.att) +
+      inp('total','tot', src.total && src.total.tot) +
+      inp('total','qr',  src.total && src.total.qr) +
+      inp('total','sa',  src.total && src.total.sa) +
+      inp('total','ab',  src.total && src.total.ab) +
+    '</div>';
+
+    regions.forEach(function(reg){
+      var r = src.regions[reg] || { att:0, tot:0, qr:0, sa:0, ab:0, types:{}, teams:{} };
+      var rOpenTypes  = (r.types  && Object.keys(r.types).length);
+      var rOpenTeams  = (r.teams  && Object.keys(r.teams).length);
+      html += '<div class="ss-row ss-reg">' +
+        '<div class="ss-label">'+esc(reg)+'</div>' +
+        inp('reg:'+reg,'att', r.att) +
+        inp('reg:'+reg,'tot', r.tot) +
+        inp('reg:'+reg,'qr',  r.qr) +
+        inp('reg:'+reg,'sa',  r.sa) +
+        inp('reg:'+reg,'ab',  r.ab) +
+      '</div>';
+
+      // 유형
+      if(rOpenTypes){
+        html += '<details style="margin-left:10px"><summary>유형별 (가족·가족외·일반)</summary>';
+        ['가족','가족외','일반'].forEach(function(t){
+          var ent = r.types && r.types[t];
+          if(!ent && !rOpenTypes) return;
+          ent = ent || {att:0,tot:0};
+          html += '<div class="ss-row ss-sub">' +
+            '<div class="ss-label ss-sub-label">└ '+t+'</div>' +
+            inp('type:'+reg+':'+t,'att', ent.att) +
+            inp('type:'+reg+':'+t,'tot', ent.tot) +
+            '<div class="ss-blank">-</div><div class="ss-blank">-</div><div class="ss-blank">-</div>' +
+          '</div>';
+        });
+        html += '</details>';
+      }
+
+      // 팀
+      if(rOpenTeams){
+        var teams = Object.keys(r.teams).sort(function(a,b){ return teamNumSafe(a) - teamNumSafe(b); });
+        html += '<details style="margin-left:10px"><summary>팀별</summary>';
+        teams.forEach(function(tm){
+          var ent = r.teams[tm] || {att:0,tot:0,qr:0,sa:0,ab:0};
+          html += '<div class="ss-row ss-sub">' +
+            '<div class="ss-label ss-sub-label">└ '+esc(tm)+'</div>' +
+            inp('team:'+reg+':'+tm,'att', ent.att) +
+            inp('team:'+reg+':'+tm,'tot', ent.tot) +
+            inp('team:'+reg+':'+tm,'qr',  ent.qr) +
+            inp('team:'+reg+':'+tm,'sa',  ent.sa) +
+            inp('team:'+reg+':'+tm,'ab',  ent.ab) +
+          '</div>';
+        });
+        html += '</details>';
+      }
+    });
+
+    form.innerHTML = html;
+
+    // 변경 감지(테두리 강조)
+    form.querySelectorAll('input.ss-in').forEach(function(el){
+      var initial = el.value;
+      el.dataset.initial = initial;
+      el.addEventListener('input', function(){
+        if(el.value !== el.dataset.initial) el.classList.add('ss-edited');
+        else el.classList.remove('ss-edited');
+      });
+    });
+  }
+
+  function inp(scope, field, val){
+    var v = (val==null) ? '' : Number(val);
+    if(!isFinite(v)) v = '';
+    return '<input class="ss-in" type="number" min="0" step="1" data-scope="'+esc(scope)+'" data-field="'+esc(field)+'" value="'+v+'">';
+  }
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  async function saveFromForm(){
+    var sel = document.getElementById('ss-date-sel');
+    if(!sel || !sel.value) return;
+    var date = sel.value;
+    var form = document.getElementById('ss-form');
+    if(!form) return;
+
+    // form 입력값을 snapshot 객체로 조립.
+    // 시작점은 저장된 스냅샷(있으면) 또는 자동 계산값.
+    var base = SNAPSHOTS[date] ? JSON.parse(JSON.stringify(SNAPSHOTS[date])) : buildSnapshot(date);
+    if(!base){
+      base = { date: date, total:{att:0,tot:0,qr:0,sa:0,ab:0}, regions:{} };
+    }
+
+    var inputs = form.querySelectorAll('input.ss-in');
+    inputs.forEach(function(el){
+      var scope = el.dataset.scope || '';
+      var field = el.dataset.field || '';
+      var v = el.value === '' ? 0 : Number(el.value);
+      if(!isFinite(v)) v = 0;
+      if(scope === 'total'){
+        if(!base.total) base.total = {att:0,tot:0,qr:0,sa:0,ab:0};
+        base.total[field] = v;
+      } else if(scope.indexOf('reg:') === 0){
+        var reg = scope.slice(4);
+        if(!base.regions[reg]) base.regions[reg] = { att:0, tot:0, qr:0, sa:0, ab:0, types:{}, teams:{} };
+        base.regions[reg][field] = v;
+      } else if(scope.indexOf('type:') === 0){
+        var parts = scope.slice(5).split(':');
+        var reg2 = parts[0], type2 = parts[1];
+        if(!base.regions[reg2]) base.regions[reg2] = { att:0, tot:0, qr:0, sa:0, ab:0, types:{}, teams:{} };
+        if(!base.regions[reg2].types) base.regions[reg2].types = {};
+        if(!base.regions[reg2].types[type2]) base.regions[reg2].types[type2] = { att:0, tot:0 };
+        base.regions[reg2].types[type2][field] = v;
+      } else if(scope.indexOf('team:') === 0){
+        var p2 = scope.slice(5).split(':');
+        var reg3 = p2[0], tm3 = p2.slice(1).join(':');
+        if(!base.regions[reg3]) base.regions[reg3] = { att:0, tot:0, qr:0, sa:0, ab:0, types:{}, teams:{} };
+        if(!base.regions[reg3].teams) base.regions[reg3].teams = {};
+        if(!base.regions[reg3].teams[tm3]) base.regions[reg3].teams[tm3] = { att:0, tot:0, qr:0, sa:0, ab:0 };
+        base.regions[reg3].teams[tm3][field] = v;
+      }
+    });
+
+    // 자동 att = qr + sa 보정 (사용자가 qr/sa만 바꾸고 att를 깜빡한 경우)
+    // — 강제하지 않음. att를 직접 입력했을 수도 있으니, 사용자가 명시한 값 유지.
+
+    base.manual = true;
+    base.generatedAt = Date.now();
+
+    var status = document.getElementById('ss-date-status');
+    if(status) status.innerHTML = '<span class="ss-tag manual">저장 중...</span>';
+
+    try {
+      await saveOne(date, base);
+      if(status) status.innerHTML = '<span class="ss-tag manual">수동 저장 완료</span> <span style="color:var(--text3);margin-left:6px">'+new Date().toLocaleString()+'</span>';
+      populateDateOptions();
+      try { if(typeof window.renderRegionCards === 'function') window.renderRegionCards(); } catch(e){}
+    } catch(e){
+      if(status) status.innerHTML = '<span class="ss-tag none">저장 실패: '+esc(e.message||String(e))+'</span>';
+    }
+  }
+
+  // 관리자 로그인/페이지 진입 시 탭 보장 — 폴링으로 admin-tabs 발견 시 부착
+  var _tabTries = 0;
+  var _tabIv = setInterval(function(){
+    try { ensureAdminTab(); } catch(e){}
+    if(++_tabTries > 600) clearInterval(_tabIv);
+  }, 250);
+
+  // 사용자 로그인 직후에도 보장
+  window.addEventListener('load', function(){
+    setTimeout(function(){ try { ensureAdminTab(); } catch(e){} }, 1500);
+    setTimeout(function(){ try { ensureAdminTab(); } catch(e){} }, 4000);
+  });
+
+  console.log('[weekly-snap] Loaded');
+})();
+</script>
+<!-- WEEKLY_SNAPSHOTS_END -->
+
+<!-- CACHE_FIRST_COVER_RELEASE_START -->
+<style id="cache-first-cover-css">
+/* release 후엔 cover 클래스가 다시 붙어도 시각적으로 노출되지 않게 한다 */
+body.cf-released #v97-loading-cover{display:none !important;}
+body.cf-released.llf-pin-loading #main,
+body.cf-released.v97-data-loading #main{visibility:visible !important;}
+body.cf-released.llf-pin-loading::before{content:none !important;background:none !important;}
+body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !important;}
+</style>
+<script id="cache-first-cover-release">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     캐시 우선 렌더링 v3 — Step 1 cache render 직후 cover 해제 + 재추가 차단.
+       방식:
+         a. window.hideLoading 후크 — minjiFastLoad Step 1 직후 호출됨
+         b. window.loadFromDB 가장 바깥 wrap — Step 1 Promise 해결 시
+         c. 폴링 fallback — appVisible + dataPopulated 감지
+         d. **document.body.classList.add 인터셉트** — release 후 cover
+            클래스(v97-data-loading / llf-pin-loading) 추가를 source 에서
+            차단. 어떤 코드 경로(v27 finishLoadingWhenReady, LLF showCover,
+            v97 showLoading 등)에서 호출되든 add 자체가 무시됨.
+         e. CSS cf-released — body 에 클래스가 붙어도 cover 가 시각적으로
+            보이지 않도록 belt-and-suspenders.
+       Step 2 (Firebase) 는 백그라운드, cover 와 무관하게 진행.
+     ════════════════════════════════════════════════════════════════ */
+  function hasLocalCache(){
+    try{
+      var m = localStorage.getItem('att_members_v1');
+      var r = localStorage.getItem('att_records_v1');
+      if(!m || !r) return false;
+      var mArr = JSON.parse(m), rArr = JSON.parse(r);
+      return Array.isArray(mArr) && mArr.length > 0
+          && Array.isArray(rArr) && rArr.length > 0;
+    }catch(e){ return false; }
+  }
+
+  /* ── Chart.js 안전 가드 (캐시 유무 무관) ─────────────────────────── */
+  (function installChartGuard(){
+    if(window.__cf_chartGuardInstalled) return;
+    var origMc = window.mc;
+    if(typeof origMc !== 'function'){
+      var tries = 0;
+      var iv = setInterval(function(){
+        if(typeof window.mc === 'function'){ clearInterval(iv); installChartGuard(); }
+        else if(++tries > 200) clearInterval(iv);
+      }, 50);
+      return;
+    }
+    window.__cf_chartGuardInstalled = true;
+    var pending = [];
+    window.mc = function(id, cfg){
+      if(typeof window.Chart === 'function'){
+        try{ return origMc.call(this, id, cfg); }catch(e){}
+        return;
+      }
+      pending.push([id, cfg]);
+    };
+    var iv2 = setInterval(function(){
+      if(typeof window.Chart === 'function'){
+        clearInterval(iv2);
+        if(!pending.length) return;
+        var q = pending; pending = [];
+        q.forEach(function(p){ try{ origMc.call(window, p[0], p[1]); }catch(e){} });
+      }
+    }, 50);
+  })();
+
+  if(!hasLocalCache()) return;
+  /* fast-path armed 플래그 — 실제 auth gate bypass / initApp 호출은
+     early-auth 의 onAuthStateChanged user 발화 후에만. 이 패치에서는
+     wrapper(hideLoading hook / loadFromDB 외측 / classList.add interceptor /
+     idempotent initApp wrap) 만 설치하고 release 트리거를 대기. */
+  window.__cf_armed = true;
+
+  /* initApp idempotent wrap: google-auth 가 auth resolve 후에 또 initApp 을
+     호출하므로, 두 번 실행되지 않도록 가드. LLF 의 re-wrap 도 막기 위해
+     __llfWrapped 플래그 박음. */
+  function wrapInitIdempotent(){
+    var orig = window.initApp;
+    if(typeof orig !== 'function') return false;
+    if(orig.__cf_initWrapped) return true;
+    var wrapped = function(){
+      if(window.__cf_initAppRan) return;
+      window.__cf_initAppRan = true;
+      try{ return orig.apply(this, arguments); }catch(e){ console.error('[cache-first] initApp error', e); }
+    };
+    wrapped.__cf_initWrapped = true;
+    wrapped.__llfWrapped = true;
+    window.initApp = wrapped;
+    return true;
+  }
+  if(!wrapInitIdempotent()){
+    var initTries = 0;
+    var initIv = setInterval(function(){
+      if(wrapInitIdempotent() || ++initTries > 200) clearInterval(initIv);
+    }, 30);
+  }
+
+  /* 모든 가시화는 early-auth 의 onAuthStateChanged user 콜백에서만:
+       - cached profile 매칭 → fastShowAppAndInit (showApp + initApp)
+       - 그 외 → google-auth 의 정상 flow (resolveUserAccess → showApp + initApp)
+     어느 경로든 minjiFastLoad 가 호출되고, Step 1 의 hideLoading() 가
+     아래 등록된 hook(즉, release 트리거)을 발화해서 cover 가 사라짐. */
+
+  /* ── 핵심 상태 ─────────────────────────────────────────────────── */
+  var released = false;
+
+  /* ── classList.add 인터셉트: release 후 cover 클래스 추가를 source 에서 차단
+     v27 의 showCover, LLF 의 showCover, v97 의 showLoading 등 모든 호출이
+     결국 document.body.classList.add(...) 로 귀결되므로 여기서 잡으면 재추가
+     일어나지 않는다. */
+  (function installAddInterceptor(){
+    try{
+      var bodyList = document.body.classList;
+      var proto = Object.getPrototypeOf(bodyList);
+      var origAdd = proto.add;
+      Object.defineProperty(bodyList, 'add', {
+        configurable: true,
+        writable: true,
+        value: function(){
+          if(!released){
+            return origAdd.apply(bodyList, arguments);
+          }
+          var pass = [];
+          for(var i=0; i<arguments.length; i++){
+            var c = arguments[i];
+            if(c !== 'v97-data-loading' && c !== 'llf-pin-loading') pass.push(c);
+          }
+          if(pass.length){
+            return origAdd.apply(bodyList, pass);
+          }
+        }
+      });
+    }catch(e){}
+  })();
+
+  function dropCovers(){
+    try{ document.body.classList.remove('llf-pin-loading'); }catch(e){}
+    try{ document.body.classList.remove('v97-data-loading'); }catch(e){}
+  }
+
+  function syncRender(){
+    try{
+      var ov = document.getElementById('page-overview');
+      if(ov && ov.classList.contains('active')){
+        if(typeof window.renderOverviewNow === 'function') window.renderOverviewNow();
+        else if(typeof window.renderOverview === 'function') window.renderOverview();
+      } else {
+        var active = document.querySelector('.page.active');
+        var pid = active ? (active.id||'').replace('page-','') : '';
+        if(pid && typeof window.renderPage === 'function') window.renderPage(pid);
+      }
+    }catch(e){}
+    try{ if(typeof window.renderOverviewExtra === 'function') window.renderOverviewExtra(); }catch(e){}
+  }
+
+  function release(){
+    if(released) return;
+    released = true;
+    /* 순서 중요: 1) cf-released 추가 (CSS 즉시 차폐) → 2) dropCovers 즉시 실행
+       → 3) syncRender 는 cover 가 사라진 뒤 다음 RAF 에 (renderOverview 가
+       9700건 record 처리로 100-500ms 걸리므로 cover hide 보다 뒤로 미룬다) */
+    try{ document.body.classList.add('cf-released'); }catch(e){}
+    dropCovers();
+    requestAnimationFrame(function(){
+      try{ syncRender(); }catch(e){}
+      dropCovers();
+    });
+  }
+
+  /* ── 1. window.hideLoading 후크 ───────────────────────────────── */
+  window.hideLoading = function(){ release(); };
+
+  /* ── 2. window.loadFromDB 가장 바깥 wrap ─────────────────────── */
+  (function hookLoadFromDB(){
+    function applyWrap(){
+      var orig = window.loadFromDB;
+      if(typeof orig !== 'function') return false;
+      if(orig.__cfWrapped) return true;
+      var wrapped = async function(){
+        var ret;
+        try{ ret = await orig.apply(this, arguments); }catch(e){ console.error('[cache-first] loadFromDB error', e); }
+        release();
+        return ret;
+      };
+      wrapped.__cfWrapped = true;
+      /* LLF re-wrap 차단용 flag */
+      wrapped.__llfWrapped = true;
+      window.loadFromDB = wrapped;
+      return true;
+    }
+    if(applyWrap()) return;
+    var tries = 0;
+    var iv = setInterval(function(){
+      if(window.loadFromDB && !window.loadFromDB.__cfWrapped){
+        applyWrap();
+      }
+      if(++tries > 400) clearInterval(iv);
+    }, 50);
+  })();
+
+  /* ── 3. 폴링 fallback ──────────────────────────────────────────── */
+  function dataPopulated(){
+    var rLen = 0, mLen = 0;
+    try{ if(Array.isArray(window.RECORDS)) rLen = Math.max(rLen, window.RECORDS.length); }catch(e){}
+    try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) rLen = Math.max(rLen, RECORDS.length); }catch(e){}
+    try{ if(Array.isArray(window.MEMBERS)) mLen = Math.max(mLen, window.MEMBERS.length); }catch(e){}
+    try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) mLen = Math.max(mLen, MEMBERS.length); }catch(e){}
+    return rLen > 0 && mLen > 0;
+  }
+  var pollT0 = performance.now();
+  function pollTick(){
+    if(released) return true;
+    if(dataPopulated()){ release(); return true; }
+    if(performance.now() - pollT0 > 15000){ release(); return true; }
+    return false;
+  }
+  if(!pollTick()){
+    var poll_iv = setInterval(function(){
+      if(pollTick()) clearInterval(poll_iv);
+    }, 100);
+  }
+})();
+</script>
+<!-- CACHE_FIRST_COVER_RELEASE_END -->
+
+<!-- TAB_SWITCH_PERF_START -->
+<script id="tab-switch-perf">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     탭 전환 속도 개선
+       1) 사이드바/페이지 active 클래스를 동기 즉시 변경 → 클릭 피드백 먼저
+       2) 무거운 렌더(renderOverview/renderHabit 등)는 RAF + setTimeout 0 으로
+          한 프레임 뒤에 실행 — "눌렸다"는 시각 반응이 먼저 보임
+       3) Chart.js 전역 default animation = false (mc() per-call 외 직접
+          new Chart() 경로도 즉시 그려짐)
+     ════════════════════════════════════════════════════════════════ */
+
+  /* ── Chart.js 전역 animation off + resizeDelay 줄임 ─────────────── */
+  (function disableChartAnim(){
+    function apply(){
+      if(typeof window.Chart !== 'function' || !Chart.defaults) return false;
+      try{
+        Chart.defaults.animation = false;
+        Chart.defaults.animations = {};
+        Chart.defaults.transitions = {};
+        Chart.defaults.responsiveAnimationDuration = 0;
+        if(Chart.defaults.plugins && Chart.defaults.plugins.tooltip){
+          Chart.defaults.plugins.tooltip.animation = false;
+        }
+        return true;
+      }catch(e){ return false; }
+    }
+    if(apply()) return;
+    var tries = 0;
+    var iv = setInterval(function(){
+      if(apply() || ++tries > 100) clearInterval(iv);
+    }, 100);
+  })();
+
+  /* ── nav() 래핑: 시각 변경 즉시 + 무거운 렌더 RAF defer ───────── */
+  function applyVisualImmediate(page, btn){
+    try{
+      var pages = document.querySelectorAll('.page');
+      for(var i=0;i<pages.length;i++) pages[i].classList.remove('active');
+      var target = document.getElementById('page-' + page);
+      if(target) target.classList.add('active');
+      var navs = document.querySelectorAll('.nav-item');
+      for(var j=0;j<navs.length;j++) navs[j].classList.remove('active');
+      if(btn && btn.classList) btn.classList.add('active');
+      if(window.innerWidth <= 768){
+        var sb = document.getElementById('sidebar');
+        var ov = document.getElementById('sidebar-overlay');
+        if(sb) sb.classList.remove('open');
+        if(ov) ov.classList.remove('open');
+      }
+    }catch(e){}
+  }
+
+  function wrapNav(){
+    var orig = window.nav;
+    if(typeof orig !== 'function') return false;
+    if(orig.__perfWrapped) return true;
+    var wrapped = function(page, btn){
+      /* 1) 시각 변경 즉시 — 클릭이 눌렸다는 피드백 */
+      applyVisualImmediate(page, btn);
+      /* 2) 무거운 렌더는 RAF + 0ms 로 한 프레임 뒤에 실행 — paint 가 먼저 */
+      requestAnimationFrame(function(){
+        setTimeout(function(){
+          try{
+            if(typeof window.renderPage === 'function'){
+              window.renderPage(page);
+            } else {
+              orig.call(this, page, btn);
+            }
+          }catch(e){ console.warn('[tab] render error', e); }
+        }, 0);
+      });
+    };
+    wrapped.__perfWrapped = true;
+    wrapped.__v86_fast = true; /* v86 의 재래핑 방지 */
+    window.nav = wrapped;
+    return true;
+  }
+
+  if(!wrapNav()){
+    var navTries = 0;
+    var navIv = setInterval(function(){
+      if(wrapNav() || ++navTries > 200) clearInterval(navIv);
+    }, 50);
+  }
+})();
+</script>
+<!-- TAB_SWITCH_PERF_END -->
+
+<!-- TARGET_INSPECTION_START -->
+<script id="target-inspection">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     타겟 관리 점검 — 보고 주제 > 타겟 현황 탭 상단에 카드 3개 추가
+       1) 회복된 타겟 (월 출결 미완성이면 "판정 대기")
+       2) 타겟 미선정 (습관성 결석자 있지만 타겟 0인 팀-구역)
+       3) 이행여부 미기입 (1~5주차 이행여부 전부 빈 타겟이 있는 팀-구역)
+     데이터는 모두 메모리(window.RECORDS, MEMBERS, targets, plans)에서만 계산.
+     ════════════════════════════════════════════════════════════════ */
+
+  function $(id){ return document.getElementById(id); }
+  function esc(s){
+    return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function records(){ return Array.isArray(window.RECORDS) ? window.RECORDS : []; }
+  function membersAll(){ return Array.isArray(window.MEMBERS) ? window.MEMBERS : []; }
+  function targetsMap(){ try{ return typeof getTargets==='function' ? getTargets() : {}; }catch(e){ return {}; } }
+  function plansMap(){ try{ return typeof getPlans==='function' ? getPlans() : {}; }catch(e){ return {}; } }
+
+  function normalizeTZ(m){
+    var raw = (m.team||'') + '-' + (m.zone||'');
+    try{
+      return (typeof normalizeTeamZone==='function') ? normalizeTeamZone(raw) : String(raw).trim();
+    }catch(e){ return String(raw).trim(); }
+  }
+  function teamOf(tz){
+    /* "N팀-M구역" 또는 "N-M" → "N팀" */
+    var m = String(tz||'').match(/^(\d+)/);
+    return m ? (m[1]+'팀') : String(tz||'').split('-')[0];
+  }
+
+  /* ── 핵심 헬퍼: 그 달의 모든 (오늘까지 지난) 일요일에 출결 기록이 있으면
+       complete=true. lastEnteredWeek 는 해당 월 records 중 max wk. ── */
+  function isMonthAttendanceComplete(year, month){
+    var sundays = [];
+    var d = new Date(year, month-1, 1);
+    while(d.getMonth() === month-1){
+      if(d.getDay() === 0){
+        var iso = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+        sundays.push(iso);
+      }
+      d.setDate(d.getDate()+1);
+    }
+    var today = new Date();
+    var todayStr = today.getFullYear()+'-'+String(today.getMonth()+1).padStart(2,'0')+'-'+String(today.getDate()).padStart(2,'0');
+    var moStr = year+'-'+String(month).padStart(2,'0');
+    var moRecs = records().filter(function(r){ return (r.date||'').slice(0,7) === moStr; });
+    var recDates = {};
+    moRecs.forEach(function(r){ recDates[(r.date||'').slice(0,10)] = 1; });
+    var maxWk = 0;
+    moRecs.forEach(function(r){ var w = Number(r.wk)||0; if(w > maxWk) maxWk = w; });
+
+    var pastSundays = sundays.filter(function(s){ return s <= todayStr; });
+    if(!pastSundays.length){
+      return { complete:false, lastEnteredWeek:maxWk, sundays:sundays, reason:'no-past-sundays' };
+    }
+    for(var i=0; i<pastSundays.length; i++){
+      if(!recDates[pastSundays[i]]){
+        return { complete:false, lastEnteredWeek:maxWk, sundays:sundays, missingSunday:pastSundays[i] };
+      }
+    }
+    return { complete:true, lastEnteredWeek:maxWk, sundays:sundays };
+  }
+  window.isMonthAttendanceComplete = isMonthAttendanceComplete;
+
+  function rawDetail(r){
+    var st = String((r&&r.st)||'').trim();
+    var rsn = String((r&&r.rsn)||'').trim();
+    if(st==='QR인증') return 'QR인증';
+    if(st==='사유출석'){ var rv = rsn || '인증안함'; return (!rv || rv==='미입력') ? '인증안함' : rv; }
+    if(st==='사유결석') return '사유결석';
+    if(st==='결석' || st==='미출석') return '결석';
+    return st || rsn;
+  }
+  var ATTEND_OK = {'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1};
+
+  /* 선택월의 모든 주일에 QR인증·인증안함·인증오류·대체예배 중 하나에 해당하면 true.
+     사유결석/결석 한 주라도 있으면 false. */
+  function isMemberRecovered(memberId, monthStr){
+    var monthRecs = records().filter(function(r){
+      return r.id === memberId && (r.date||'').slice(0,7) === monthStr;
+    });
+    if(!monthRecs.length) return false;
+    for(var i=0; i<monthRecs.length; i++){
+      var d = rawDetail(monthRecs[i]);
+      if(!ATTEND_OK[d]) return false;
+    }
+    return true;
+  }
+  window.isMemberRecovered = isMemberRecovered;
+
+  /* 1~5주차 plan.done 이 전부 비어있으면 true */
+  function hasMissingExecution(memberId, plans){
+    var p = plans[memberId];
+    if(!p) return true;
+    for(var w=1; w<=5; w++){
+      var wk = p['w'+w];
+      if(wk && String(wk.done||'').trim()) return false;
+    }
+    return true;
+  }
+
+  /* 습관성 결석자 후보 — 기존 isHabitCandidate 와 같은 기준 */
+  function isHabitCandidate(m, streakOf){
+    var t = String(m.type||'').trim();
+    var sk = streakOf[m.id] || 0;
+    return (t==='가족' || t==='가족외') ? sk >= 7 : sk >= 3;
+  }
+
+  /* 메모이즈: 한 번의 renderInspection 호출 안에서 latestStreak 인덱스 빌드 */
+  function buildStreakIndex(){
+    var idx = {};
+    var recs = records();
+    /* 가장 최근 record (id, date) 만 보존 */
+    var lastByDate = {};
+    for(var i=0; i<recs.length; i++){
+      var r = recs[i];
+      if(!r || !r.id) continue;
+      var prev = lastByDate[r.id];
+      if(!prev || (r.date||'') > (prev.date||'')){
+        lastByDate[r.id] = r;
+      }
+    }
+    Object.keys(lastByDate).forEach(function(id){
+      var r = lastByDate[id];
+      /* latestStreak 로직: 마지막 record 가 사유결석/결석이면 streak 사용, 출석이면 0 */
+      var sk = Number(r.streak)||0;
+      var st = String(r.st||'').trim();
+      idx[id] = (st === '사유결석' || st === '결석' || st === '미출석') ? sk : 0;
+    });
+    return idx;
+  }
+
+  function renderInspection(){
+    var hsCard = $('rt-habitStatus');
+    if(!hsCard) return;
+    var moSel = $('hs-month');
+    var regSel = $('hs-reg');
+    var zoneSel = $('hs-zone');
+    var mo = (moSel && moSel.value) || '';
+    if(!mo) return; /* renderHabitTargetStatus 가 아직 setup 안 됐을 때 */
+
+    /* 컨테이너 (없으면 생성, hs-total-card 앞에 삽입) */
+    var sec = $('ti-section');
+    if(!sec){
+      var inner = hsCard.querySelector('.card');
+      if(!inner) return;
+      sec = document.createElement('div');
+      sec.id = 'ti-section';
+      sec.style.margin = '6px 0 14px';
+      sec.innerHTML =
+        '<div class="ct-sm" style="margin:14px 0 8px">타겟 관리 점검 '+
+          '<span style="font-size:11px;font-weight:400;color:var(--text3)">선택 월·지역·팀-구역 기준 · 카드 클릭 → 명단 펼침</span>'+
+        '</div>'+
+        '<div class="mg" style="grid-template-columns:repeat(3,1fr);margin-bottom:6px">'+
+          '<div id="ti-card-recover" class="mc" style="cursor:pointer;border-left:3px solid var(--green,#2d8b3d)"></div>'+
+          '<div id="ti-card-missing" class="mc" style="cursor:pointer;border-left:3px solid var(--red,#c33)"></div>'+
+          '<div id="ti-card-blank"   class="mc" style="cursor:pointer;border-left:3px solid var(--red,#c33)"></div>'+
+        '</div>'+
+        '<div id="ti-panel-recover" style="display:none;background:var(--surface,#fafaf7);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:10px 12px;margin-bottom:8px"></div>'+
+        '<div id="ti-panel-missing" style="display:none;background:var(--surface,#fafaf7);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:10px 12px;margin-bottom:8px"></div>'+
+        '<div id="ti-panel-blank"   style="display:none;background:var(--surface,#fafaf7);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:10px 12px;margin-bottom:8px"></div>';
+      var totalCard = $('hs-total-card');
+      if(totalCard) totalCard.parentNode.insertBefore(sec, totalCard);
+      else inner.appendChild(sec);
+    }
+
+    var regFilter = (regSel && regSel.value) || '';
+    var zoneFilter = (zoneSel && zoneSel.value) || '';
+    var year = parseInt(mo.slice(0,4),10), month = parseInt(mo.slice(5,7),10);
+
+    /* 권한 + 필터 */
+    var scoped = (typeof getFilteredMembers==='function') ? getFilteredMembers() : membersAll();
+    if(regFilter) scoped = scoped.filter(function(m){ return m.region === regFilter; });
+    if(zoneFilter) scoped = scoped.filter(function(m){ return normalizeTZ(m) === zoneFilter; });
+
+    var tgt = targetsMap();
+    var plans = plansMap();
+    var targetMembers = scoped.filter(function(m){ return !!tgt[m.id+'_habit']; });
+
+    /* ── 패널 기본 hide (사용자 클릭 전엔 어떤 패널도 보이지 않게) ──
+       매 render 마다 reset → 필터 변경 시에도 이전에 펼쳐둔 panel 닫힘.
+       카드 클릭으로 다시 toggle. */
+    var _p1 = $('ti-panel-recover'); if(_p1) _p1.style.display = 'none';
+    var _p2 = $('ti-panel-missing'); if(_p2) _p2.style.display = 'none';
+    var _p3 = $('ti-panel-blank');   if(_p3) _p3.style.display = 'none';
+
+    /* ── 카드 1: 회복된 타겟 ── */
+    var monthCheck = isMonthAttendanceComplete(year, month);
+    var card1 = $('ti-card-recover');
+    var panel1 = $('ti-panel-recover');
+    var recoveredList = [];
+    if(monthCheck.complete){
+      targetMembers.forEach(function(m){
+        if(isMemberRecovered(m.id, mo)) recoveredList.push(m);
+      });
+      card1.innerHTML =
+        '<div class="lbl">회복된 타겟 <span style="font-size:10px;color:var(--blue);font-weight:500;margin-left:4px">클릭 → 명단</span></div>'+
+        '<div class="val" style="color:var(--green,#2d8b3d)">'+recoveredList.length+'<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div>'+
+        '<div class="sub">'+month+'월 모든 주일 출석 (사유결석·결석 0)</div>';
+    } else {
+      card1.innerHTML =
+        '<div class="lbl">회복된 타겟</div>'+
+        '<div class="val" style="color:var(--text3);font-size:15px">판정 대기</div>'+
+        '<div class="sub">'+(monthCheck.lastEnteredWeek||0)+'주차까지 입력</div>';
+    }
+    var panel1HTML = '';
+    if(!monthCheck.complete){
+      panel1HTML = '<div class="empty" style="padding:14px">월 출결이 아직 완성되지 않아 회복 판정을 보류합니다 ('+(monthCheck.lastEnteredWeek||0)+'주차까지 입력됨).</div>';
+    } else if(!recoveredList.length){
+      panel1HTML = '<div class="empty" style="padding:14px">선택 조건에서 회복된 타겟이 없습니다.</div>';
+    } else {
+      recoveredList.sort(function(a,b){
+        return (a.region||'').localeCompare(b.region||'','ko')
+          || normalizeTZ(a).localeCompare(normalizeTZ(b),'ko')
+          || (a.name||'').localeCompare(b.name||'','ko');
+      });
+      panel1HTML = '<div style="font-size:12px;color:var(--text3);margin-bottom:8px">총 '+recoveredList.length+'명</div>'+
+        '<div class="tw"><table>'+
+        '<thead><tr><th>이름</th><th>지역</th><th>팀-구역</th><th>회복 근거</th></tr></thead>'+
+        '<tbody>'+
+        recoveredList.map(function(m){
+          return '<tr><td style="font-weight:700">'+esc(m.name||'')+'</td>'+
+            '<td>'+esc(m.region||'')+'</td>'+
+            '<td>'+esc(normalizeTZ(m))+'</td>'+
+            '<td>'+month+'월 '+monthCheck.lastEnteredWeek+'주 전부 출석</td></tr>';
+        }).join('')+
+        '</tbody></table></div>';
+    }
+    panel1.innerHTML = panel1HTML;
+    card1.onclick = function(){ panel1.style.display = (panel1.style.display==='none' ? '' : 'none'); };
+
+    /* ── 카드 2: 타겟 미선정 ── */
+    var streakIdx = buildStreakIndex();
+    var habitByTZ = {}, targetByTZ = {};
+    scoped.forEach(function(m){
+      var tz = normalizeTZ(m);
+      if(!tz) return;
+      if(isHabitCandidate(m, streakIdx)){
+        (habitByTZ[tz] = habitByTZ[tz] || []).push(m);
+      }
+      if(tgt[m.id+'_habit']){
+        (targetByTZ[tz] = targetByTZ[tz] || []).push(m);
+      }
+    });
+    var missingTZs = [];
+    Object.keys(habitByTZ).forEach(function(tz){
+      if(habitByTZ[tz].length >= 1 && (!targetByTZ[tz] || targetByTZ[tz].length === 0)){
+        missingTZs.push(tz);
+      }
+    });
+    missingTZs.sort(function(a,b){
+      var pa=a.split('-'), pb=b.split('-');
+      var ta=parseInt(pa[0],10), tb=parseInt(pb[0],10);
+      if(!isNaN(ta) && !isNaN(tb) && ta!==tb) return ta-tb;
+      return a.localeCompare(b,'ko');
+    });
+    var card2 = $('ti-card-missing');
+    var panel2 = $('ti-panel-missing');
+    card2.innerHTML =
+      '<div class="lbl">타겟 미선정 <span style="font-size:10px;color:var(--blue);font-weight:500;margin-left:4px">클릭 → 팀-구역</span></div>'+
+      '<div class="val" style="color:var(--red,#c33)">'+missingTZs.length+'<span style="font-size:13px;font-weight:400;color:var(--text3)">개</span></div>'+
+      '<div class="sub">습관성 결석자 ≥1 인데 타겟 0인 팀-구역</div>';
+    if(!missingTZs.length){
+      panel2.innerHTML = '<div class="empty" style="padding:14px">모든 팀-구역에서 타겟이 1명 이상 선정되어 있습니다.</div>';
+    } else {
+      panel2.innerHTML =
+        '<div style="font-size:12px;color:var(--text3);margin-bottom:8px">총 '+missingTZs.length+'개 팀-구역 — 행 클릭 → 습관성 결석자 명단</div>'+
+        missingTZs.map(function(tz, idx){
+          var hList = habitByTZ[tz] || [];
+          var listId = 'ti-mtz-list-' + idx;
+          return '<div style="border-bottom:1px solid var(--border,#e5e3dc);padding:6px 4px">'+
+            '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" '+
+              'data-ti-toggle="'+listId+'">'+
+              '<span style="font-weight:600">'+esc(tz)+'</span>'+
+              '<span style="color:var(--red,#c33);font-size:11.5px">습관성 결석자 '+hList.length+'명</span>'+
+            '</div>'+
+            '<div id="'+listId+'" style="display:none;margin-top:6px;padding-left:8px;font-size:12px;color:var(--text2)">'+
+              hList.map(function(m){
+                return esc(m.name||'')+' <span style="color:var(--text3);font-size:11px">('+esc(m.region||'')+')</span>';
+              }).join(' · ')+
+            '</div>'+
+          '</div>';
+        }).join('');
+      /* delegated click: toggle nested list */
+      panel2.onclick = function(ev){
+        var el = ev.target.closest && ev.target.closest('[data-ti-toggle]');
+        if(!el) return;
+        var listId = el.getAttribute('data-ti-toggle');
+        var n = document.getElementById(listId);
+        if(n) n.style.display = (n.style.display==='none' ? '' : 'none');
+      };
+    }
+    card2.onclick = function(){ panel2.style.display = (panel2.style.display==='none' ? '' : 'none'); };
+
+    /* ── 카드 3: 이행여부 미기입 ── */
+    var blankByTZ = {};
+    targetMembers.forEach(function(m){
+      if(hasMissingExecution(m.id, plans)){
+        var tz = normalizeTZ(m) || '(미지정)';
+        (blankByTZ[tz] = blankByTZ[tz] || []).push(m);
+      }
+    });
+    var blankTZs = Object.keys(blankByTZ).sort(function(a,b){
+      var pa=a.split('-'), pb=b.split('-');
+      var ta=parseInt(pa[0],10), tb=parseInt(pb[0],10);
+      if(!isNaN(ta) && !isNaN(tb) && ta!==tb) return ta-tb;
+      return a.localeCompare(b,'ko');
+    });
+    var distinctTeams = {};
+    blankTZs.forEach(function(tz){ distinctTeams[teamOf(tz)] = 1; });
+    var teamCount = Object.keys(distinctTeams).length;
+    var card3 = $('ti-card-blank');
+    var panel3 = $('ti-panel-blank');
+    card3.innerHTML =
+      '<div class="lbl">이행여부 미기입 <span style="font-size:10px;color:var(--blue);font-weight:500;margin-left:4px">클릭 → 명단</span></div>'+
+      '<div class="val" style="color:var(--red,#c33)">'+teamCount+'<span style="font-size:13px;font-weight:400;color:var(--text3)">팀</span></div>'+
+      '<div class="sub">1~5주차 이행여부 전부 미기입 타겟 있는 팀</div>';
+    if(!blankTZs.length){
+      panel3.innerHTML = '<div class="empty" style="padding:14px">모든 타겟의 이행여부가 1주차 이상 기입되어 있습니다.</div>';
+    } else {
+      /* 팀별로 묶기 */
+      var grouped = {};
+      blankTZs.forEach(function(tz){
+        var t = teamOf(tz);
+        (grouped[t] = grouped[t] || []).push(tz);
+      });
+      var teamKeys = Object.keys(grouped).sort(function(a,b){
+        var ta=parseInt(a,10), tb=parseInt(b,10);
+        if(!isNaN(ta) && !isNaN(tb) && ta!==tb) return ta-tb;
+        return a.localeCompare(b,'ko');
+      });
+      panel3.innerHTML =
+        '<div style="font-size:12px;color:var(--text3);margin-bottom:8px">총 '+teamCount+'팀 / '+blankTZs.length+'개 팀-구역</div>'+
+        teamKeys.map(function(t){
+          var tzList = grouped[t];
+          return '<div style="margin-bottom:10px">'+
+            '<div style="font-weight:700;font-size:13px;color:var(--text);margin-bottom:4px">'+esc(t)+'</div>'+
+            tzList.map(function(tz){
+              var list = blankByTZ[tz];
+              return '<div style="border-bottom:1px solid var(--border,#e5e3dc);padding:4px 0 4px 12px">'+
+                '<div style="font-size:12px;color:var(--text2);margin-bottom:2px">'+esc(tz)+' <span style="color:var(--text3);font-size:11px">('+list.length+'명)</span></div>'+
+                '<div style="font-size:12px;color:var(--text2);padding-left:8px">'+
+                  list.map(function(m){
+                    return esc(m.name||'')+' <span style="color:var(--text3);font-size:11px">('+esc(m.region||'')+')</span>';
+                  }).join(' · ')+
+                '</div>'+
+              '</div>';
+            }).join('')+
+          '</div>';
+        }).join('');
+    }
+    card3.onclick = function(){ panel3.style.display = (panel3.style.display==='none' ? '' : 'none'); };
+  }
+
+  /* 로컬 MEMBERS/RECORDS 가 비어있고 window 에 데이터가 있으면 sync.
+     getFilteredMembers() 가 lexical `MEMBERS` (let, line ~1683) 를 사용하기에
+     이게 비어있으면 hs-reg / hs-zone dropdown 이 빈 채로 남는 버그가 생김. */
+  function syncLocalArraysFromWindow(){
+    try{
+      var localM = (typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) ? MEMBERS.length : 0;
+      var winM   = Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0;
+      if(localM < winM){
+        MEMBERS.length = 0;
+        for(var i=0; i<window.MEMBERS.length; i++) MEMBERS.push(window.MEMBERS[i]);
+      }
+    }catch(e){ console.warn('[target-inspection] MEMBERS sync error', e); }
+    try{
+      var localR = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS.length : 0;
+      var winR   = Array.isArray(window.RECORDS) ? window.RECORDS.length : 0;
+      if(localR < winR){
+        RECORDS.length = 0;
+        for(var j=0; j<window.RECORDS.length; j++) RECORDS.push(window.RECORDS[j]);
+      }
+    }catch(e){ console.warn('[target-inspection] RECORDS sync error', e); }
+  }
+
+  /* 빈 dataset.loaded 캐시 무효화 — 첫 호출이 MEMBERS 비어있을 때 빈 list 로
+     populate 후 dataset.loaded='' 로 캐싱되면 후속 호출에서도 비교가 ''!=='실제값'
+     로 정상이긴 한데, 안전망으로 빈 캐시를 미리 제거. */
+  function clearEmptyDatasetCaches(){
+    try{
+      var rs = document.getElementById('hs-reg');
+      if(rs && (rs.dataset.loaded === '' || (rs.dataset.loaded != null && !rs.dataset.loaded.length))){
+        delete rs.dataset.loaded;
+      }
+      var zs = document.getElementById('hs-zone');
+      if(zs && zs.dataset.loaded != null){
+        /* zoneSig 형식: "<regFilter>||<zone1|zone2|...>" — 뒷부분이 비어있으면 무효화 */
+        var parts = String(zs.dataset.loaded).split('||');
+        if(!parts[1] || !parts[1].length) delete zs.dataset.loaded;
+      }
+      var ms = document.getElementById('hs-month');
+      /* month dropdown 은 RECORDS 기반. RECORDS 가 있으면 dataset.loaded 비교가 자동 처리 */
+    }catch(e){}
+  }
+
+  /* renderHabitTargetStatus 호출 시점에 같이 실행되도록 wrap */
+  function wrapStatus(){
+    var orig = window.renderHabitTargetStatus;
+    if(typeof orig !== 'function') return false;
+    if(orig.__inspectionWrapped) return true;
+    var wrapped = function(){
+      /* 1. 데이터 sync — 로컬 MEMBERS/RECORDS 가 window 보다 작으면 채워줌 */
+      syncLocalArraysFromWindow();
+      /* 2. 빈 캐시 무효화 — populate 가 실제 옵션을 만들도록 */
+      clearEmptyDatasetCaches();
+      /* 3. 원본 renderHabitTargetStatus — month/reg/zone select populate + 5개 섹션 렌더 */
+      var ret = orig.apply(this, arguments);
+      /* 4. 타겟 관리 점검 카드 3개 렌더 (패널은 기본 hide) */
+      try{ renderInspection(); }
+      catch(e){ console.error('[target-inspection] render error', e); }
+      return ret;
+    };
+    wrapped.__inspectionWrapped = true;
+    window.renderHabitTargetStatus = wrapped;
+    return true;
+  }
+  if(!wrapStatus()){
+    var tries=0;
+    var iv=setInterval(function(){
+      if(wrapStatus() || ++tries > 200) clearInterval(iv);
+    }, 50);
+  }
+
+  /* 같은 sync 로직을 다른 렌더 함수에도 — 습관성 결석자 탭 dropdown 비어있음
+     문제 동시 해결. populateSelects 가 habit-reg 채우지만 호출 시점에 MEMBERS
+     비어있으면 빈 채로 남음. renderHabit 직전에 sync 보장. */
+  function wrapHabit(){
+    var orig = window.renderHabit;
+    if(typeof orig !== 'function') return false;
+    if(orig.__memSyncWrapped) return true;
+    var wrapped = function(){
+      syncLocalArraysFromWindow();
+      try{
+        if(typeof populateSelects === 'function'){
+          /* habit-reg 가 옵션 1개("전체 지역")밖에 없으면 강제 재populate */
+          var hr = document.getElementById('habit-reg');
+          if(hr && hr.options.length <= 1) populateSelects();
+        }
+      }catch(e){}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__memSyncWrapped = true;
+    window.renderHabit = wrapped;
+    return true;
+  }
+  if(!wrapHabit()){
+    var ht=0; var hIv=setInterval(function(){
+      if(wrapHabit() || ++ht > 200) clearInterval(hIv);
+    }, 50);
+  }
+
+  window.renderTargetInspection = renderInspection;
+})();
+</script>
+<!-- TARGET_INSPECTION_END -->
+
+<!-- STAGE2_HABITUAL_PLAN_START -->
+<script id="stage2-habitual-plan">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Stage 2 — 습관성 결석자 잠정/확정 + 다음 달 계획 시스템
+       데이터 구조 (localStorage 'att_habitual_plans_v1'):
+         { "YYYY-MM": {
+             status: 'provisional'|'confirmed',
+             baseMonth: "YYYY-MM",
+             baseDataAsOf: ISO date,
+             confirmedAt: null | ISO date,
+             goals: { "<id>": { monthlyGoal, weeklyPlan:[w1..w5] } },
+             archivedGoals: { "<id>": {...} }
+           }
+         }
+       핵심:
+         - 명단[N월] = (N-1)월 출결 기준 (전월 출결로 결정)
+         - 습관성 결석자 = baseMonth 모든 주일이 '순수결석'
+         - 잠정/확정은 isMonthAttendanceComplete(baseMonth) 로 자동 전환
+         - 확정 시 스냅샷 vs 재계산 diff → 유지/신규/제외 분류, 제외는 archive
+     ════════════════════════════════════════════════════════════════ */
+
+  var STORAGE_KEY = 'att_habitual_plans_v1';
+
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function records(){ return Array.isArray(window.RECORDS) ? window.RECORDS : []; }
+  function membersAll(){ return Array.isArray(window.MEMBERS) ? window.MEMBERS : []; }
+  function nowIso(){ return new Date().toISOString(); }
+
+  function prevMonth(mo){
+    var y = +mo.slice(0,4), m = +mo.slice(5,7) - 1;
+    if(m < 1){ y--; m = 12; }
+    return y + '-' + String(m).padStart(2,'0');
+  }
+  function nextMonth(mo){
+    var y = +mo.slice(0,4), m = +mo.slice(5,7) + 1;
+    if(m > 12){ y++; m = 1; }
+    return y + '-' + String(m).padStart(2,'0');
+  }
+
+  /* ── Data Layer ─────────────────────────────────────────────────── */
+  function getAllPlans(){
+    try{ var raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : {}; }
+    catch(e){ return {}; }
+  }
+  function saveAllPlans(obj){
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(obj||{})); return true; }
+    catch(e){ console.warn('[stage2] save failed', e); return false; }
+  }
+  /* plan 로드 시 자동 마이그레이션:
+       - snapshotMembers/snapshotAt: 없으면 goals 키로 채움 (단월 plan 호환)
+       - cycleId/cycleStart/cycleEnd: 없으면 cycleId=key, cycleEnd=nextMonth(cycleStart)
+       - addedMembers: 없으면 빈 배열
+       - 각 goals[id].weeklyPlan: 5 → 8주로 확장 (기존 입력 보존, 뒤에 빈 주 추가)
+     마이그레이션은 비파괴적 — 사용자가 입력한 데이터 절대 손실 없음. */
+  function getPlan(cycleId){
+    var all = getAllPlans();
+    var plan = all[cycleId];
+    if(!plan) return null;
+    var migrated = false;
+    if(!plan.cycleId){ plan.cycleId = cycleId; migrated = true; }
+    if(!plan.cycleStart){ plan.cycleStart = cycleId; migrated = true; }
+    if(!plan.cycleEnd){ plan.cycleEnd = nextMonth(plan.cycleStart); migrated = true; }
+    if(!Array.isArray(plan.snapshotMembers)){
+      plan.snapshotMembers = Object.keys(plan.goals || {});
+      migrated = true;
+    }
+    if(!plan.snapshotAt){
+      plan.snapshotAt = plan.baseDataAsOf || nowIso();
+      migrated = true;
+    }
+    if(!Array.isArray(plan.addedMembers)){
+      plan.addedMembers = [];
+      migrated = true;
+    }
+    /* weeklyPlan: 5주 → 8주 확장 (기존 5주 입력 보존) */
+    if(plan.goals){
+      Object.keys(plan.goals).forEach(function(id){
+        var g = plan.goals[id];
+        if(!g) return;
+        if(!Array.isArray(g.weeklyPlan)) g.weeklyPlan = [];
+        while(g.weeklyPlan.length < 8){
+          g.weeklyPlan.push(emptyWeek());
+          migrated = true;
+        }
+      });
+    }
+    if(migrated){
+      all[cycleId] = plan;
+      saveAllPlans(all);
+    }
+    return plan;
+  }
+  function setPlan(cycleId, plan){
+    var all = getAllPlans();
+    all[cycleId] = plan;
+    return saveAllPlans(all);
+  }
+
+  /* 선택된 월 (habit-month) 이 어느 cycle 에 포함되는지 찾기.
+     cycleStart === mo 또는 cycleEnd === mo 둘 다 매칭. */
+  function getCycleForMonth(mo){
+    var all = getAllPlans();
+    var keys = Object.keys(all);
+    for(var i=0; i<keys.length; i++){
+      var p = getPlan(keys[i]); /* 마이그레이션 트리거 */
+      if(p && (p.cycleStart === mo || p.cycleEnd === mo)) return p;
+    }
+    return null;
+  }
+  function emptyWeek(){ return { plan:'', doneDate:'', done:'', missReason:'' }; }
+  function emptyGoal(){
+    /* 두 달 사이클 = 8주 weeklyPlan (cycleStart 4주 + cycleEnd 4주) */
+    return { monthlyGoal:'', weeklyPlan:[
+      emptyWeek(), emptyWeek(), emptyWeek(), emptyWeek(),
+      emptyWeek(), emptyWeek(), emptyWeek(), emptyWeek()
+    ]};
+  }
+
+  /* ── 순수결석 판정 ──────────────────────────────────────────────── */
+  function rawDetail(r){
+    var st = String((r&&r.st)||'').trim();
+    var rsn = String((r&&r.rsn)||'').trim();
+    if(st==='QR인증') return 'QR인증';
+    if(st==='사유출석'){ var rv = rsn || '인증안함'; return (!rv || rv==='미입력') ? '인증안함' : rv; }
+    if(st==='사유결석') return '사유결석';
+    if(st==='결석' || st==='미출석') return '결석';
+    return st || rsn;
+  }
+  /* attend = QR인증/인증안함/인증오류/대체예배. 사유결석 도 포함되면 안 됨.
+     순수결석 = 출석계열도 사유결석도 아닌 모든 것 (기록 없음, 결석/미출석 등). */
+  var ATTEND_OR_EXCUSED = {'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1,'사유결석':1};
+
+  /* baseMonth 의 모든 일요일 (records 에 등장한 날짜만) */
+  function sundaysOf(baseMo){
+    var dates = {};
+    records().forEach(function(r){
+      if((r.date||'').slice(0,7) === baseMo) dates[r.date.slice(0,10)] = 1;
+    });
+    return Object.keys(dates).sort();
+  }
+
+  /* baseMonth 기준 습관성 결석자 ID 목록 */
+  function computeHabitualList(baseMo){
+    var sundays = sundaysOf(baseMo);
+    if(!sundays.length) return [];
+    var recsByMember = {};
+    records().forEach(function(r){
+      if((r.date||'').slice(0,7) !== baseMo) return;
+      if(!r.id) return;
+      (recsByMember[r.id] = recsByMember[r.id] || {})[r.date.slice(0,10)] = r;
+    });
+    var members = membersAll();
+    var result = [];
+    members.forEach(function(m){
+      var mid = m.id;
+      var recs = recsByMember[mid] || {};
+      var allPureAbsent = sundays.every(function(d){
+        var r = recs[d];
+        if(!r) return true; /* 기록 없음 = 순수결석 */
+        var detail = rawDetail(r);
+        return !ATTEND_OR_EXCUSED[detail]; /* 출석계열·사유결석 이 아니면 순수결석 */
+      });
+      if(allPureAbsent) result.push(mid);
+    });
+    return result;
+  }
+
+  /* ── 잠정/확정 자동 전환 ────────────────────────────────────────── */
+  function attendanceComplete(baseMo){
+    var year = +baseMo.slice(0,4), month = +baseMo.slice(5,7);
+    if(typeof window.isMonthAttendanceComplete === 'function'){
+      try{ return window.isMonthAttendanceComplete(year, month); }
+      catch(e){}
+    }
+    /* fallback: sundays count vs records */
+    return { complete:false, lastEnteredWeek:0 };
+  }
+
+  function evaluateAndAdvance(targetMo){
+    var plan = getPlan(targetMo);
+    if(!plan) return null;
+    var check = attendanceComplete(plan.baseMonth);
+    var wasProvisional = plan.status === 'provisional';
+    var nowComplete = !!check.complete;
+    if(wasProvisional && nowComplete){
+      /* 확정 전환 + diff */
+      var diff = confirmPlan(targetMo);
+      return { transitioned:true, diff:diff, check:check };
+    }
+    return { transitioned:false, status:plan.status, check:check };
+  }
+
+  /* 확정: (snapshotMembers ∪ addedMembers) vs 재계산 명단 비교.
+     계획 명단 = snapshot (생성 시 박은 사람) + added (중간 추가).
+     freshIds = baseMonth 데이터 완성 시점에서 재계산한 명단.
+     keep = 둘 다 있음 (계획대로 됨)
+     added = 재계산에만 있음 (예상 못한 새 사람)
+     removed = 계획 명단에만 있음 (회복됨/예상보다 잘 됨) → goals 는 archivedGoals 로 보관 */
+  function planMemberIds(plan){
+    var ids = (plan.snapshotMembers||[]).slice();
+    (plan.addedMembers||[]).forEach(function(m){
+      if(ids.indexOf(m.personId) < 0) ids.push(m.personId);
+    });
+    return ids;
+  }
+  function confirmPlan(cycleId){
+    var plan = getPlan(cycleId);
+    if(!plan) return null;
+    var snapshotIds = planMemberIds(plan);
+    var freshIds = computeHabitualList(plan.baseMonth);
+    var snapSet = {}; snapshotIds.forEach(function(id){ snapSet[id] = 1; });
+    var freshSet = {}; freshIds.forEach(function(id){ freshSet[id] = 1; });
+
+    var keep = [], added = [], removed = [];
+    snapshotIds.forEach(function(id){
+      if(freshSet[id]) keep.push(id);
+      else removed.push(id);
+    });
+    freshIds.forEach(function(id){
+      if(!snapSet[id]) added.push(id);
+    });
+
+    /* removed → goals 에서 archivedGoals 로 이동 (snapshotMembers 에서는 유지 — 영구 기록) */
+    plan.archivedGoals = plan.archivedGoals || {};
+    removed.forEach(function(id){
+      if(plan.goals[id]){
+        plan.archivedGoals[id] = Object.assign({}, plan.goals[id], {
+          archivedAt: nowIso(), reason: 'excluded-at-confirm'
+        });
+        delete plan.goals[id];
+      }
+    });
+    /* added → goals 에 빈 항목 추가 + addedMembers 에 등록 (확정 시점 추가) */
+    added.forEach(function(id){
+      if(!plan.goals[id]) plan.goals[id] = emptyGoal();
+      if(!plan.addedMembers.some(function(m){ return m.personId === id; })){
+        plan.addedMembers.push({ personId:id, addedAt: nowIso(), source:'confirm-diff', reason:'detected-at-confirm' });
+      }
+    });
+
+    plan.status = 'confirmed';
+    plan.confirmedAt = nowIso();
+    plan.lastDiff = { keep:keep, added:added, removed:removed, at: nowIso() };
+    setPlan(cycleId, plan);
+    return plan.lastDiff;
+  }
+
+  /* 화면(habit-body) 의 displayed list = window.getHabitData().data
+     이게 사용자가 실제로 보는 명단 (전월 records 기반, dropdown 필터 반영).
+     plan snapshot 의 source-of-truth 로 사용. */
+  function getDisplayedHabitListIds(){
+    try{
+      if(typeof window.getHabitData !== 'function') return null;
+      var got = window.getHabitData();
+      if(!got || !Array.isArray(got.data)) return null;
+      var ids = got.data.map(function(m){ return m && m.id; }).filter(Boolean);
+      return ids.length ? ids : null;
+    }catch(e){ return null; }
+  }
+
+  /* "다음 사이클 만들기" — 현재 보고 있는 month M 의 displayed list 를 그대로 snapshot.
+       cycleStart = M (= cycleId)
+       cycleEnd = nextMonth(M)
+       baseMonth = prevMonth(M)  (displayed list 가 사용하는 전월)
+       snapshotMembers = window.getHabitData().data 의 id 배열
+         (getHabitData 미사용 가능 시 fallback: computeHabitualList(baseMonth))
+     기존 plan 있으면 덮어쓰기 confirm — 예 누르면 snapshotMembers 갱신, goals 유지. */
+  function createPlanForNextCycle(viewingMo, opts){
+    opts = opts || {};
+    var baseMo = prevMonth(viewingMo);
+    var cycleStart = viewingMo;
+    var cycleEnd = nextMonth(viewingMo);
+    var cycleId = cycleStart;
+    var existing = getPlan(cycleId);
+    /* snapshot source: displayed list 우선, 없으면 compute */
+    var ids = getDisplayedHabitListIds();
+    var idsSource = ids ? 'displayed-list' : null;
+    if(!ids || !ids.length){
+      ids = computeHabitualList(baseMo);
+      idsSource = 'compute-fallback';
+    }
+    if(existing && !opts.overwrite){
+      return { created:false, reason:'already-exists',
+        cycleId:cycleId, cycleStart:cycleStart, cycleEnd:cycleEnd, baseMo:baseMo,
+        existing:existing, freshCount:ids.length, snapshotSource:idsSource };
+    }
+    if(existing && opts.overwrite){
+      existing.cycleStart = cycleStart;
+      existing.cycleEnd = cycleEnd;
+      existing.cycleId = cycleId;
+      existing.snapshotMembers = ids.slice();
+      existing.snapshotAt = nowIso();
+      existing.snapshotSource = idsSource;
+      existing.addedMembers = []; /* 덮어쓰기 시 addedMembers 리셋 */
+      existing.baseMonth = baseMo;
+      existing.baseDataAsOf = nowIso();
+      existing.__schemaV2 = true;
+      ids.forEach(function(id){ if(!existing.goals[id]) existing.goals[id] = emptyGoal(); });
+      setPlan(cycleId, existing);
+      var ev1 = evaluateAndAdvance(cycleId);
+      return { created:false, overwritten:true,
+        cycleId:cycleId, cycleStart:cycleStart, cycleEnd:cycleEnd,
+        snapshotCount:ids.length, snapshotSource:idsSource,
+        autoConfirmed:!!(ev1&&ev1.transitioned), diff:ev1&&ev1.diff };
+    }
+    var plan = {
+      cycleId: cycleId,
+      cycleStart: cycleStart,
+      cycleEnd: cycleEnd,
+      status: 'provisional',
+      baseMonth: baseMo,
+      baseDataAsOf: nowIso(),
+      confirmedAt: null,
+      goals: {},
+      archivedGoals: {},
+      snapshotMembers: ids.slice(),
+      snapshotAt: nowIso(),
+      snapshotSource: idsSource,
+      addedMembers: [],
+      __schemaV2: true
+    };
+    ids.forEach(function(id){ plan.goals[id] = emptyGoal(); });
+    setPlan(cycleId, plan);
+    var result = evaluateAndAdvance(cycleId);
+    return { created:true,
+      cycleId:cycleId, cycleStart:cycleStart, cycleEnd:cycleEnd,
+      snapshotCount:ids.length, snapshotSource:idsSource,
+      autoConfirmed:!!(result&&result.transitioned), diff:result&&result.diff };
+  }
+
+  /* 이전 의미체계 plan 재마이그레이션 — cycleStart/cycleEnd/baseMonth 모두 1개월 앞당김.
+     snapshotMembers = displayed list (현재 화면) 로 갱신. goals 보존. addedMembers 리셋.
+     마이그레이션 후 plan 의 localStorage key 도 새 cycleStart 로 이동. */
+  function remigrateOldCyclePlan(oldKey){
+    var all = getAllPlans();
+    var plan = all[oldKey];
+    if(!plan) return { skipped:true, reason:'not-found' };
+    if(plan.__schemaV2) return { skipped:true, reason:'already-v2' };
+
+    var newCycleStart = prevMonth(plan.cycleStart || oldKey);
+    var newCycleEnd = prevMonth(plan.cycleEnd || nextMonth(oldKey));
+    var newBaseMonth = prevMonth(plan.baseMonth || prevMonth(oldKey));
+
+    /* snapshot 재계산: displayed list 우선, 없으면 compute */
+    var ids = getDisplayedHabitListIds();
+    var src = ids ? 'displayed-list' : null;
+    if(!ids || !ids.length){
+      ids = computeHabitualList(newBaseMonth);
+      src = 'compute-fallback';
+    }
+
+    plan.cycleStart = newCycleStart;
+    plan.cycleEnd = newCycleEnd;
+    plan.cycleId = newCycleStart;
+    plan.baseMonth = newBaseMonth;
+    plan.snapshotMembers = ids.slice();
+    plan.snapshotAt = nowIso();
+    plan.snapshotSource = src;
+    plan.addedMembers = []; /* 재마이그레이션 시 addedMembers 리셋 */
+    plan.baseDataAsOf = nowIso();
+    plan.__schemaV2 = true;
+    /* goals 보존 + 새 멤버에 빈 항목 */
+    plan.goals = plan.goals || {};
+    ids.forEach(function(id){ if(!plan.goals[id]) plan.goals[id] = emptyGoal(); });
+
+    /* 새 key 로 이동 */
+    delete all[oldKey];
+    all[newCycleStart] = plan;
+    saveAllPlans(all);
+    return { from: oldKey, to: newCycleStart, snapshotCount: ids.length, snapshotSource: src };
+  }
+
+  function findOldCyclePlanKeys(){
+    var all = getAllPlans();
+    return Object.keys(all).filter(function(k){
+      var p = all[k];
+      return p && !p.__schemaV2;
+    });
+  }
+
+  /* 추가 데이터에서 새 결석자 감지: 현재 baseMonth 기준 재계산 명단 중
+     snapshotMembers + addedMembers 에 없는 ID 반환. 자동 추가하지 않음 —
+     UI 가 사용자 confirm 후 addMemberToPlan() 호출. */
+  function detectNewMembers(cycleId){
+    var plan = getPlan(cycleId);
+    if(!plan) return [];
+    var fresh = computeHabitualList(plan.baseMonth);
+    var current = {};
+    (plan.snapshotMembers||[]).forEach(function(id){ current[id] = 1; });
+    (plan.addedMembers||[]).forEach(function(m){ current[m.personId] = 1; });
+    return fresh.filter(function(id){ return !current[id]; });
+  }
+
+  /* addedMembers 에 ID 추가 + goals 에 빈 항목 생성. 중복 추가 방지. */
+  function addMemberToPlan(cycleId, personId, reason){
+    var plan = getPlan(cycleId);
+    if(!plan) return false;
+    if(!Array.isArray(plan.addedMembers)) plan.addedMembers = [];
+    if((plan.snapshotMembers||[]).indexOf(personId) >= 0) return false;
+    if(plan.addedMembers.some(function(m){ return m.personId === personId; })) return false;
+    plan.addedMembers.push({
+      personId: personId,
+      addedAt: nowIso(),
+      source: 'detect',
+      reason: reason || 'baseMonth-recompute'
+    });
+    if(!plan.goals[personId]) plan.goals[personId] = emptyGoal();
+    setPlan(cycleId, plan);
+    return true;
+  }
+
+  /* ── 노출 (다른 패치/UI 에서 사용) ────────────────────────────── */
+  window.habitualPlan = {
+    getAll: getAllPlans,
+    get: getPlan,
+    set: setPlan,
+    getCycleForMonth: getCycleForMonth,
+    computeList: computeHabitualList,
+    getDisplayedHabitListIds: getDisplayedHabitListIds,
+    planMemberIds: planMemberIds,
+    createForNextCycle: createPlanForNextCycle,
+    /* 하위 호환 alias */
+    createForNextMonth: createPlanForNextCycle,
+    detectNewMembers: detectNewMembers,
+    addMember: addMemberToPlan,
+    evaluate: evaluateAndAdvance,
+    confirm: confirmPlan,
+    remigrateOldCyclePlan: remigrateOldCyclePlan,
+    findOldCyclePlanKeys: findOldCyclePlanKeys,
+    prevMonth: prevMonth,
+    nextMonth: nextMonth,
+    sundaysOf: sundaysOf
+  };
+
+  /* ── UI: #rt-habit 안에 status 배지 + 버튼 + diff 패널 ─────────── */
+  function selectedMonth(){
+    var y = $('habit-year'), m = $('habit-month');
+    var ys = y && y.value, ms = m && m.value;
+    if(ys && ms) return ys + '-' + String(+ms).padStart(2,'0');
+    return new Date().toISOString().slice(0,7);
+  }
+
+  function ensureUI(){
+    var host = $('rt-habit');
+    if(!host) return false;
+    if($('s2-bar')) return true;
+    var card = host.querySelector('.card');
+    if(!card) return false;
+    var bar = document.createElement('div');
+    bar.id = 's2-bar';
+    bar.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--surface2,#efede7);border-radius:6px;padding:8px 12px;margin:8px 0 12px;font-size:12px';
+    bar.innerHTML =
+      '<span id="s2-badge" style="display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600">—</span>'+
+      '<span id="s2-info" style="color:var(--text3);font-size:11.5px;flex:1;min-width:100px"></span>'+
+      '<button id="s2-detect-btn" class="btn btn-sm" style="display:none" title="추가 데이터에서 새 결석자 감지 (자동 추가 안 함, 사용자 confirm 후 명단에 추가)">추가 명단 감지</button>'+
+      '<button id="s2-create-btn" class="btn btn-sm">다음 사이클 만들기</button>'+
+      '<button id="s2-diff-btn" class="btn btn-sm" style="display:none">변경 내역</button>';
+    /* 카드 안쪽, 필터 영역 직후에 삽입 */
+    var summary = $('habit-count-summary');
+    if(summary && summary.parentNode === card){
+      card.insertBefore(bar, summary);
+    } else {
+      card.insertBefore(bar, card.firstChild.nextSibling);
+    }
+    var diffPanel = document.createElement('div');
+    diffPanel.id = 's2-diff-panel';
+    diffPanel.style.cssText = 'display:none;background:var(--surface,#fafaf7);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:12px;margin-bottom:12px;font-size:12px';
+    bar.insertAdjacentElement('afterend', diffPanel);
+
+    $('s2-create-btn').addEventListener('click', onCreateClick);
+    $('s2-diff-btn').addEventListener('click', function(){
+      diffPanel.style.display = (diffPanel.style.display === 'none' ? '' : 'none');
+    });
+    $('s2-detect-btn').addEventListener('click', onDetectClick);
+    return true;
+  }
+
+  /* "추가 명단 감지" — 자동 재계산이 아닌 사용자 confirm 기반.
+     baseMonth 재계산 결과 중 snapshot/added 에 없는 ID 들을 사용자에게 알리고
+     addedMembers 에 추가. */
+  function onDetectClick(){
+    var p = currentPlan();
+    if(!p) return;
+    var newIds = detectNewMembers(p.cycleId);
+    if(!newIds.length){
+      alert('추가 데이터에서 새로 발견된 결석자가 없습니다.\n('+p.baseMonth+' 출결 재계산 기준)');
+      return;
+    }
+    var names = newIds.map(function(id){
+      return '· '+nameOf(id)+' ('+regionOf(id)+' '+tzOf(id)+')';
+    }).join('\n');
+    var msg = p.baseMonth+' 출결 재계산에서 명단에 없는 결석자 '+newIds.length+'명 발견:\n\n'+names+'\n\n명단에 추가할까요?';
+    if(!confirm(msg)) return;
+    var added = 0;
+    newIds.forEach(function(id){ if(addMemberToPlan(p.cycleId, id, 'manual-detect')) added++; });
+    alert(added+'명을 추가 명단(addedMembers)에 등록했습니다.\n월목표 입력 가능.');
+    try{ if(typeof window.renderHabit === 'function') window.renderHabit(); }catch(e){}
+    refreshUI();
+  }
+
+  /* 현재 선택된 month 에 해당하는 cycle plan 반환 */
+  function currentPlan(){
+    var mo = selectedMonth();
+    return getCycleForMonth(mo);
+  }
+
+  function monthNum(mo){ return +String(mo).slice(5,7); }
+  function cycleRangeLabel(plan){
+    /* "5-6월" 형식 — cycleStart 월 ~ cycleEnd 월 */
+    return monthNum(plan.cycleStart)+'-'+monthNum(plan.cycleEnd)+'월';
+  }
+
+  function nameOf(id){
+    var m = membersAll().find(function(x){ return x.id === id; });
+    return m ? m.name : id;
+  }
+  function regionOf(id){
+    var m = membersAll().find(function(x){ return x.id === id; });
+    return m ? (m.region||'') : '';
+  }
+  function tzOf(id){
+    var m = membersAll().find(function(x){ return x.id === id; });
+    return m ? ((m.team||'')+'-'+(m.zone||'')) : '';
+  }
+
+  function fmtDate(iso){
+    if(!iso) return '';
+    return String(iso).slice(0,10);
+  }
+
+  /* admin 여부 — witpire@gmail.com 또는 role==='admin' */
+  function isAdminUser(){
+    try{
+      var u = window.currentUser;
+      if(!u) return false;
+      if(u.role === 'admin') return true;
+      if(String(u.email||'').toLowerCase() === 'witpire@gmail.com') return true;
+      return false;
+    }catch(e){ return false; }
+  }
+
+  /* 이전 의미체계 plan 마이그레이션 배너.
+     - 관리자: 배너 + confirm 다이얼로그 표시 → 클릭 후 재마이그레이션
+     - 일반 사용자: 배너 숨김, 백그라운드에서 silent 자동 재마이그레이션 */
+  function ensureMigrationBanner(){
+    var existing = $('s2-migrate-banner');
+    var oldKeys = findOldCyclePlanKeys();
+    if(!oldKeys.length){
+      if(existing) existing.style.display = 'none';
+      return;
+    }
+    if(!isAdminUser()){
+      /* 비-admin: 배너 숨김 + silent 자동 마이그레이션 */
+      if(existing) existing.style.display = 'none';
+      try{ oldKeys.forEach(remigrateOldCyclePlan); }catch(e){}
+      return;
+    }
+    /* admin 전용 — 배너 표시 */
+    if(!existing){
+      existing = document.createElement('div');
+      existing.id = 's2-migrate-banner';
+      existing.style.cssText = 'background:var(--amber-bg,#fdf0d8);border:1px solid var(--amber,#7a4608);border-radius:6px;padding:10px 12px;margin:8px 0 12px;font-size:12px;color:var(--amber,#7a4608)';
+      var bar = $('s2-bar');
+      if(bar && bar.parentNode) bar.parentNode.insertBefore(existing, bar);
+    }
+    existing.style.display = '';
+    var all = getAllPlans();
+    var labels = oldKeys.map(function(k){
+      var p = all[k];
+      var cs = p && p.cycleStart || k;
+      var ce = p && p.cycleEnd || nextMonth(k);
+      return monthNum(cs)+'-'+monthNum(ce)+'월';
+    }).join(', ');
+    existing.innerHTML =
+      '⚠️ <b>이전 의미체계로 생성된 사이클 발견</b>: '+esc(labels)+'. '+
+      '<button id="s2-migrate-btn" class="btn btn-sm" style="margin-left:6px">새 의미체계로 재정렬</button>'+
+      '<div style="font-size:11px;color:var(--text2);margin-top:4px">관리자 전용 안내. cycleStart/cycleEnd/baseMonth 를 1개월 앞당기고, snapshotMembers 를 현재 화면 명단으로 갱신합니다. 월목표/주차계획 보존, addedMembers 는 리셋.</div>';
+    var btn = $('s2-migrate-btn');
+    if(btn){
+      btn.onclick = function(){
+        if(!confirm('기존 사이클 plan 을 새 의미체계로 재정렬합니다.\n현재 화면 명단으로 snapshotMembers 갱신, 월목표/주차계획 보존.\n진행할까요?')) return;
+        var results = oldKeys.map(remigrateOldCyclePlan);
+        try{ if(typeof window.renderHabit === 'function') window.renderHabit(); }catch(e){}
+        refreshUI();
+        var summary = results.filter(function(r){return r && r.to;}).map(function(r){
+          return r.from+' → '+r.to+' ('+r.snapshotCount+'명, '+(r.snapshotSource||'?')+')';
+        }).join('\n');
+        alert('재정렬 완료:\n'+summary);
+      };
+    }
+  }
+
+  function refreshUI(){
+    if(!ensureUI()) return;
+    ensureMigrationBanner();
+    var viewingMo = selectedMonth();
+    var plan = getCycleForMonth(viewingMo);
+    var badge = $('s2-badge'), info = $('s2-info');
+    var createBtn = $('s2-create-btn'), diffBtn = $('s2-diff-btn');
+    var detectBtn = $('s2-detect-btn');
+    /* viewing M 기준 cycle 라벨: cycleStart=M, cycleEnd=nextMonth(M) */
+    var startN = monthNum(viewingMo), endN = monthNum(nextMonth(viewingMo));
+    var nextRange = startN+'-'+endN+'월';
+    if(!plan){
+      badge.style.background = 'var(--surface,#fff)';
+      badge.style.color = 'var(--text3)';
+      badge.style.border = '1px solid var(--border)';
+      badge.textContent = viewingMo + ' — 사이클 없음';
+      info.textContent = '"다음 사이클 만들기" 로 ' + nextRange + ' 사이클 생성 가능 (기준월: ' + prevMonth(viewingMo) + ' 출결 = 현재 화면 명단)';
+      createBtn.textContent = nextRange+' 사이클 만들기';
+      diffBtn.style.display = 'none';
+      if(detectBtn) detectBtn.style.display = 'none';
+      hideDiffPanel();
+      return;
+    }
+    /* plan 있으면 자동 평가 (provisional → confirmed) */
+    var ev = evaluateAndAdvance(plan.cycleId);
+    plan = getPlan(plan.cycleId); /* 갱신본 */
+    var check = ev && ev.check;
+    var rng = cycleRangeLabel(plan);
+    var snapN = (plan.snapshotMembers||[]).length;
+    var addN = (plan.addedMembers||[]).length;
+    var totalN = planMemberIds(plan).length;
+    if(plan.status === 'provisional'){
+      badge.style.background = 'var(--amber-bg,#fdf0d8)';
+      badge.style.color = 'var(--amber,#7a4608)';
+      badge.style.border = '1px solid var(--amber,#7a4608)';
+      badge.textContent = rng + ' 사이클 (잠정) — 명단 기준: ' + plan.baseMonth + ' 출결';
+      var w = (check && check.lastEnteredWeek) || 0;
+      info.textContent = '기준월 ' + plan.baseMonth + ' ' + w + '주차까지 입력 · 명단 '+totalN+'명 (스냅샷 '+snapN+' + 추가 '+addN+') — 출결 완성 시 자동 확정';
+    } else {
+      badge.style.background = 'var(--green-bg,#e6f4ee)';
+      badge.style.color = 'var(--green,#1a7a54)';
+      badge.style.border = '1px solid var(--green,#1a7a54)';
+      badge.textContent = rng + ' 사이클 (확정) — 명단 기준: ' + plan.baseMonth + ' 출결';
+      info.textContent = '기준월 ' + plan.baseMonth + ' 확정 · 명단 '+totalN+'명 (스냅샷 '+snapN+' + 추가 '+addN+') · ' + fmtDate(plan.confirmedAt);
+    }
+    /* "다음 사이클 만들기" 버튼: viewingMo 기준 (M, M+1) cycle (새 의미체계) */
+    createBtn.textContent = nextRange+' 사이클 만들기';
+    /* "추가 명단 감지" — plan 있을 때 항상 표시 */
+    if(detectBtn) detectBtn.style.display = '';
+    /* 변경 내역 — admin 전용 표시 */
+    if(plan.status === 'confirmed' && plan.lastDiff && isAdminUser()){
+      diffBtn.style.display = '';
+      renderDiffPanel(plan);
+      if(ev && ev.transitioned){
+        $('s2-diff-panel').style.display = '';
+      }
+    } else {
+      diffBtn.style.display = 'none';
+      hideDiffPanel();
+    }
+    applyPlanSnapshotToBody(plan);
+  }
+
+  function hideDiffPanel(){
+    var p = $('s2-diff-panel'); if(p) p.style.display = 'none';
+  }
+
+  function renderDiffPanel(plan){
+    var p = $('s2-diff-panel'); if(!p) return;
+    var d = plan.lastDiff || { keep:[], added:[], removed:[] };
+    function listSection(title, ids, color, hint){
+      if(!ids.length){
+        return '<div style="margin-bottom:8px"><b style="color:'+color+'">'+title+' (0)</b> <span style="color:var(--text3);font-size:11px">'+hint+'</span></div>';
+      }
+      return '<div style="margin-bottom:10px">'+
+        '<b style="color:'+color+'">'+title+' ('+ids.length+'명)</b> <span style="color:var(--text3);font-size:11px">'+hint+'</span>'+
+        '<div style="margin-top:4px;padding-left:8px;font-size:12px;color:var(--text2);display:flex;flex-wrap:wrap;gap:6px">'+
+        ids.map(function(id){
+          return '<span style="background:var(--surface2,#efede7);padding:2px 8px;border-radius:14px">'+esc(nameOf(id))+' <span style="color:var(--text3);font-size:11px">'+esc(regionOf(id))+' '+esc(tzOf(id))+'</span></span>';
+        }).join('')+
+        '</div></div>';
+    }
+    p.innerHTML =
+      '<div style="font-weight:700;font-size:13px;margin-bottom:8px">변경 내역 — ' + plan.baseMonth + ' 출결 확정 시점 vs 스냅샷</div>'+
+      listSection('유지', d.keep, 'var(--text)', '계획안 + 확정 명단 모두 있음 (목표 그대로 승계)')+
+      listSection('신규', d.added, 'var(--blue,#1550a0)', '확정 명단에만 있음 (목표 미입력)')+
+      listSection('제외(개선)', d.removed, 'var(--green,#1a7a54)', '스냅샷에만 있음 (계획은 archivedGoals 에 보관)')+
+      '<div style="font-size:11px;color:var(--text3);margin-top:6px">확정 시각: '+(plan.confirmedAt||'').slice(0,19).replace('T',' ')+'</div>';
+  }
+
+  function onCreateClick(){
+    var viewing = selectedMonth();
+    var result = createPlanForNextCycle(viewing);
+    var rng;
+    if(!result.created && result.reason === 'already-exists'){
+      var existing = result.existing;
+      var curCount = planMemberIds(existing).length;
+      rng = (monthNum(result.cycleStart)+'-'+monthNum(result.cycleEnd))+'월';
+      var msg = '기존 '+rng+' 사이클을 현재 명단으로 덮어쓸까요?\n'+
+                '(입력한 월목표/주차계획은 보존됩니다, addedMembers 는 초기화)\n\n'+
+                '기존 명단 ' + curCount + '명 → 갱신 후 ' + result.freshCount + '명';
+      if(!confirm(msg)) return;
+      result = createPlanForNextCycle(viewing, { overwrite:true });
+      rng = (monthNum(result.cycleStart)+'-'+monthNum(result.cycleEnd))+'월';
+      alert(rng+' 사이클 명단 덮어쓰기 완료 — '+result.snapshotCount+'명' +
+        (result.autoConfirmed ? ' (기준월 완성되어 자동 확정)' : ''));
+    } else if(result.created){
+      rng = (monthNum(result.cycleStart)+'-'+monthNum(result.cycleEnd))+'월';
+      var m1 = rng+' 사이클 생성 — 기준월 ' + viewing + ' 의 습관성 결석자 ' + result.snapshotCount + '명 스냅샷.';
+      if(result.autoConfirmed) m1 += ' (기준월 완성되어 자동 확정)';
+      alert(m1);
+    }
+    /* 새 cycle 의 시작 월로 자동 이동 */
+    try{
+      var y = $('habit-year'), m = $('habit-month');
+      if(y) y.value = result.cycleStart.slice(0,4);
+      if(m) m.value = String(+result.cycleStart.slice(5,7));
+      if(typeof window.renderHabit === 'function') window.renderHabit();
+    }catch(e){}
+    refreshUI();
+  }
+
+  /* habit-body 를 (snapshotMembers + addedMembers) 기준으로 리렌더.
+     renderHabit 의 dynamic 계산 결과를 cycle 명단으로 덮어쓰기.
+     지역/팀-구역/타겟만 dropdown filter 는 상위에서 narrowing 만 함 (명단 set 은 고정).
+     각 행 옆에 [스냅샷] / [추가] 배지로 출처 구분. */
+  function applyPlanSnapshotToBody(plan){
+    if(!plan) return;
+    var body = $('habit-body'); if(!body) return;
+    var listDiv = $('habit-list'); if(listDiv) listDiv.style.display = '';
+
+    /* source 맵: id → 'snapshot' | 'added' */
+    var sourceById = {};
+    (plan.snapshotMembers||[]).forEach(function(id){ sourceById[id] = 'snapshot'; });
+    (plan.addedMembers||[]).forEach(function(m){
+      /* snapshot 우선 — 같은 id 가 둘 다 있으면 snapshot 표시 */
+      if(!sourceById[m.personId]) sourceById[m.personId] = 'added';
+    });
+    var allIds = Object.keys(sourceById);
+
+    var members = membersAll();
+    var memMap = {}; members.forEach(function(m){ memMap[m.id] = m; });
+
+    /* 현재 dropdown 필터 적용 (명단 set 은 고정, 그 위에서 narrowing) */
+    var regEl = $('habit-reg'), zoneEl = $('habit-zone'), onlyEl = $('habit-only');
+    var reg = (regEl && regEl.value) || '';
+    var zone = (zoneEl && zoneEl.value) || '';
+    var onlyTarget = !!(onlyEl && onlyEl.checked);
+    var targets = (typeof getTargets === 'function') ? getTargets() : {};
+
+    var list = allIds.map(function(id){ return memMap[id]; }).filter(function(m){ return !!m; });
+    if(reg) list = list.filter(function(m){ return String(m.region||'') === reg; });
+    if(zone){
+      var zNorm = (typeof normalizeTeamZone === 'function') ? normalizeTeamZone(zone) : zone;
+      list = list.filter(function(m){
+        var tz = (m.team||'')+'-'+(m.zone||'');
+        var tzNorm = (typeof normalizeTeamZone === 'function') ? normalizeTeamZone(tz) : tz;
+        return tzNorm === zNorm;
+      });
+    }
+    if(onlyTarget) list = list.filter(function(m){ return !!targets[m.id+'_habit']; });
+
+    /* count summary 갱신 — cycle 명단 기준 (snapshot + added) */
+    var sum = $('habit-count-summary');
+    if(sum){
+      var snapN = (plan.snapshotMembers||[]).length;
+      var addN = (plan.addedMembers||[]).length;
+      var totalN = allIds.length;
+      var targetCnt = allIds.filter(function(id){ return !!targets[id+'_habit']; }).length;
+      var withGoal = allIds.filter(function(id){
+        return plan.goals && plan.goals[id] && String(plan.goals[id].monthlyGoal||'').trim();
+      }).length;
+      var rng = cycleRangeLabel(plan);
+      sum.style.gridTemplateColumns='repeat(3,1fr)';
+      sum.innerHTML =
+        '<div class="mc"><div class="lbl">'+rng+' 사이클 명단</div><div class="val">'+totalN+'<span style="font-size:12px">명</span></div><div class="sub">스냅샷 '+snapN+' + 추가 '+addN+' · 기준월 '+esc(plan.baseMonth)+' · 잠금 ('+fmtDate(plan.snapshotAt)+')</div></div>'+
+        '<div class="mc"><div class="lbl">타겟 설정</div><div class="val">'+targetCnt+'</div></div>'+
+        '<div class="mc"><div class="lbl">월목표 입력</div><div class="val">'+withGoal+'<span style="font-size:12px">/'+totalN+'</span></div></div>';
+    }
+
+    if(!list.length){
+      body.innerHTML = '<tr><td colspan="7" class="empty">명단에 표시할 인원이 없습니다 (필터 결과 0)</td></tr>';
+      return;
+    }
+    body.innerHTML = list.map(function(m){
+      var mid = esc(m.id);
+      var goal = (plan.goals[m.id] && plan.goals[m.id].monthlyGoal) || '';
+      var badgeT = (typeof badgeType === 'function') ? badgeType(m.type) : esc(m.type||'');
+      var rsnLabel = '—';
+      try{
+        if(typeof latestPrevRec === 'function' && typeof detail === 'function' && typeof detailBadge === 'function'){
+          var r = latestPrevRec(m.id, plan.baseMonth);
+          var d = detail(r);
+          rsnLabel = detailBadge(d);
+        }
+      }catch(e){}
+      /* 출처 배지 — snapshot 은 무표시, added 만 명시 */
+      var src = sourceById[m.id];
+      var srcChip = (src === 'added')
+        ? ' <span style="display:inline-block;font-size:9.5px;font-weight:600;padding:1px 6px;border-radius:10px;background:var(--blue-bg,#e6eefe);color:var(--blue,#1550a0);margin-left:4px;vertical-align:middle">추가</span>'
+        : '';
+      return '<tr data-pid="'+mid+'" data-src="'+src+'">'+
+        '<td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td>'+
+        '<td>'+esc(m.region||'')+'</td>'+
+        '<td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td>'+
+        '<td style="font-weight:700"><span style="cursor:pointer;color:var(--blue)" onclick="openHabitDetail&&openHabitDetail(\''+mid+'\',\''+esc(plan.baseMonth)+'\')">'+esc(m.name||'')+'</span>'+srcChip+'</td>'+
+        '<td>'+badgeT+'</td>'+
+        '<td>'+rsnLabel+'</td>'+
+        '<td><input class="s2-goal-inp" data-pid="'+mid+'" value="'+esc(goal)+'" placeholder="월 목표" style="width:100%;padding:3px 6px;font-size:11.5px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);font-family:inherit"></td>'+
+      '</tr>';
+    }).join('');
+
+    /* monthlyGoal 입력 → plan.goals[id].monthlyGoal 저장 */
+    var inputs = body.querySelectorAll('.s2-goal-inp');
+    for(var i=0; i<inputs.length; i++){
+      inputs[i].addEventListener('change', function(){
+        var pid = this.dataset.pid;
+        var p = currentPlan();
+        if(!p) return;
+        if(!p.goals) p.goals = {};
+        if(!p.goals[pid]) p.goals[pid] = emptyGoal();
+        p.goals[pid].monthlyGoal = String(this.value||'').trim();
+        setPlan(p.cycleId, p);
+      });
+    }
+  }
+
+  /* renderHabit 호출 후 자동 refresh */
+  function hookRenderHabit(){
+    var orig = window.renderHabit;
+    if(typeof orig !== 'function') return false;
+    if(orig.__stage2Hooked) return true;
+    var wrapped = function(){
+      var ret = orig.apply(this, arguments);
+      try{ refreshUI(); }catch(e){ console.warn('[stage2] refreshUI error', e); }
+      return ret;
+    };
+    wrapped.__stage2Hooked = true;
+    wrapped.__memSyncWrapped = orig.__memSyncWrapped;
+    wrapped.__llfCoalesced = orig.__llfCoalesced;
+    wrapped.__llfWrapped = orig.__llfWrapped;
+    window.renderHabit = wrapped;
+    return true;
+  }
+  if(!hookRenderHabit()){
+    var ht=0; var iv=setInterval(function(){
+      if(hookRenderHabit() || ++ht > 200) clearInterval(iv);
+    }, 50);
+  }
+
+  /* 보고 탭 → 습관성 결석자 진입 시에도 refresh */
+  document.addEventListener('click', function(ev){
+    var t = ev.target;
+    if(t && t.closest && t.closest('#report-tabs .tb')){
+      setTimeout(function(){ try{ ensureUI(); refreshUI(); }catch(e){} }, 50);
+    }
+  }, true);
+
+  /* habit-month / habit-year 변경 감지 */
+  document.addEventListener('change', function(ev){
+    var t = ev.target;
+    if(t && (t.id === 'habit-month' || t.id === 'habit-year')){
+      setTimeout(function(){ try{ refreshUI(); }catch(e){} }, 50);
+    }
+  }, true);
+
+})();
+</script>
+<!-- STAGE2_HABITUAL_PLAN_END -->
+
+<!-- SIDEBAR_DATE_AUTOSET_START -->
+<script id="sidebar-date-autoset">
+(function(){
+  'use strict';
+  /* 사이드바 "날짜 기준" #gb-date 를 페이지 열 때마다 "가장 최근 일요일"로 자동 세팅.
+       - 오늘이 일요일 → 오늘
+       - 오늘이 월~토 → 직전 일요일
+     사용자가 수동으로 바꾸면 그 세션 동안 유지 (gbApplyDate 가 호출됨).
+     새로고침 시 다시 가장 최근 일요일로 리셋. */
+  function mostRecentSunday(){
+    var d = new Date();
+    var diff = d.getDay(); /* 0=일, 1=월, ..., 6=토 */
+    if(diff !== 0) d.setDate(d.getDate() - diff);
+    var y = d.getFullYear();
+    var m = String(d.getMonth()+1).padStart(2,'0');
+    var dd = String(d.getDate()).padStart(2,'0');
+    return y+'-'+m+'-'+dd;
+  }
+
+  function applyDefault(){
+    var el = document.getElementById('gb-date');
+    if(!el) return false;
+    var target = mostRecentSunday();
+    if(el.value === target) return true;
+    el.value = target;
+    /* gbApplyDate 가 정의돼 있으면 호출해 화면 갱신 */
+    try{ if(typeof window.gbApplyDate === 'function') window.gbApplyDate(); }catch(e){}
+    /* globalMonth 도 같이 갱신 */
+    try{
+      var gm = document.getElementById('globalMonth');
+      if(gm && !gm.value) gm.value = target.slice(0,7);
+    }catch(e){}
+    return true;
+  }
+
+  /* 1) DOMContentLoaded 직후 한 번
+     2) initApp 직후 한 번 (initApp 이 today 로 덮어쓰니까 다시 reset)
+     3) loadFromDB 완료 후 한 번 (minjiFastLoad Step 1 이 latest record date 로
+        덮어쓸 수 있어서 그 후 다시 reset) */
+  function setupListeners(){
+    /* 초기 */
+    if(document.readyState === 'loading'){
+      document.addEventListener('DOMContentLoaded', function(){ setTimeout(applyDefault, 0); });
+    } else {
+      setTimeout(applyDefault, 0);
+    }
+    window.addEventListener('load', function(){ setTimeout(applyDefault, 50); });
+    /* initApp 후 / loadFromDB 후 추가 reset */
+    var lateTimes = [200, 500, 1000, 2000];
+    lateTimes.forEach(function(ms){ setTimeout(applyDefault, ms); });
+  }
+  setupListeners();
+
+  /* 노출 — 진단·외부 호출용 */
+  window.sidebarDateAutoset = {
+    mostRecentSunday: mostRecentSunday,
+    applyDefault: applyDefault
+  };
+})();
+</script>
+<!-- SIDEBAR_DATE_AUTOSET_END -->
+
+<!-- DATE_STATE_DIAG_START -->
+<script id="date-state-diag">
+(function(){
+  'use strict';
+  /* 17일 stale state 진단 도구.
+       콘솔: window.__diagDate()
+     출력:
+       - #gb-date 값
+       - effectiveOverviewDate / selectedFinalDate / latestRecordDateInMonth 결과
+       - window.RECORDS / RECORDS 의 최신 날짜
+       - 특정 날짜 (예: 2026-05-17) record 개수
+       - Firebase 에 그 날짜 record 가 있는지 (fbDB 사용 가능 시) */
+  function rcs(){
+    var w = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var l = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS : [];
+    return w.length >= l.length ? w : l;
+  }
+  function uniqueDates(arr){
+    var s = {}; arr.forEach(function(r){ var d=(r.date||'').slice(0,10); if(d) s[d]=1; });
+    return Object.keys(s).sort();
+  }
+  function checkFn(name){
+    try{ return typeof window[name] === 'function' ? window[name]() : '(no function)'; }
+    catch(e){ return '(error: '+e.message+')'; }
+  }
+
+  window.__diagDate = function(targetDate){
+    targetDate = targetDate || '2026-05-17';
+    var report = {};
+    report['#gb-date.value'] = (document.getElementById('gb-date')||{}).value || '(empty)';
+    report['#globalMonth.value'] = (document.getElementById('globalMonth')||{}).value || '(empty)';
+    report['effectiveOverviewDate()'] = checkFn('effectiveOverviewDate');
+    report['selectedFinalDate()'] = checkFn('selectedFinalDate');
+    report['latestRecordDateInMonth()'] = checkFn('latestRecordDateInMonth');
+    var r = rcs();
+    report['RECORDS.length'] = r.length;
+    var ds = uniqueDates(r);
+    report['RECORDS unique dates (last 10)'] = ds.slice(-10);
+    report['RECORDS latest date'] = ds[ds.length-1] || '(none)';
+    report['RECORDS for '+targetDate] = r.filter(function(x){return (x.date||'').slice(0,10) === targetDate;}).length;
+    /* FINAL_TOTALS 는 v98+ 의 하드코딩 상수 */
+    try{ report['FINAL_TOTALS keys (last 5)'] = (typeof FINAL_TOTALS !== 'undefined' ? Object.keys(FINAL_TOTALS).sort().slice(-5) : '(undefined)'); }catch(e){ report['FINAL_TOTALS keys'] = '(error)'; }
+    try{ report['localStorage att_records_v1 dates (last 5)'] = (function(){
+      var raw = localStorage.getItem('att_records_v1'); if(!raw) return '(empty)';
+      var arr = JSON.parse(raw); var s={};
+      arr.forEach(function(x){ var d=(x.date||'').slice(0,10); if(d) s[d]=1; });
+      return Object.keys(s).sort().slice(-5);
+    })(); }catch(e){ report['localStorage'] = '(error)'; }
+
+    console.log('[date-diag] target='+targetDate);
+    Object.keys(report).forEach(function(k){ console.log('  '+k+':', report[k]); });
+
+    /* Firebase 비동기 확인 */
+    if(typeof window.fbDB !== 'undefined' && window.fbDB){
+      console.log('[date-diag] Firebase 조회 중... (records 노드 keys 중 '+targetDate+' 포함 갯수)');
+      try{
+        window.fbDB.ref('records').once('value').then(function(snap){
+          var v = snap.val() || {};
+          var keys = Object.keys(v);
+          var matched = keys.filter(function(k){
+            var r = v[k];
+            return (r && (String(r.date||'').slice(0,10) === targetDate)) ||
+                   (k.indexOf('_'+targetDate) >= 0);
+          });
+          console.log('[date-diag] Firebase records 총 '+keys.length+'건, '+targetDate+' 매칭 '+matched.length+'건');
+          if(matched.length){
+            console.log('[date-diag] 샘플 (최대 3건):');
+            matched.slice(0,3).forEach(function(k){ console.log('  ', k, v[k]); });
+          }
+        }).catch(function(e){
+          console.warn('[date-diag] Firebase 조회 실패:', e);
+        });
+      }catch(e){ console.warn('[date-diag] Firebase 조회 throw:', e); }
+    } else {
+      console.log('[date-diag] window.fbDB 미초기화 — Firebase 조회 건너뜀');
+    }
+    return report;
+  };
+
+  /* 페이지 로드 후 한 번 자동 실행 (admin 만, console 에) */
+  function autoDiag(){
+    try{
+      var u = window.currentUser;
+      if(!u) return;
+      if(!(u.role === 'admin' || String(u.email||'').toLowerCase() === 'witpire@gmail.com')) return;
+      window.__diagDate('2026-05-17');
+    }catch(e){}
+  }
+  /* loadFromDB 완료 후로 미룸 — RECORDS 가 채워진 뒤 */
+  setTimeout(autoDiag, 3000);
+})();
+</script>
+<!-- DATE_STATE_DIAG_END -->
+
+<!-- APPLY_FINAL_DATA_GUARD_START -->
+<script id="apply-final-data-guard">
+(function(){
+  'use strict';
+  /* applyFinalData (v98+, [index.html:8825]) 는 RECORDS / localStorage.att_records_v1
+     을 무조건 하드코딩 FINAL_RECORDS (5/10 까지) 로 덮어씀. 새로 업로드된 5/17
+     데이터가 매번 renderOverview/login/load 시점에 지워지는 원인.
+
+     가드 정책 (v2): 현재 RECORDS/window.RECORDS/캐시 에 FINAL_RECORDS max date
+     보다 늦은 date 가 있으면:
+       1) 가장 richest source 를 골라 그 contents 로 window.FINAL_RECORDS /
+          window.FINAL_MEMBERS 를 PROMOTE (splice 로 in-place 갱신)
+       2) 그 다음 orig applyFinalData 를 호출 — RECORDS = FINAL_RECORDS.map(...) 가
+          이제 promoted 된 newer 데이터를 사용 → 화면이 5/17 로 갱신
+       3) const FINAL_RECORDS 는 binding 만 잠금, contents 는 mutable 이므로 가능
+       4) window.FINAL_RECORDS 는 IIFE 가 line 8832 에서 노출함 — 같은 reference */
+  function maxDateOf(arr){
+    if(!Array.isArray(arr) || !arr.length) return '';
+    var m = '';
+    for(var i=0;i<arr.length;i++){
+      var d = (arr[i] && arr[i].date || '').slice(0,10);
+      if(d > m) m = d;
+    }
+    return m;
+  }
+  function finalMaxDate(){
+    try{
+      return Array.isArray(window.FINAL_RECORDS) ? maxDateOf(window.FINAL_RECORDS) : '';
+    }catch(e){ return ''; }
+  }
+  function readLocalCache(){
+    try{
+      var raw = localStorage.getItem('att_records_v1');
+      if(!raw) return null;
+      var arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : null;
+    }catch(e){ return null; }
+  }
+
+  function hasRicherData(){
+    var fMax = finalMaxDate();
+    if(!fMax) return false;
+    /* window.RECORDS */
+    if(Array.isArray(window.RECORDS)){
+      for(var i=0;i<window.RECORDS.length;i++){
+        var d = (window.RECORDS[i] && window.RECORDS[i].date || '').slice(0,10);
+        if(d > fMax) return true;
+      }
+    }
+    /* lexical RECORDS */
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+        for(var j=0;j<RECORDS.length;j++){
+          var d2 = (RECORDS[j] && RECORDS[j].date || '').slice(0,10);
+          if(d2 > fMax) return true;
+        }
+      }
+    }catch(e){}
+    /* localStorage 캐시 */
+    var cache = readLocalCache();
+    if(cache){
+      for(var k=0;k<cache.length;k++){
+        var d3 = (cache[k] && cache[k].date || '').slice(0,10);
+        if(d3 > fMax) return true;
+      }
+    }
+    return false;
+  }
+
+  /* 가장 richest source 선택: max date 우선, 같으면 길이 우선 */
+  function pickRichestSource(){
+    var sources = [];
+    if(Array.isArray(window.RECORDS) && window.RECORDS.length){
+      sources.push({ src:'window.RECORDS', arr: window.RECORDS });
+    }
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS.length){
+        sources.push({ src:'lexical RECORDS', arr: RECORDS });
+      }
+    }catch(e){}
+    var cache = readLocalCache();
+    if(cache && cache.length) sources.push({ src:'localStorage', arr: cache });
+    if(!sources.length) return null;
+    var best = null;
+    sources.forEach(function(s){
+      var max = maxDateOf(s.arr);
+      if(!best){ best = { src:s.src, arr:s.arr, max:max }; return; }
+      if(max > best.max){ best = { src:s.src, arr:s.arr, max:max }; return; }
+      if(max === best.max && s.arr.length > best.arr.length){
+        best = { src:s.src, arr:s.arr, max:max };
+      }
+    });
+    return best;
+  }
+
+  /* FINAL_RECORDS contents 를 richest source 로 in-place 교체 (const binding 유지).
+     FINAL_MEMBERS 도 window.MEMBERS 가 더 풍부하면 promote.
+     반환: 무엇이 어떻게 promote 됐는지 진단 정보. */
+  function promoteFinalRecords(){
+    if(!Array.isArray(window.FINAL_RECORDS)) return { error:'window.FINAL_RECORDS not array' };
+    var best = pickRichestSource();
+    if(!best) return { error:'no source available' };
+    var before = window.FINAL_RECORDS.length;
+    var beforeMax = maxDateOf(window.FINAL_RECORDS);
+    /* deep-clone 으로 contents 만 mutate — reference 유지 */
+    window.FINAL_RECORDS.splice(0, window.FINAL_RECORDS.length);
+    best.arr.forEach(function(r){
+      if(!r || !r.id || !r.date) return;
+      window.FINAL_RECORDS.push({
+        id: r.id, date: String(r.date).slice(0,10),
+        wk: r.wk || 1, day: r.day || '일',
+        st: r.st || '', rsn: r.rsn || '',
+        streak: r.streak || 0,
+        region: r.region || '', team: r.team || '', zone: r.zone || '',
+        name: r.name || '', type: r.type || '', regType: r.regType || ''
+      });
+    });
+    var memSrc = null;
+    if(Array.isArray(window.FINAL_MEMBERS) && Array.isArray(window.MEMBERS) && window.MEMBERS.length > window.FINAL_MEMBERS.length){
+      window.FINAL_MEMBERS.splice(0, window.FINAL_MEMBERS.length);
+      window.MEMBERS.forEach(function(m){
+        if(!m || !m.id) return;
+        window.FINAL_MEMBERS.push({
+          id: m.id, region: m.region || '', team: m.team || '',
+          zone: m.zone || '', name: m.name || '',
+          type: m.type || '일반', regType: m.regType || '총회등록',
+          _retired: !!m._retired
+        });
+      });
+      memSrc = 'window.MEMBERS';
+    }
+    return {
+      sourceRecords: best.src,
+      countBefore: before, countAfter: window.FINAL_RECORDS.length,
+      maxBefore: beforeMax, maxAfter: maxDateOf(window.FINAL_RECORDS),
+      memSource: memSrc, memCount: Array.isArray(window.FINAL_MEMBERS) ? window.FINAL_MEMBERS.length : 0
+    };
+  }
+
+  function wrap(){
+    var orig = window.applyFinalData;
+    if(typeof orig !== 'function') return false;
+    if(orig.__guardWrapped) return true;
+    var wrapped = function(){
+      if(hasRicherData()){
+        /* SKIP 이 아니라 PROMOTE 후 orig 실행 — FINAL_RECORDS 갱신 → orig 의
+           RECORDS = FINAL_RECORDS.map(...) 가 newer 데이터로 채워짐 → 화면 갱신 */
+        try{
+          var res = promoteFinalRecords();
+          if(res && res.maxAfter && res.maxAfter !== res.maxBefore){
+            console.log('[apply-guard] PROMOTED FINAL_RECORDS from '+res.maxBefore+' → '+res.maxAfter+' (source='+res.sourceRecords+', '+res.countBefore+'→'+res.countAfter+' records, mem='+res.memSource+'/'+res.memCount+')');
+          }
+        }catch(e){ console.warn('[apply-guard] promote error', e); }
+      }
+      return orig.apply(this, arguments);
+    };
+    wrapped.__guardWrapped = true;
+    /* login-gate 의 setter trap 이 다시 wrapApply 로 감싸지 못하게 marker 박음 */
+    wrapped.__loginGated = orig.__loginGated || true;
+    wrapped.__originalApply = orig.__originalApply || orig;
+    window.applyFinalData = wrapped;
+    return true;
+  }
+
+  if(!wrap()){
+    var t=0;
+    var iv=setInterval(function(){
+      if(wrap() || ++t > 300) clearInterval(iv);
+    }, 30);
+  }
+
+  /* 진단 보조: 현재 상태 한눈에 + 수동 promote 트리거 */
+  window.__diagFinalGuard = function(){
+    var fMax = finalMaxDate();
+    var wMax = maxDateOf(window.RECORDS||[]);
+    var cache = readLocalCache();
+    var lMax = cache ? maxDateOf(cache) : '';
+    var richer = hasRicherData();
+    console.log('[apply-guard] FINAL_RECORDS max date:', fMax, '('+(Array.isArray(window.FINAL_RECORDS)?window.FINAL_RECORDS.length:0)+' records)');
+    console.log('[apply-guard] window.RECORDS max date:', wMax, '('+(Array.isArray(window.RECORDS)?window.RECORDS.length:0)+' records)');
+    console.log('[apply-guard] localStorage cache max date:', lMax, '('+(cache?cache.length:0)+' records)');
+    console.log('[apply-guard] hasRicherData() →', richer);
+    return { finalMax:fMax, windowMax:wMax, cacheMax:lMax, hasRicher:richer };
+  };
+  window.__promoteFinalNow = function(){
+    var res = promoteFinalRecords();
+    console.log('[apply-guard] manual promote →', res);
+    /* 갱신된 FINAL_RECORDS 로 orig 강제 호출 — RECORDS / 화면 동기화 */
+    try{
+      var orig = window.applyFinalData && window.applyFinalData.__originalApply;
+      if(orig) orig();
+      /* 화면 강제 갱신 */
+      if(typeof window.renderOverview === 'function') window.renderOverview();
+    }catch(e){ console.warn('[apply-guard] manual apply error', e); }
+    return res;
+  };
+
+  /* 페이지 로드 후 자동 promote 시도 — 캐시/Firebase 가 RECORDS 채운 뒤 */
+  function autoPromote(){
+    try{
+      if(hasRicherData()){
+        var res = promoteFinalRecords();
+        if(res && res.maxAfter && res.maxAfter !== res.maxBefore){
+          console.log('[apply-guard] AUTO-PROMOTED on load: '+res.maxBefore+' → '+res.maxAfter+' (source='+res.sourceRecords+')');
+          /* orig 강제 호출 + render 트리거 — 화면 갱신 */
+          try{
+            var orig = window.applyFinalData && window.applyFinalData.__originalApply;
+            if(orig) orig();
+            if(typeof window.renderOverview === 'function') window.renderOverview();
+          }catch(e){}
+        }
+      }
+    }catch(e){}
+  }
+  /* loadFromDB 완료 후로 충분히 지연 (3초/6초) — Firebase Step 2 가 RECORDS 채우고 난 뒤 */
+  setTimeout(autoPromote, 3000);
+  setTimeout(autoPromote, 6000);
+})();
+</script>
+<!-- APPLY_FINAL_DATA_GUARD_END -->
+
+<!-- FIREBASE_SYNC_DIAG_START -->
+<script id="firebase-sync-diag">
+(function(){
+  'use strict';
+  /* Firebase 동기화 흐름 진단:
+       1) fbRecordsFromVal 래핑 — 입출력 5/17 record 개수 로그
+       2) minjiFastLoad Step 2 의 RECORDS 갱신 결정 추적
+       3) 5초 뒤 자동 진단 — Firebase 에 직접 5/17 query 해서 어디서 사라지는지 보고
+
+     target date 기본 5/17. window.__diagFirebaseSync('YYYY-MM-DD') 로 수동 호출. */
+
+  var TARGET_DATE = '2026-05-17';
+
+  /* ── fbRecordsFromVal 래핑 — 입출력에 target 매칭 record 갯수 로그 ─── */
+  function wrapFbRecordsFromVal(){
+    var orig = window.fbRecordsFromVal;
+    if(typeof orig !== 'function') return false;
+    if(orig.__diagWrapped) return true;
+    var wrapped = function(rawObj){
+      var inCount = 0, inKeys = 0, inWithDate = 0;
+      try{
+        if(rawObj && typeof rawObj === 'object'){
+          var allKeys = Object.keys(rawObj);
+          inKeys = allKeys.length;
+          allKeys.forEach(function(k){
+            var v = rawObj[k];
+            if(v && (String(v.date||'').slice(0,10) === TARGET_DATE)) inWithDate++;
+            if(String(k).indexOf('_'+TARGET_DATE) >= 0) inCount++;
+          });
+        }
+      }catch(e){}
+      var out = orig.apply(this, arguments);
+      var outCount = 0;
+      try{
+        if(Array.isArray(out)){
+          out.forEach(function(r){ if(r && String(r.date||'').slice(0,10) === TARGET_DATE) outCount++; });
+        }
+      }catch(e){}
+      console.log('[firebase-sync] fbRecordsFromVal: raw keys='+inKeys+
+        ', '+TARGET_DATE+' key-suffix='+inCount+', value.date='+inWithDate+
+        ' → out total='+(Array.isArray(out)?out.length:0)+', '+TARGET_DATE+' entries='+outCount);
+      return out;
+    };
+    wrapped.__diagWrapped = true;
+    window.fbRecordsFromVal = wrapped;
+    return true;
+  }
+  if(!wrapFbRecordsFromVal()){
+    var t=0;
+    var iv=setInterval(function(){
+      if(wrapFbRecordsFromVal() || ++t > 200) clearInterval(iv);
+    }, 50);
+  }
+
+  /* ── Firebase 직접 조회 진단 (manual + auto) ─────────────────── */
+  window.__diagFirebaseSync = function(targetDate){
+    targetDate = targetDate || TARGET_DATE;
+    console.log('[firebase-sync] === diag start (target='+targetDate+') ===');
+    if(typeof window.fbDB === 'undefined' || !window.fbDB){
+      console.warn('[firebase-sync] window.fbDB 미초기화');
+      return null;
+    }
+    return window.fbDB.ref('records').once('value').then(function(snap){
+      var raw = snap.val() || {};
+      var keys = Object.keys(raw);
+      var targetKeys = keys.filter(function(k){ return k.indexOf('_'+targetDate) >= 0; });
+      var targetWithDate = keys.filter(function(k){
+        var v = raw[k]; return v && String(v.date||'').slice(0,10) === targetDate;
+      });
+      console.log('[firebase-sync] Firebase records 총 keys: '+keys.length);
+      console.log('[firebase-sync] Firebase keys with "_'+targetDate+'" suffix: '+targetKeys.length);
+      console.log('[firebase-sync] Firebase entries with value.date='+targetDate+': '+targetWithDate.length);
+      if(targetKeys.length > 0){
+        console.log('[firebase-sync] 샘플 (key-suffix 매칭) 최대 3건:');
+        targetKeys.slice(0,3).forEach(function(k){ console.log('  '+k+' →', raw[k]); });
+      }
+
+      /* fbRecordsFromVal 변환 결과 */
+      var orig = window.fbRecordsFromVal && window.fbRecordsFromVal.__diagWrapped ?
+        (function(){ var w=window.fbRecordsFromVal; while(w.__diagWrapped && w.__originalApply){ w = w.__originalApply; } return w; })() :
+        window.fbRecordsFromVal;
+      var converted = orig ? orig(raw) : Object.values(raw);
+      var convertedTarget = converted.filter(function(r){ return r && String(r.date||'').slice(0,10) === targetDate; });
+      console.log('[firebase-sync] fbRecordsFromVal 변환 → 총 '+converted.length+'건, '+targetDate+' '+convertedTarget.length+'건');
+
+      /* 현재 RECORDS / window.RECORDS / localStorage 와 비교 */
+      var w = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+      var wTarget = w.filter(function(r){ return String(r.date||'').slice(0,10) === targetDate; }).length;
+      console.log('[firebase-sync] window.RECORDS 총 '+w.length+'건, '+targetDate+' '+wTarget+'건');
+
+      var lex;
+      try{ lex = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS : []; }catch(e){ lex = []; }
+      var lexTarget = lex.filter(function(r){ return String(r.date||'').slice(0,10) === targetDate; }).length;
+      console.log('[firebase-sync] lexical RECORDS 총 '+lex.length+'건, '+targetDate+' '+lexTarget+'건');
+
+      try{
+        var raw2 = localStorage.getItem('att_records_v1');
+        var cache = raw2 ? JSON.parse(raw2) : [];
+        var cTarget = Array.isArray(cache) ? cache.filter(function(r){ return String(r.date||'').slice(0,10) === targetDate; }).length : 0;
+        console.log('[firebase-sync] localStorage att_records_v1 총 '+(Array.isArray(cache)?cache.length:0)+'건, '+targetDate+' '+cTarget+'건');
+      }catch(e){ console.warn('[firebase-sync] localStorage 읽기 실패', e); }
+
+      /* Step 2 의 gate 조건 진단 — fbRecs.length >= currentRValid2 가 false 면 skip 됨 */
+      var currentRValid = lex.filter(function(x){return x && x.id && x.date;}).length;
+      var fbRecsValid = converted.filter(function(x){return x && x.id && x.date;}).length;
+      console.log('[firebase-sync] Step 2 gate: fbRecs.length='+fbRecsValid+' vs currentRValid='+currentRValid+
+        ' → '+(fbRecsValid >= currentRValid ? 'UPDATE 함' : '⚠️ SKIP (Firebase 가 cache 보다 적음 → 덮어쓰지 않음)'));
+
+      /* FINAL_RECORDS / FINAL_TOTALS max */
+      var fr = Array.isArray(window.FINAL_RECORDS) ? window.FINAL_RECORDS : [];
+      var frMax = ''; fr.forEach(function(r){ var d=(r.date||'').slice(0,10); if(d>frMax) frMax=d; });
+      console.log('[firebase-sync] FINAL_RECORDS 총 '+fr.length+'건, max date='+frMax);
+
+      console.log('[firebase-sync] === diag end ===');
+      return {
+        firebaseKeys: keys.length,
+        firebaseTargetKeys: targetKeys.length,
+        convertedTotal: converted.length,
+        convertedTarget: convertedTarget.length,
+        windowTotal: w.length, windowTarget: wTarget,
+        lexicalTotal: lex.length, lexicalTarget: lexTarget,
+        cacheTotal: 0, /* set below */
+        gateWillUpdate: fbRecsValid >= currentRValid,
+        finalMax: frMax
+      };
+    }).catch(function(e){
+      console.error('[firebase-sync] Firebase 조회 실패:', e);
+    });
+  };
+
+  /* 5초 뒤 자동 실행 (Step 2 완료 후) — admin 만 */
+  function autoRun(){
+    try{
+      var u = window.currentUser;
+      if(!u || !(u.role === 'admin' || String(u.email||'').toLowerCase() === 'witpire@gmail.com')) return;
+      window.__diagFirebaseSync(TARGET_DATE);
+    }catch(e){}
+  }
+  setTimeout(autoRun, 5000);
+})();
+</script>
+<!-- FIREBASE_SYNC_DIAG_END -->
+
+<!-- OV_METRICS_REBUILD_START -->
+<script id="ov-metrics-rebuild">
+(function(){
+  'use strict';
+  /* 윗쪽 5개 카드 (#ov-metrics, v28 buildOvMetrics) 가 window.RECORDS 만 보고
+     렌더링하는데, v106 syncData 등이 window.RECORDS 에서 5/17 record 를 떨궈
+     5-cards 가 0 으로 나옴. 가족/가족외/일반 (type-cards) 은 lexical RECORDS 를
+     쓰므로 정상.
+
+     해결: window.renderOverview 가 끝난 뒤 #ov-metrics 를 다시 계산.
+     데이터 소스는 lexical RECORDS / window.RECORDS / window.FINAL_RECORDS 중
+     target date 에 매칭되는 records 가 가장 많은 것을 best source 로 선택. */
+
+  function ovDateValue(){
+    try{
+      if(typeof window.effectiveOverviewDate === 'function'){
+        var d = String(window.effectiveOverviewDate()||'').slice(0,10);
+        if(d) return d;
+      }
+    }catch(e){}
+    var gd = document.getElementById('gb-date');
+    return (gd && gd.value) || '';
+  }
+
+  function normalizeDate(d){
+    d = String(d||'').slice(0,10);
+    var m = d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if(m) return m[1]+'-'+String(+m[2]).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0');
+    return d;
+  }
+
+  function pickRichestForDate(dateVal){
+    var sources = [];
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS.length){
+        sources.push({ name:'lexical RECORDS', arr:RECORDS });
+      }
+    }catch(e){}
+    if(Array.isArray(window.RECORDS) && window.RECORDS.length){
+      sources.push({ name:'window.RECORDS', arr:window.RECORDS });
+    }
+    if(Array.isArray(window.FINAL_RECORDS) && window.FINAL_RECORDS.length){
+      sources.push({ name:'window.FINAL_RECORDS', arr:window.FINAL_RECORDS });
+    }
+    var best = null;
+    sources.forEach(function(s){
+      var match = [];
+      for(var i=0;i<s.arr.length;i++){
+        var r = s.arr[i];
+        if(!r) continue;
+        if(normalizeDate(r.date) === dateVal) match.push(r);
+      }
+      if(!best || match.length > best.match.length){
+        best = { name:s.name, arr:s.arr, match:match };
+      }
+    });
+    return best;
+  }
+
+  function fmtPct(v){
+    v = Number(v) || 0;
+    return (Math.round(v*10)/10).toFixed(1);
+  }
+
+  function rebuildOvMetrics(){
+    var ovm = document.getElementById('ov-metrics');
+    if(!ovm) return;
+    var dateVal = normalizeDate(ovDateValue());
+    if(!dateVal) return;
+
+    var best = pickRichestForDate(dateVal);
+    if(!best || !best.match.length) return;
+
+    /* dedupe by id */
+    var seen = {}, uniq = [];
+    for(var i=0;i<best.match.length;i++){
+      var r = best.match[i];
+      var id = String(r.id||'').trim();
+      if(id && !seen[id]){ seen[id] = 1; uniq.push(r); }
+    }
+    if(!uniq.length) return;
+
+    /* existing DOM 의 첫 카드 (출결 재적) 값 확인 — 이미 정답이면 rebuild 안 함 */
+    var existingFirst = ovm.querySelector('.v28-mc .v28-num');
+    if(existingFirst){
+      var existingTotal = parseInt(String(existingFirst.textContent||'').replace(/[^\d]/g,''),10) || 0;
+      if(existingTotal >= uniq.length){
+        /* 이미 v28 buildOvMetrics 가 같거나 더 많은 인원으로 렌더했으면 skip */
+        return;
+      }
+    }
+
+    var total = uniq.length, qr = 0, sa = 0, ab = 0;
+    for(var j=0;j<uniq.length;j++){
+      var st = String(uniq[j].st||'').trim();
+      if(st === 'QR인증') qr++;
+      else if(st === '사유출석') sa++;
+      else if(st === '사유결석') ab++;
+    }
+    var rate = total ? Math.round((qr+sa)/total*1000)/10 : 0;
+
+    function card(label, num, unit, color, sub){
+      return '<div class="mc v28-mc">'+
+        '<div class="v28-lbl">'+label+'</div>'+
+        '<div class="v28-num" style="color:'+(color||'var(--text)')+'">'+num+(unit?'<small>'+unit+'</small>':'')+'</div>'+
+        '<div class="v28-sub">'+(sub||'')+'</div>'+
+      '</div>';
+    }
+
+    ovm.classList.add('v28-grid5');
+    ovm.innerHTML =
+      card('출결 재적', total, '명', 'var(--text)', dateVal+' 기준') +
+      card('QR 인증', qr, '명', 'var(--green)', fmtPct(total?qr/total*100:0)+'% · QR코드 인증') +
+      card('사유 출석', sa, '명', 'var(--blue)', fmtPct(total?sa/total*100:0)+'% · 사유 인정 출석') +
+      card('사유 결석', ab, '명', 'var(--red)', fmtPct(total?ab/total*100:0)+'% · 사유 결석') +
+      card('출석률', fmtPct(rate), '%', rate>=80?'var(--green)':rate>=60?'var(--amber)':'var(--red)', 'QR+사유출석 기준');
+
+    /* ov-sub 텍스트도 갱신 (v28 이 같이 쓰는 영역) */
+    var ovSub = document.getElementById('ov-sub');
+    if(ovSub) ovSub.textContent = dateVal + ' 출결 현황';
+
+    console.log('[ov-rebuild] '+dateVal+' total='+total+' QR='+qr+' SA='+sa+' AB='+ab+' (source='+best.name+')');
+  }
+
+  /* renderOverview 호출 후 자동 rebuild — coalesce/wrap 와 충돌 방지 */
+  function wrap(){
+    var orig = window.renderOverview;
+    if(typeof orig !== 'function') return false;
+    if(orig.__ovRebuildWrapped) return true;
+    var wrapped = function(){
+      var ret;
+      try{ ret = orig.apply(this, arguments); }
+      catch(e){ console.error('[ov-rebuild] orig error', e); }
+      requestAnimationFrame(function(){
+        try{ rebuildOvMetrics(); }catch(e){ console.warn('[ov-rebuild] rebuild error', e); }
+      });
+      return ret;
+    };
+    wrapped.__ovRebuildWrapped = true;
+    /* 다른 패치들이 다시 wrap 못 하게 모든 marker 박음 */
+    wrapped.__llfCoalesced = true;
+    wrapped.__llfWrapped = true;
+    wrapped.__perfWrapped = true;
+    wrapped.__v86_fast = true;
+    window.renderOverview = wrapped;
+    /* renderOverviewNow 도 같이 — masterRender 가 우회 호출 */
+    if(typeof window.renderOverviewNow === 'function' && !window.renderOverviewNow.__ovRebuildWrapped){
+      var origNow = window.renderOverviewNow;
+      var wrappedNow = function(){
+        var r;
+        try{ r = origNow.apply(this, arguments); }catch(e){}
+        try{ rebuildOvMetrics(); }catch(e){}
+        return r;
+      };
+      wrappedNow.__ovRebuildWrapped = true;
+      window.renderOverviewNow = wrappedNow;
+    }
+    return true;
+  }
+  if(!wrap()){
+    var t=0;
+    var iv=setInterval(function(){
+      if(wrap() || ++t > 300) clearInterval(iv);
+    }, 30);
+  }
+
+  /* 페이지 로드 후 자동 한 번 — Step 2 + applyFinalData guard promote 후 */
+  setTimeout(function(){ try{ rebuildOvMetrics(); }catch(e){} }, 3500);
+  setTimeout(function(){ try{ rebuildOvMetrics(); }catch(e){} }, 6500);
+
+  /* 수동 트리거 — 콘솔 진단용 */
+  window.__rebuildOvMetrics = rebuildOvMetrics;
+  window.__diagOvRebuild = function(){
+    var dateVal = normalizeDate(ovDateValue());
+    console.log('[ov-rebuild] diag — dateVal='+dateVal);
+    if(!dateVal){ console.log('  date empty'); return; }
+    var lex = []; try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) lex = RECORDS; }catch(e){}
+    var w = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var f = Array.isArray(window.FINAL_RECORDS) ? window.FINAL_RECORDS : [];
+    function cnt(arr){ return arr.filter(function(r){ return normalizeDate(r && r.date) === dateVal; }).length; }
+    console.log('  lexical RECORDS: total='+lex.length+', target match='+cnt(lex));
+    console.log('  window.RECORDS:  total='+w.length+', target match='+cnt(w));
+    console.log('  window.FINAL_RECORDS: total='+f.length+', target match='+cnt(f));
+    var best = pickRichestForDate(dateVal);
+    console.log('  pickRichestForDate → '+(best?best.name+' ('+best.match.length+'건)':'none'));
+  };
+})();
+</script>
+<!-- OV_METRICS_REBUILD_END -->
