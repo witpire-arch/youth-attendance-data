@@ -16800,3 +16800,295 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- ACTIVE_MEMBER_FILTER_END -->
+
+<!-- DIAG_B_12MEMBER_DIFF_START -->
+<script id="diag-b-12member">
+(function(){
+  'use strict';
+  /* [B] 진단 only — MEMBERS / RECORDS 변경 X.
+     applyActiveFilter wrap 으로 필터 이전 멤버 캡처. */
+
+  var ORIG_M = null;
+  function maybeSnap(){
+    if(ORIG_M) return;
+    if(Array.isArray(window.MEMBERS) && window.MEMBERS.length){
+      ORIG_M = window.MEMBERS.slice();
+    }
+  }
+  (function wrapApply(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      var fn = window.applyActiveFilter;
+      if(typeof fn === 'function' && !fn.__diagBWrap){
+        var wrapped = function(){
+          maybeSnap();
+          return fn.apply(this, arguments);
+        };
+        wrapped.__diagBWrap = true;
+        try{
+          for(var k in fn) if(Object.prototype.hasOwnProperty.call(fn,k)) wrapped[k] = fn[k];
+        }catch(e){}
+        window.applyActiveFilter = wrapped;
+        clearInterval(iv);
+      }
+      if(++tries > 200) clearInterval(iv);
+    }, 30);
+  })();
+  /* 폴링 — 초기 1초 max 캡처 */
+  var sCnt = 0;
+  var sIv = setInterval(function(){
+    maybeSnap();
+    if(ORIG_M){ clearInterval(sIv); return; }
+    if(++sCnt > 40) clearInterval(sIv);
+  }, 25);
+
+  function userRegion(){
+    var u = window.currentUser;
+    return (u && u.region) ? String(u.region).trim() : null;
+  }
+
+  var diagDone = false;
+  function runDiagB(){
+    if(diagDone) return;
+    maybeSnap();
+    var src = (ORIG_M && ORIG_M.length) ? ORIG_M
+            : (Array.isArray(window.MEMBERS) ? window.MEMBERS : []);
+    var records = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    if(!src.length || !records.length) return;
+    diagDone = true;
+
+    /* records grouped by id */
+    var byId = {};
+    records.forEach(function(r){
+      if(!r || !r.id) return;
+      var id = String(r.id);
+      if(!byId[id]) byId[id] = { count:0, latestDate:'', dates:[] };
+      byId[id].count++;
+      var d = String(r.date||'').slice(0,10);
+      if(d && d > byId[id].latestDate) byId[id].latestDate = d;
+    });
+
+    /* member id set */
+    var memIdToMember = {};
+    src.forEach(function(m){
+      if(m && m.id) memIdToMember[String(m.id)] = m;
+    });
+
+    var focus = userRegion() || '강북';
+
+    /* [B-1] focus region 의 stale members (region=focus 인데 records=0) */
+    var stale = src.filter(function(m){
+      if(!m || !m.id) return false;
+      if(String(m.region||'').trim() !== focus) return false;
+      return !byId[String(m.id)];
+    });
+
+    /* [B-2] orphan records (records 있는데 ORIG_M 에 없음) */
+    var orphanIds = [];
+    Object.keys(byId).forEach(function(id){
+      if(!memIdToMember[id]) orphanIds.push(id);
+    });
+
+    /* 표 출력 — focus region stale */
+    console.log('[diag-B] ╔══════════════════════════════════════════════════════════════╗');
+    console.log('[diag-B] ║ '+focus+' members.region 인데 records 0건 ('+stale.length+'명)');
+    console.log('[diag-B] ╠══════════════════════════════════════════════════════════════╣');
+    console.log('[diag-B]   #  | ID            | 이름           | members.region | 최근 records   | 건수');
+    if(stale.length === 0){
+      console.log('[diag-B]   (없음)');
+    } else {
+      stale.forEach(function(m, i){
+        var pad = function(s,w){ s=String(s==null?'':s); while(s.length<w)s+=' '; return s; };
+        console.log('[diag-B]   '+pad(i+1,3)+'| '+pad(m.id,14)+'| '+pad(m.name||'?',14)+'| '+pad(m.region||'?',14)+'| '+pad('(records 없음)',14)+'| 0');
+      });
+    }
+
+    /* orphan records 표 */
+    console.log('[diag-B] ╠══════════════════════════════════════════════════════════════╣');
+    console.log('[diag-B] ║ records 있는데 members 없음 — orphan records ('+orphanIds.length+'명)');
+    console.log('[diag-B] ╠══════════════════════════════════════════════════════════════╣');
+    console.log('[diag-B]   #  | ID            | 최근 records   | 건수');
+    var show = orphanIds.slice(0, 40);
+    show.forEach(function(id, i){
+      var pad = function(s,w){ s=String(s==null?'':s); while(s.length<w)s+=' '; return s; };
+      console.log('[diag-B]   '+pad(i+1,3)+'| '+pad(id,14)+'| '+pad(byId[id].latestDate||'-',14)+'| '+byId[id].count);
+    });
+    if(orphanIds.length > 40) console.log('[diag-B]   ... +'+(orphanIds.length-40)+' more');
+    console.log('[diag-B] ╚══════════════════════════════════════════════════════════════╝');
+
+    /* 분석 */
+    var regCount = src.filter(function(m){ return m && String(m.region||'').trim() === focus; }).length;
+    var regActive = src.filter(function(m){ return m && String(m.region||'').trim() === focus && byId[String(m.id)]; }).length;
+    console.log('[diag-B] === 분석 ===');
+    console.log('[diag-B]   ORIG_MEMBERS 에서 region='+focus+' = '+regCount+'명 (records 1건이상 = '+regActive+'명)');
+    console.log('[diag-B]   사이드바 (재적): records-active 기준 → '+regActive+'명');
+    console.log('[diag-B]   출결재적 카드: 특정 date 의 uniq id (members 무관, orphan 포함)');
+    console.log('[diag-B]   ∴ 차이 = stale '+focus+' members ('+stale.length+'명) + orphan record IDs ('+orphanIds.length+'명) 중 그 날 출석한 사람');
+    console.log('[diag-B]   12명 = (stale '+stale.length+') 가능 / orphan 도 contributing 가능 → console 캡처 후 추적');
+  }
+  setTimeout(runDiagB, 4000);
+  setTimeout(runDiagB, 8000);
+  setTimeout(runDiagB, 12000);
+})();
+</script>
+<!-- DIAG_B_12MEMBER_DIFF_END -->
+
+<!-- ADMIN_REGION_SWITCHER_C_START -->
+<style>
+  #ars-box{
+    display:none;
+    align-items:center;
+    gap:8px;
+    padding:8px 12px;
+    margin:8px 0;
+    background:var(--surface2);
+    border:1px solid var(--border);
+    border-radius:8px;
+    font-size:11.5px;
+    flex-wrap:wrap;
+  }
+  #ars-box.show{ display:flex; }
+  #ars-box label{ font-weight:700; color:var(--text2); white-space:nowrap; }
+  #ars-box select{
+    height:26px; padding:2px 8px; font-size:11.5px;
+    border:1px solid var(--border-md); border-radius:6px;
+    background:var(--surface); color:var(--text); font-family:var(--font);
+  }
+  #ars-status{ font-size:11px; color:var(--text3); margin-left:auto; }
+  #ars-box.viewing{ background:#fef3c7; border-color:#f59e0b; }
+  #ars-box.viewing #ars-status{ color:#92400e; font-weight:700; }
+</style>
+<script id="admin-region-switcher-c">
+(function(){
+  'use strict';
+  /* [C] 관리자 지역 필터 — UI 추가, 기존 logic 안 건드림.
+     applyActiveFilter 등 기존 함수를 호출만 함. data array 는 in-place 필터 (applyRegionFilter 와 같은 패턴). */
+
+  var REGIONS = ['도봉','성북','노원','중랑','강북','대학','이음','새신자','국제영어','국제중국어'];
+
+  function isAdmin(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(u.role === 'admin') return true;
+    return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+  }
+
+  /* ORIG snapshot — full 데이터 캡처 (admin 은 region filter 안 걸리므로 첫 8초간 max) */
+  var ORIG_M = null, ORIG_R = null;
+  function snapMax(){
+    var m = window.MEMBERS, r = window.RECORDS;
+    if(Array.isArray(m) && m.length && (!ORIG_M || m.length > ORIG_M.length)){
+      ORIG_M = m.slice();
+    }
+    if(Array.isArray(r) && r.length && (!ORIG_R || r.length > ORIG_R.length)){
+      ORIG_R = r.slice();
+    }
+  }
+  var snapCnt = 0;
+  var snapIv = setInterval(function(){
+    snapMax();
+    if(++snapCnt > 320) clearInterval(snapIv);
+  }, 25);
+
+  /* === UI 삽입 === */
+  function ensureUI(){
+    if(document.getElementById('ars-box')) return;
+    var ph = document.querySelector('#page-overview .ph');
+    if(!ph || !ph.parentNode) return;
+    var box = document.createElement('div');
+    box.id = 'ars-box';
+    var opts = '<option value="">전체</option>' + REGIONS.map(function(r){
+      return '<option value="'+r+'">'+r+'</option>';
+    }).join('');
+    box.innerHTML =
+      '<label>👑 관리자 지역 필터:</label>'+
+      '<select id="ars-sel">'+opts+'</select>'+
+      '<span id="ars-status">지금 보는 시점: 전체 (관리자)</span>';
+    ph.parentNode.insertBefore(box, ph.nextSibling);
+    var sel = document.getElementById('ars-sel');
+    if(sel) sel.addEventListener('change', function(e){ applyView(e.target.value || null); });
+  }
+  function setVisibility(){
+    var box = document.getElementById('ars-box');
+    if(!box) return;
+    box.classList.toggle('show', isAdmin());
+  }
+  setInterval(function(){ try{ ensureUI(); setVisibility(); }catch(e){} }, 500);
+
+  /* === view 적용 — in-place 필터 (기존 applyRegionFilter 와 같은 패턴) === */
+  function inplaceReplace(arr, newItems){
+    if(!Array.isArray(arr)) return;
+    arr.length = 0;
+    for(var i=0;i<newItems.length;i++) arr.push(newItems[i]);
+  }
+  function applyView(region){
+    if(!ORIG_M || !ORIG_R){
+      console.warn('[ars] ORIG snapshot not ready (data still loading)');
+      return;
+    }
+    /* 1) ORIG 으로 복원 (window.MEMBERS / RECORDS 참조 유지) */
+    if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+    if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
+    inplaceReplace(window.MEMBERS, ORIG_M);
+    inplaceReplace(window.RECORDS, ORIG_R);
+    try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS) && MEMBERS !== window.MEMBERS) inplaceReplace(MEMBERS, ORIG_M); }catch(e){}
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS !== window.RECORDS){
+        inplaceReplace(RECORDS, ORIG_R);
+        if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
+      }
+    }catch(e){}
+    /* FINAL_* 도 ORIG 백업이 있으면 복원 — 없으면 그대로 (변경 없음) */
+
+    /* 2) region 선택 시 in-place 필터 */
+    if(region){
+      var keepM = window.MEMBERS.filter(function(m){ return m && m.region === region; });
+      inplaceReplace(window.MEMBERS, keepM);
+      try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS) && MEMBERS !== window.MEMBERS) inplaceReplace(MEMBERS, keepM); }catch(e){}
+      var ids = {};
+      keepM.forEach(function(m){ if(m && m.id) ids[m.id] = 1; });
+      var keepR = window.RECORDS.filter(function(r){ return r && ids[r.id]; });
+      inplaceReplace(window.RECORDS, keepR);
+      try{
+        if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS !== window.RECORDS){
+          inplaceReplace(RECORDS, keepR);
+          if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
+        }
+      }catch(e){}
+      if(Array.isArray(window.FINAL_MEMBERS)){
+        var fm = window.FINAL_MEMBERS.filter(function(m){ return m && m.region === region; });
+        inplaceReplace(window.FINAL_MEMBERS, fm);
+      }
+      if(Array.isArray(window.FINAL_RECORDS)){
+        var fr = window.FINAL_RECORDS.filter(function(r){ return r && ids[r.id]; });
+        inplaceReplace(window.FINAL_RECORDS, fr);
+      }
+    }
+
+    /* 3) 기존 applyActiveFilter 호출 — records 0건 멤버 제거 */
+    try{ if(typeof window.applyActiveFilter === 'function') window.applyActiveFilter(); }catch(e){}
+
+    /* 4) 상태 표시 */
+    var status = document.getElementById('ars-status');
+    var box = document.getElementById('ars-box');
+    if(region){
+      if(status) status.textContent = '지금 보는 시점: '+region+' (일반 사용자 시점)';
+      if(box) box.classList.add('viewing');
+    } else {
+      if(status) status.textContent = '지금 보는 시점: 전체 (관리자)';
+      if(box) box.classList.remove('viewing');
+    }
+
+    /* 5) 재렌더 */
+    try{ if(typeof window.renderOverview === 'function') window.renderOverview(); }catch(e){}
+    try{
+      var active = document.querySelector('.page.active');
+      var pageId = active ? active.id.replace('page-','') : 'overview';
+      if(typeof window.renderPage === 'function') window.renderPage(pageId);
+    }catch(e){}
+    console.log('[ars] view='+(region||'전체')+' MEMBERS='+window.MEMBERS.length+' RECORDS='+window.RECORDS.length);
+  }
+  window.__arsApply = applyView;
+})();
+</script>
+<!-- ADMIN_REGION_SWITCHER_C_END -->
