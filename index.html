@@ -17092,3 +17092,120 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- ADMIN_REGION_SWITCHER_C_END -->
+
+<!-- CLEAN_RSN_5_17_START -->
+<script id="clean-rsn-5-17">
+(function(){
+  'use strict';
+  /* 5/17 records 의 rsn 청소 — st==='QR인증' 인데 rsn 에 'QR인증' 등이 잘못 복사된 경우.
+     반드시 dry-run → confirm → apply 2단계. */
+
+  var TARGET_DATE_SUFFIX = '_2026-05-17';
+  var pendingUpdates = null;
+
+  function fetchTargetRecords(){
+    return new Promise(function(resolve, reject){
+      if(!window.fbDB){
+        return reject(new Error('Firebase 초기화 안 됨 (window.fbDB 없음)'));
+      }
+      window.fbDB.ref('records').once('value').then(function(snap){
+        var all = snap.val() || {};
+        var hits = {};
+        Object.keys(all).forEach(function(key){
+          if(key.endsWith(TARGET_DATE_SUFFIX)){
+            hits[key] = all[key];
+          }
+        });
+        resolve(hits);
+      }).catch(reject);
+    });
+  }
+
+  /* === dry-run === */
+  window.__cleanRsn5_17 = function(){
+    console.log('[clean-rsn] === DRY-RUN 시작 (5/17 records fetch) ===');
+    fetchTargetRecords().then(function(recs){
+      var keys = Object.keys(recs);
+      console.log('[clean-rsn] 5/17 total Firebase records: '+keys.length+'건');
+
+      var toUpdate = [];
+      var stCounts = {};
+      keys.forEach(function(k){
+        var r = recs[k];
+        if(!r) return;
+        var st = r.st || '(없음)';
+        stCounts[st] = (stCounts[st]||0) + 1;
+        if(r.st === 'QR인증' && r.rsn != null && String(r.rsn).trim() !== ''){
+          toUpdate.push({
+            key: k,
+            id: r.id || '?',
+            st: r.st,
+            'rsn (현재)': String(r.rsn),
+            'rsn (변경 후)': ''
+          });
+        }
+      });
+
+      console.log('[clean-rsn] st 분포:', stCounts);
+      console.log('[clean-rsn] === DRY-RUN 결과 ===');
+      console.log('[clean-rsn] 변경 대상: '+toUpdate.length+'건 (st==="QR인증" AND rsn !== "")');
+
+      if(toUpdate.length){
+        if(typeof console.table === 'function') console.table(toUpdate.slice(0, 30));
+        else toUpdate.slice(0, 30).forEach(function(d){ console.log(JSON.stringify(d)); });
+        if(toUpdate.length > 30) console.log('[clean-rsn] ... +'+(toUpdate.length-30)+' more (총 '+toUpdate.length+'건)');
+      } else {
+        console.log('[clean-rsn] 변경 대상 0건 — 청소 불필요.');
+      }
+
+      pendingUpdates = toUpdate;
+      console.log('[clean-rsn] ============================================');
+      console.log('[clean-rsn] 위 명단 확인 후 적용:');
+      console.log('[clean-rsn]   window.__cleanRsn5_17_apply()');
+      console.log('[clean-rsn] (confirm dialog 한 번 더 뜸 · Firebase 영구 변경)');
+      console.log('[clean-rsn] ============================================');
+    }).catch(function(err){
+      console.error('[clean-rsn] fetch 실패:', err);
+    });
+  };
+
+  /* === apply === */
+  window.__cleanRsn5_17_apply = function(){
+    if(!pendingUpdates){
+      console.log('[clean-rsn] dry-run 먼저 실행 필요: window.__cleanRsn5_17()');
+      return;
+    }
+    if(!pendingUpdates.length){
+      console.log('[clean-rsn] pending 변경 없음.');
+      return;
+    }
+    if(!window.fbDB){
+      console.error('[clean-rsn] Firebase 초기화 안 됨');
+      return;
+    }
+    var msg = 'Firebase 5/17 records '+pendingUpdates.length+'건 의 rsn 을 "" 로 영구 변경합니다.\n'+
+              '원본 데이터가 변경됩니다. 진행하시겠습니까?';
+    if(!window.confirm(msg)){
+      console.log('[clean-rsn] 취소됨');
+      return;
+    }
+    console.log('[clean-rsn] 적용 시작: '+pendingUpdates.length+'건');
+    var updates = {};
+    pendingUpdates.forEach(function(d){
+      updates['records/'+d.key+'/rsn'] = '';
+    });
+    window.fbDB.ref().update(updates).then(function(){
+      console.log('[clean-rsn] ✓ Firebase batch update 완료: '+pendingUpdates.length+'건');
+      console.log('[clean-rsn] 페이지 새로고침 → 출결재적 카드 / 결석사유 분포 재확인 권장');
+      pendingUpdates = null;
+    }).catch(function(err){
+      console.error('[clean-rsn] update 실패:', err);
+    });
+  };
+
+  console.log('[clean-rsn] 5/17 rsn 청소 도구 노출됨');
+  console.log('[clean-rsn]   1. window.__cleanRsn5_17()       — dry-run (변경 X)');
+  console.log('[clean-rsn]   2. window.__cleanRsn5_17_apply() — 실제 적용 (confirm 필요)');
+})();
+</script>
+<!-- CLEAN_RSN_5_17_END -->
