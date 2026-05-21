@@ -17394,6 +17394,41 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     if(++snapCnt > 400) clearInterval(snapIv);
   }, 25);
 
+  /* Firebase 직접 fetch fallback — polling 이 ARS 필터 이후 데이터만 봐서 비어있을 때 */
+  var FB_M = null, FB_R = null, fbFetching = false;
+  function fbFetchOnce(){
+    if((FB_M && FB_R) || fbFetching) return Promise.resolve();
+    if(!window.fbDB) return Promise.resolve();
+    fbFetching = true;
+    return Promise.all([
+      window.fbDB.ref('members').once('value'),
+      window.fbDB.ref('records').once('value')
+    ]).then(function(snaps){
+      var mObj = snaps[0].val() || {};
+      var rObj = snaps[1].val() || {};
+      FB_M = []; Object.keys(mObj).forEach(function(k){ if(mObj[k]) FB_M.push(mObj[k]); });
+      FB_R = []; Object.keys(rObj).forEach(function(k){
+        var r = rObj[k];
+        if(!r) return;
+        /* id 가 비어있으면 key prefix 에서 추출 */
+        if(!r.id){
+          var idx = k.lastIndexOf('_');
+          if(idx > 0) r._idFromKey = k.substring(0, idx);
+        }
+        FB_R.push(r);
+      });
+      fbFetching = false;
+      console.log('[fix-region-cards] Firebase 직접 fetch 완료: members='+FB_M.length+' records='+FB_R.length);
+      setTimeout(function(){ try{ patchCards(); }catch(e){} }, 100);
+    }).catch(function(err){
+      fbFetching = false;
+      console.warn('[fix-region-cards] Firebase fetch 실패:', err);
+    });
+  }
+  /* 페이지 로드 후 1.5초 시점에 fetch 시도 (fbDB 초기화 완료 이후) */
+  setTimeout(fbFetchOnce, 1500);
+  setTimeout(fbFetchOnce, 4000); /* 재시도 */
+
   function effDateValue(){
     try{
       if(typeof window.effectiveOverviewDate === 'function'){
@@ -17422,12 +17457,14 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   function normId(v){ return String(v == null ? '' : v).replace(/[\s​-‏﻿]/g, '').trim(); }
 
   /* region 별 카드 5칸 값 재계산
-     ORIG_M.region → ORIG_R 매칭 시 id 정규화 (trim/공백) + r.id 또는 key prefix 양쪽 시도 */
+     소스 우선순위: FB_M/FB_R (Firebase 직접 fetch, 가장 신뢰) > ORIG_M/ORIG_R (polling) */
   function computeRegionCardValues(region){
-    if(!ORIG_M || !ORIG_R) return null;
+    var srcM = (FB_M && FB_M.length) ? FB_M : ORIG_M;
+    var srcR = (FB_R && FB_R.length) ? FB_R : ORIG_R;
+    if(!srcM || !srcR) return null;
     var dateVal = normDate(effDateValue());
     if(!dateVal) return null;
-    var memInRegion = ORIG_M.filter(function(m){ return m && m.region === region; });
+    var memInRegion = srcM.filter(function(m){ return m && m.region === region; });
     if(!memInRegion.length) return null;
     var memIds = {};
     memInRegion.forEach(function(m){
@@ -17437,11 +17474,12 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var total = memInRegion.length;
     var qr = 0, sa = 0, ab = 0;
     var dateMatch = 0, idMatch = 0;
-    ORIG_R.forEach(function(r){
+    srcR.forEach(function(r){
       if(!r) return;
       if(normDate(r.date) !== dateVal) return;
       dateMatch++;
-      var rid = normId(r.id);
+      /* r.id 또는 r._idFromKey (key prefix 추출본) 양쪽 시도 */
+      var rid = normId(r.id || r._idFromKey);
       if(!rid || !memIds[rid]) return;
       idMatch++;
       if(r.st === 'QR인증') qr++;
@@ -17449,48 +17487,55 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       else if(r.st === '사유결석') ab++;
     });
     var rate = total ? Math.round((qr+sa)/total*1000)/10 : 0;
-    return { total:total, qr:qr, sa:sa, ab:ab, rate:rate, dateMatch:dateMatch, idMatch:idMatch };
+    return {
+      total:total, qr:qr, sa:sa, ab:ab, rate:rate,
+      dateMatch:dateMatch, idMatch:idMatch,
+      source: (srcM === FB_M ? 'FB' : 'ORIG')
+    };
   }
 
   /* idMatch=0 인 경우 진단 출력 — 한 번만 */
   var diagPrinted = false;
   function diagIdMismatch(region){
     if(diagPrinted) return;
-    if(!ORIG_M || !ORIG_R) return;
+    var srcM = (FB_M && FB_M.length) ? FB_M : ORIG_M;
+    var srcR = (FB_R && FB_R.length) ? FB_R : ORIG_R;
+    if(!srcM || !srcR) return;
     var dateVal = normDate(effDateValue());
     if(!dateVal) return;
-    var memInRegion = ORIG_M.filter(function(m){ return m && m.region === region; });
-    var dateRecs = ORIG_R.filter(function(r){ return r && normDate(r.date) === dateVal; });
-    console.log('[fix-region-cards/diag] === id mismatch 진단 ===');
-    console.log('[fix-region-cards/diag] '+region+' MEMBERS '+memInRegion.length+' 명, 5/17 records '+dateRecs.length+'건');
+    var memInRegion = srcM.filter(function(m){ return m && m.region === region; });
+    var dateRecs = srcR.filter(function(r){ return r && normDate(r.date) === dateVal; });
+    var source = (srcM === FB_M ? 'FB' : 'ORIG');
+    console.log('[fix-region-cards/diag] === id mismatch 진단 (source='+source+') ===');
+    console.log('[fix-region-cards/diag] '+region+' MEMBERS '+memInRegion.length+' 명, '+dateVal+' records '+dateRecs.length+'건');
     console.log('[fix-region-cards/diag] MEMBERS id 샘플 5:');
     memInRegion.slice(0, 5).forEach(function(m, i){
       console.log('  '+(i+1)+'. id='+JSON.stringify(m.id)+' name='+(m.name||'?')+' region='+m.region);
     });
-    console.log('[fix-region-cards/diag] 5/17 records id 샘플 5:');
+    console.log('[fix-region-cards/diag] '+dateVal+' records id 샘플 5:');
     dateRecs.slice(0, 5).forEach(function(r, i){
-      console.log('  '+(i+1)+'. id='+JSON.stringify(r.id)+' date='+r.date+' st='+r.st);
+      console.log('  '+(i+1)+'. id='+JSON.stringify(r.id)+' _idFromKey='+JSON.stringify(r._idFromKey)+' date='+r.date+' st='+r.st);
     });
-    /* 5/17 records.id 가 ORIG_M 어디든 매칭되는지 — region 무관 */
-    var origMemAll = {};
-    ORIG_M.forEach(function(m){ if(m && m.id) origMemAll[normId(m.id)] = m; });
+    /* 매칭 검사 — region 무관 */
+    var srcMemAll = {};
+    srcM.forEach(function(m){ if(m && m.id) srcMemAll[normId(m.id)] = m; });
     var matchAny = 0, matchRegion = 0, unmatched = 0;
     var unmatchedSample = [];
     dateRecs.forEach(function(r){
-      var rid = normId(r.id);
-      if(!rid){ unmatched++; if(unmatchedSample.length<5) unmatchedSample.push({id:r.id, st:r.st}); return; }
-      var m = origMemAll[rid];
+      var rid = normId(r.id || r._idFromKey);
+      if(!rid){ unmatched++; if(unmatchedSample.length<5) unmatchedSample.push({id:r.id, _idFromKey:r._idFromKey, st:r.st}); return; }
+      var m = srcMemAll[rid];
       if(m){
         matchAny++;
         if(m.region === region) matchRegion++;
       } else {
         unmatched++;
-        if(unmatchedSample.length<5) unmatchedSample.push({id:r.id, st:r.st, normalized:rid});
+        if(unmatchedSample.length<5) unmatchedSample.push({id:r.id, _idFromKey:r._idFromKey, st:r.st, normalized:rid});
       }
     });
-    console.log('[fix-region-cards/diag] 5/17 records → ORIG_M 매칭: 전체 region '+matchAny+' / '+region+' region '+matchRegion+' / 매칭 안됨 '+unmatched);
+    console.log('[fix-region-cards/diag] '+dateVal+' records → srcM 매칭: 전체 region '+matchAny+' / '+region+' region '+matchRegion+' / 매칭 안됨 '+unmatched);
     if(unmatchedSample.length){
-      console.log('[fix-region-cards/diag] 매칭 안 되는 records id 샘플:');
+      console.log('[fix-region-cards/diag] 매칭 안 되는 records 샘플:');
       unmatchedSample.forEach(function(s, i){ console.log('  '+(i+1)+'.', s); });
     }
     diagPrinted = true;
@@ -17519,11 +17564,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       changed = true;
     });
     if(changed){
-      console.log('[fix-region-cards] region='+region+' date='+normDate(effDateValue())+' total='+v.total+' QR='+v.qr+' SA='+v.sa+' AB='+v.ab+' rate='+v.rate+'%');
+      console.log('[fix-region-cards] region='+region+' date='+normDate(effDateValue())+' source='+(v.source||'?')+' total='+v.total+' QR='+v.qr+' SA='+v.sa+' AB='+v.ab+' rate='+v.rate+'% (dateMatch='+v.dateMatch+' idMatch='+v.idMatch+')');
     }
-    /* QR/SA/AB 합계 0 인데 dateMatch>0 인 경우 → id mismatch. 진단 출력 */
-    if(v && v.idMatch === 0 && v.dateMatch > 0){
+    /* dateMatch=0 (records 캡처 못함) 또는 idMatch=0 (매칭 실패) → 진단 출력 */
+    if(v && (v.dateMatch === 0 || v.idMatch === 0)){
       try{ diagIdMismatch(region); }catch(e){}
+      /* Firebase fetch 아직 안 됐으면 fetch 트리거 */
+      if(!FB_R) try{ fbFetchOnce(); }catch(e){}
     }
   }
 
