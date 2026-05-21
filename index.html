@@ -17368,3 +17368,58 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- DIAG_5_17_VS_4_19_END -->
+
+<!-- FIX_OV_FIRST_CARD_TOTAL_START -->
+<script id="fix-ov-first-card-total">
+(function(){
+  'use strict';
+  /* 가장 작은 변경 —
+     출결 재적 (#ov-metrics 첫 카드) total 만 MEMBERS.length 로 보정.
+     단, 현재 표시값이 MEMBERS.length 이상이면 유지 (전체 view 1617 보존).
+     QR/SA/AB/% 등 다른 4개 카드는 절대 손대지 않음.
+     renderOverview 안 부름 → 회귀 X. */
+
+  function patchFirstCardTotal(){
+    var ovm = document.getElementById('ov-metrics');
+    if(!ovm) return;
+    var firstMc = ovm.querySelector('.v28-mc');
+    if(!firstMc) return;
+    var firstLbl = firstMc.querySelector('.v28-lbl');
+    if(!firstLbl) return;
+    var lblTxt = String(firstLbl.textContent||'').trim();
+    if(lblTxt.indexOf('출결 재적') !== 0) return; /* 첫 카드 라벨 일치 시만 */
+    var firstNum = firstMc.querySelector('.v28-num');
+    if(!firstNum) return;
+    var members = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var target = members.length;
+    if(!target) return;
+    var curNumStr = String(firstNum.textContent||'').replace(/[^\d]/g,'');
+    var curNum = parseInt(curNumStr, 10) || 0;
+    /* 현재값이 MEMBERS 이상이면 그대로 유지 — 전체 view 1617 보존 */
+    if(curNum >= target) return;
+    /* 현재값 < target → 0 같은 비정상 값. MEMBERS.length 로 보정 */
+    firstNum.innerHTML = target + '<small>명</small>';
+  }
+
+  var attached = false;
+  function attach(){
+    if(attached) return;
+    var ovm = document.getElementById('ov-metrics');
+    if(!ovm){ setTimeout(attach, 200); return; }
+    attached = true;
+    var pending = false;
+    var mo = new MutationObserver(function(){
+      if(pending) return;
+      pending = true;
+      setTimeout(function(){
+        try{ patchFirstCardTotal(); }catch(e){}
+        pending = false;
+      }, 0);
+    });
+    mo.observe(ovm, { childList:true, subtree:true });
+    [200, 600, 1500, 3000, 5000, 8000].forEach(function(t){ setTimeout(patchFirstCardTotal, t); });
+  }
+  attach();
+})();
+</script>
+<!-- FIX_OV_FIRST_CARD_TOTAL_END -->
