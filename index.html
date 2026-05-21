@@ -17028,3 +17028,203 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- REGION_DIAGNOSTIC_V3_END -->
+
+<!-- ADMIN_REGION_SWITCHER_START -->
+<style>
+  #admin-region-switcher{
+    display:none;
+    align-items:center;
+    gap:8px;
+    padding:8px 12px;
+    margin:8px 0 4px;
+    background:var(--surface2);
+    border:1px solid var(--border);
+    border-radius:var(--rsm);
+    font-size:11.5px;
+  }
+  #admin-region-switcher.show{ display:flex; }
+  #admin-region-switcher label{ font-weight:700; color:var(--text2); white-space:nowrap; }
+  #admin-region-switcher select{
+    height:26px; padding:2px 8px; font-size:11.5px;
+    border:1px solid var(--border-md); border-radius:6px;
+    background:var(--surface); color:var(--text); font-family:var(--font);
+  }
+  #admin-region-switcher .ars-status{
+    font-size:11px; color:var(--text3); margin-left:auto;
+  }
+  #admin-region-switcher.viewing-region{ background:#fef3c7; border-color:#f59e0b; }
+  #admin-region-switcher.viewing-region .ars-status{ color:#92400e; font-weight:700; }
+</style>
+<script id="admin-region-switcher-js">
+(function(){
+  'use strict';
+  /* [admin-region-switcher]
+     관리자(witpire@gmail.com) 전용 드롭다운으로
+     "전체 보기 / 도봉 / 성북 / 노원 / 중랑 / 강북 / 대학 / 이음 / 새신자 / 국제영어 / 국제중국어"
+     선택 시 그 지역만 보이는 일반 사용자 시점으로 전환. */
+
+  var REGIONS = ['도봉','성북','노원','중랑','강북','대학','이음','새신자','국제영어','국제중국어'];
+
+  function isAdminUser(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(u.role === 'admin') return true;
+    return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+  }
+
+  /* === ORIGINAL_MEMBERS / ORIGINAL_RECORDS snapshot === */
+  var ORIG_M = null, ORIG_R = null;
+  function snapAll(){
+    if(!ORIG_M && Array.isArray(window.MEMBERS) && window.MEMBERS.length){
+      ORIG_M = window.MEMBERS.slice();
+      window.__ORIG_MEMBERS = ORIG_M;
+    }
+    if(!ORIG_R && Array.isArray(window.RECORDS) && window.RECORDS.length){
+      ORIG_R = window.RECORDS.slice();
+      window.__ORIG_RECORDS = ORIG_R;
+    }
+  }
+  /* 폴링 — 첫 8초간 (admin 은 region filter 안 걸리므로 full 데이터 캡처) */
+  var tries = 0;
+  var iv = setInterval(function(){
+    snapAll();
+    if(ORIG_M && ORIG_R) clearInterval(iv);
+    if(++tries > 320) clearInterval(iv);
+  }, 25);
+
+  /* === 드롭다운 UI 삽입 === */
+  function ensureUI(){
+    if(document.getElementById('admin-region-switcher')) return;
+    /* page-overview 상단(.ph 다음)에 삽입 */
+    var ph = document.querySelector('#page-overview .ph');
+    if(!ph || !ph.parentNode) return;
+    var div = document.createElement('div');
+    div.id = 'admin-region-switcher';
+    var opts = ['<option value="">전체 보기</option>']
+      .concat(REGIONS.map(function(r){ return '<option value="'+r+'">'+r+'</option>'; }))
+      .join('');
+    div.innerHTML =
+      '<label>👑 관리자 지역 필터:</label>'+
+      '<select id="ars-select">'+opts+'</select>'+
+      '<span class="ars-status" id="ars-status">현재: 전체 보기 (관리자 시점)</span>';
+    ph.parentNode.insertBefore(div, ph.nextSibling);
+    div.querySelector('#ars-select').addEventListener('change', onSelect);
+  }
+  function setVisibility(){
+    var el = document.getElementById('admin-region-switcher');
+    if(!el) return;
+    el.classList.toggle('show', isAdminUser());
+  }
+  /* 폴링 */
+  setInterval(function(){ try{ ensureUI(); setVisibility(); }catch(e){} }, 500);
+
+  /* === 적용 logic === */
+  function restoreFromOriginal(){
+    if(!ORIG_M || !ORIG_R) return false;
+    /* window.MEMBERS / RECORDS in-place 복원 */
+    if(Array.isArray(window.MEMBERS)){
+      window.MEMBERS.length = 0;
+      for(var i=0;i<ORIG_M.length;i++) window.MEMBERS.push(ORIG_M[i]);
+    } else window.MEMBERS = ORIG_M.slice();
+    if(Array.isArray(window.RECORDS)){
+      window.RECORDS.length = 0;
+      for(var j=0;j<ORIG_R.length;j++) window.RECORDS.push(ORIG_R[j]);
+    } else window.RECORDS = ORIG_R.slice();
+    /* 모듈 lexical 도 복원 — nav() 가 100 미만이면 reload 시도 */
+    try{
+      if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+        MEMBERS.length = 0;
+        for(var k=0;k<ORIG_M.length;k++) MEMBERS.push(ORIG_M[k]);
+      }
+    }catch(e){}
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+        RECORDS.length = 0;
+        for(var p=0;p<ORIG_R.length;p++) RECORDS.push(ORIG_R[p]);
+        if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
+      }
+    }catch(e){}
+    return true;
+  }
+
+  function applyOverride(region){
+    if(!ORIG_M || !ORIG_R){
+      console.warn('[ars] ORIG not ready');
+      return;
+    }
+    /* 1) 원본 복원 */
+    restoreFromOriginal();
+    /* 2) override 세팅 */
+    window.__overrideRegion = region || null;
+    /* 3) region filter 강제 적용 (admin 도 override 가 있으면 region 사용자처럼 동작) */
+    if(region){
+      /* in-place 필터 */
+      var keepM = window.MEMBERS.filter(function(m){ return m && m.region === region; });
+      window.MEMBERS.length = 0;
+      keepM.forEach(function(m){ window.MEMBERS.push(m); });
+      try{
+        if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+          MEMBERS.length = 0;
+          keepM.forEach(function(m){ MEMBERS.push(m); });
+        }
+      }catch(e){}
+      var ids = {};
+      keepM.forEach(function(m){ if(m && m.id) ids[m.id] = 1; });
+      var keepR = window.RECORDS.filter(function(r){ return r && ids[r.id]; });
+      window.RECORDS.length = 0;
+      keepR.forEach(function(r){ window.RECORDS.push(r); });
+      try{
+        if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+          RECORDS.length = 0;
+          keepR.forEach(function(r){ RECORDS.push(r); });
+          if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
+        }
+      }catch(e){}
+      /* FINAL_* 도 동기화 */
+      if(Array.isArray(window.FINAL_MEMBERS)){
+        var keepFM = window.FINAL_MEMBERS.filter(function(m){ return m && m.region === region; });
+        window.FINAL_MEMBERS.length = 0;
+        keepFM.forEach(function(m){ window.FINAL_MEMBERS.push(m); });
+      }
+      if(Array.isArray(window.FINAL_RECORDS)){
+        var keepFR = window.FINAL_RECORDS.filter(function(r){ return r && ids[r.id]; });
+        window.FINAL_RECORDS.length = 0;
+        keepFR.forEach(function(r){ window.FINAL_RECORDS.push(r); });
+      }
+    }
+    /* 4) active filter 적용 (있으면) — records 무 멤버 제거 */
+    try{
+      if(typeof window.applyActiveFilter === 'function') window.applyActiveFilter();
+    }catch(e){ console.warn('[ars] active filter', e); }
+    /* 5) 상태 표시 */
+    var statusEl = document.getElementById('ars-status');
+    var box = document.getElementById('admin-region-switcher');
+    if(region){
+      if(statusEl) statusEl.textContent = '현재 보는 시점: '+region+' (일반 사용자 시점)';
+      if(box) box.classList.add('viewing-region');
+    } else {
+      if(statusEl) statusEl.textContent = '현재: 전체 보기 (관리자 시점)';
+      if(box) box.classList.remove('viewing-region');
+    }
+    /* 6) 재렌더 */
+    try{
+      if(typeof window.renderOverview === 'function') window.renderOverview();
+    }catch(e){}
+    /* 다른 활성 page 도 같이 refresh */
+    try{
+      var active = document.querySelector('.page.active');
+      var pageId = active ? active.id.replace('page-','') : 'overview';
+      if(typeof window.renderPage === 'function') window.renderPage(pageId);
+    }catch(e){}
+    console.log('[ars] override='+(region||'(전체)')+' MEMBERS='+window.MEMBERS.length+' RECORDS='+window.RECORDS.length);
+  }
+  window.__arsApply = applyOverride;
+
+  function onSelect(e){
+    var v = e.target.value || '';
+    applyOverride(v || null);
+  }
+
+})();
+</script>
+<!-- ADMIN_REGION_SWITCHER_END -->
