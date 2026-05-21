@@ -17209,3 +17209,162 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- CLEAN_RSN_5_17_END -->
+
+<!-- DIAG_5_17_VS_4_19_START -->
+<script id="diag-5-17-vs-4-19">
+(function(){
+  'use strict';
+  /* 진단 only · 데이터 변경 X · Firebase 변경 X.
+     - window.MEMBERS region 분포
+     - 5/17 vs 4/19 records 비교 (raw Firebase + window.RECORDS)
+     - 5/17 records.id 가 MEMBERS.id 와 매칭되는지 검사 */
+
+  function normDate(d){
+    d = String(d||'').slice(0,10);
+    var m = d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if(m) return m[1]+'-'+String(+m[2]).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0');
+    return d;
+  }
+
+  function distByRegion(members){
+    var d = {};
+    members.forEach(function(m){
+      if(!m) return;
+      var r = m.region == null ? '(null)' : (String(m.region).trim() || '(empty)');
+      d[r] = (d[r]||0) + 1;
+    });
+    return d;
+  }
+
+  function diagMembersInMemory(){
+    var members = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var dist = distByRegion(members);
+    console.log('[diag-bug] === window.MEMBERS region 분포 ('+members.length+') ===');
+    console.table(dist);
+    if(members.length){
+      console.log('[diag-bug] MEMBERS 샘플 5건:');
+      members.slice(0,5).forEach(function(m,i){
+        console.log('  '+(i+1)+'.', { id: m.id, name: m.name, region: m.region, type: m.type, team: m.team });
+      });
+    }
+  }
+
+  function diagInMemoryRecords(){
+    var records = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var byDate = {};
+    records.forEach(function(r){
+      if(!r) return;
+      var d = normDate(r.date);
+      byDate[d] = (byDate[d]||0) + 1;
+    });
+    var keys = Object.keys(byDate).sort();
+    console.log('[diag-bug] === window.RECORDS by date (total '+records.length+') ===');
+    var tail = keys.slice(-10).reduce(function(a,k){ a[k] = byDate[k]; return a; }, {});
+    console.table(tail);
+  }
+
+  function fetchRawSample(){
+    return new Promise(function(resolve, reject){
+      if(!window.fbDB) return reject(new Error('Firebase 초기화 안 됨'));
+      window.fbDB.ref('records').once('value').then(function(snap){
+        var all = snap.val() || {};
+        resolve(all);
+      }).catch(reject);
+    });
+  }
+
+  function compareDates(allRecs, idsInMembersByRegion){
+    var dates = ['2026-05-17', '2026-04-19'];
+    dates.forEach(function(date){
+      var suf = '_'+date;
+      var hits = [];
+      Object.keys(allRecs).forEach(function(k){
+        if(k.endsWith(suf)) hits.push({ key:k, rec:allRecs[k] });
+      });
+      console.log('[diag-bug] === Firebase records ending with '+suf+' = '+hits.length+'건 ===');
+      if(!hits.length) return;
+      var sample3 = hits.slice(0,3);
+      sample3.forEach(function(h, i){
+        console.log('  sample #'+(i+1)+' key='+h.key+':', h.rec);
+        console.log('     keys:', Object.keys(h.rec));
+      });
+      /* id 매칭 검사 — 5/17 vs MEMBERS */
+      var memIds = idsInMembersByRegion.all;
+      var matchAll = 0, missAll = 0;
+      var matchKangbuk = 0, missKangbuk = 0;
+      var kbIds = idsInMembersByRegion.강북 || {};
+      var missList = [];
+      hits.forEach(function(h){
+        var r = h.rec;
+        var rid = String(r && r.id || '');
+        /* key 에서도 id 추출 */
+        var keyId = h.key.replace(suf, '');
+        var idFromKey = String(keyId);
+        var effectiveId = rid || idFromKey;
+        if(memIds[effectiveId]) matchAll++; else { missAll++; if(missList.length<10) missList.push({ keyId: idFromKey, recId: rid, rec_region: r && r.region, rec_st: r && r.st }); }
+        if(kbIds[effectiveId]) matchKangbuk++; else missKangbuk++;
+      });
+      console.log('  → MEMBERS 전체 id 매칭: '+matchAll+' 매칭 / '+missAll+' 불일치');
+      console.log('  → MEMBERS 강북 id 매칭: '+matchKangbuk+' 매칭 / '+missKangbuk+' 불일치');
+      if(missList.length){
+        console.log('  → 불일치 샘플 (최대 10):');
+        console.table(missList);
+      }
+    });
+  }
+
+  window.__diagBug = function(){
+    console.log('[diag-bug] ============================================');
+    console.log('[diag-bug] 강북 카운트 0 버그 진단 시작');
+    console.log('[diag-bug] ============================================');
+
+    /* in-memory state */
+    diagMembersInMemory();
+    diagInMemoryRecords();
+
+    /* build MEMBERS ID lookup by region */
+    var members = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var idsByRegion = { all:{} };
+    members.forEach(function(m){
+      if(!m || !m.id) return;
+      var id = String(m.id);
+      idsByRegion.all[id] = 1;
+      var r = String(m.region||'').trim() || '(empty)';
+      if(!idsByRegion[r]) idsByRegion[r] = {};
+      idsByRegion[r][id] = 1;
+    });
+    console.log('[diag-bug] MEMBERS region 별 unique id 수:');
+    var summary = {};
+    Object.keys(idsByRegion).forEach(function(r){ summary[r] = Object.keys(idsByRegion[r]).length; });
+    console.table(summary);
+
+    /* raw Firebase fetch — 5/17 vs 4/19 */
+    fetchRawSample().then(function(allRecs){
+      var totalRecs = Object.keys(allRecs).length;
+      console.log('[diag-bug] Firebase records total: '+totalRecs+'건');
+      compareDates(allRecs, idsByRegion);
+
+      /* sample 양지윤 (00100502-00016) — 사용자 언급한 verified case */
+      var YJ = '00100502-00016';
+      var yjMem = members.filter(function(m){ return String(m && m.id) === YJ; });
+      console.log('[diag-bug] === 양지윤 ('+YJ+') 검증 ===');
+      console.log('  MEMBERS:', yjMem.length ? yjMem[0] : '(없음)');
+      var yjRec517 = allRecs[YJ+'_2026-05-17'];
+      var yjRec419 = allRecs[YJ+'_2026-04-19'];
+      console.log('  Firebase 2026-05-17 record:', yjRec517 || '(없음)');
+      console.log('  Firebase 2026-04-19 record:', yjRec419 || '(없음)');
+
+      console.log('[diag-bug] ============================================');
+      console.log('[diag-bug] 진단 끝 — 위 결과 console 캡처 후 보고');
+      console.log('[diag-bug] ============================================');
+    }).catch(function(err){
+      console.error('[diag-bug] Firebase fetch 실패:', err);
+    });
+  };
+
+  console.log('[diag-bug] 강북 카운트 0 버그 진단 도구 노출됨');
+  console.log('[diag-bug]   실행: window.__diagBug()');
+  console.log('[diag-bug]   read-only, Firebase 변경 X, 데이터 변경 X');
+})();
+</script>
+<!-- DIAG_5_17_VS_4_19_END -->
