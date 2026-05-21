@@ -9137,8 +9137,8 @@ body.v97-data-loading #login-screen{z-index:9999;}
   }
   function finalCounts(){
     var c=calculatedCounts();
-    // 전체 관리자 화면에서 데이터 파싱/렌더 순서 때문에 계산이 덜 잡히면 요청 기준값으로 보정
-    if(c.total!==DESIRED.total) return DESIRED;
+    /* DESIRED fallback 제거 — region user 가 admin 전체 합계(192) 를 보게 되는 버그 차단.
+       실제 계산값 그대로 사용. */
     return c;
   }
 
@@ -9156,16 +9156,16 @@ body.v97-data-loading #login-screen{z-index:9999;}
     var sm=document.getElementById('sk-metrics');
     if(sm){
       sm.innerHTML = [
-        metricHtml('일반 4회↑', c.normal, 'var(--amber)'),
-        metricHtml('가족 8회↑', c.family, 'var(--red)'),
-        metricHtml('가족외 8회↑', c.familyOut, 'var(--red)'),
+        metricHtml('일반 3회↑', c.normal, 'var(--amber)'),
+        metricHtml('가족 7회↑', c.family, 'var(--red)'),
+        metricHtml('가족외 7회↑', c.familyOut, 'var(--red)'),
         metricHtml('주의 합계', c.total, 'var(--amber)')
       ].join('');
     }
     var sc=document.getElementById('sk-content');
     if(sc) sc.innerHTML='<div class="empty" style="padding:18px">명단은 표시하지 않고 상단 수치만 확인합니다.</div>';
     var ph=document.querySelector('#page-streak .ph p');
-    if(ph) ph.textContent='기준: 일반 4회 이상 · 가족·가족외 8회 이상';
+    if(ph) ph.textContent='기준: 일반 3회 이상 · 가족·가족외 7회 이상';
     patchWarningCards();
   };
 
@@ -16627,3 +16627,176 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- STREAK_LABEL_FIX_END -->
+
+<!-- ACTIVE_MEMBER_FILTER_START -->
+<script id="active-member-filter">
+(function(){
+  'use strict';
+  /* [1] 재적 logic: members.region + "records 1회 이상" 양쪽 조건.
+     applyRegionFilter 직후 추가 필터로 records 없는 12명 제외.
+     [3] 가족·가족외 메뉴 admin 외 숨김.
+     [4] 디버그 로그. */
+
+  function isAdminUser(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(u.role === 'admin') return true;
+    return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+  }
+  function isRegionUser(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(isAdminUser()) return false;
+    return !!u.region;
+  }
+  function userRegion(){
+    var u = window.currentUser;
+    return (u && u.region) ? String(u.region).trim() : '';
+  }
+
+  function filterArrInPlace(arr, predicate){
+    if(!Array.isArray(arr)) return false;
+    var keep = arr.filter(predicate);
+    if(keep.length === arr.length) return false;
+    arr.length = 0;
+    for(var i=0;i<keep.length;i++) arr.push(keep[i]);
+    return true;
+  }
+
+  /* records 에 1회 이상 등장하는 id set */
+  function activeIdSet(){
+    var s = {};
+    var rs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    for(var i=0;i<rs.length;i++){
+      var r = rs[i];
+      if(r && r.id) s[r.id] = 1;
+    }
+    return s;
+  }
+
+  /* MEMBERS 에서 records 없는 멤버 제외. admin / region 공통 적용. */
+  function applyActiveFilter(){
+    var actives = activeIdSet();
+    var region = isRegionUser() ? userRegion() : null;
+    var before = (Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0);
+    filterArrInPlace(window.MEMBERS, function(m){
+      if(!m || !m.id) return false;
+      if(region && m.region !== region) return false;
+      return !!actives[m.id];
+    });
+    try{
+      if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+        filterArrInPlace(MEMBERS, function(m){
+          if(!m || !m.id) return false;
+          if(region && m.region !== region) return false;
+          return !!actives[m.id];
+        });
+      }
+    }catch(e){}
+    filterArrInPlace(window.FINAL_MEMBERS, function(m){
+      if(!m || !m.id) return false;
+      if(region && m.region !== region) return false;
+      return !!actives[m.id];
+    });
+    var after = (Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0);
+    /* [4] active count 디버그 로그 */
+    var rsCount = Object.keys(actives).length;
+    console.log('[active-count] region='+(region||'admin')+' members='+before+' records-active='+rsCount+' total-active='+after);
+  }
+  window.applyActiveFilter = applyActiveFilter;
+
+  /* 모든 주요 render 함수 wrap — 호출 직전에 active 필터 추가 적용
+     (applyRegionFilter 뒤에 실행되어 region + active 양쪽 조건 만족) */
+  var TARGETS = [
+    'renderOverview','renderOverviewNow','renderOverviewExtra',
+    'renderStatSum','renderRegionCards','renderTeamStat','renderZoneStat',
+    'renderFamilyWorship','renderHabit','renderLongAbsent',
+    'renderWeekCompare','renderStreak'
+  ];
+  function wrapOne(name){
+    var orig = window[name];
+    if(typeof orig !== 'function') return false;
+    if(orig.__activeFilterWrapped) return true;
+    var wrapped = function(){
+      try{ applyActiveFilter(); }catch(e){}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__activeFilterWrapped = true;
+    /* 모든 marker 박아 다른 패치 재-wrap 차단 */
+    wrapped.__roleFilterWrapped = true;
+    wrapped.__llfCoalesced = true;
+    wrapped.__llfWrapped = true;
+    wrapped.__perfWrapped = true;
+    wrapped.__v86_fast = true;
+    wrapped.__ovRebuildWrapped = true;
+    wrapped.__stage2Hooked = true;
+    wrapped.__memSyncWrapped = true;
+    window[name] = wrapped;
+    return true;
+  }
+  function wrapAll(){ TARGETS.forEach(wrapOne); }
+  wrapAll();
+  var t=0;
+  var iv=setInterval(function(){
+    var anyNew = false;
+    TARGETS.forEach(function(n){
+      if(typeof window[n] === 'function' && !window[n].__activeFilterWrapped){
+        wrapOne(n); anyNew = true;
+      }
+    });
+    if(++t > 300 && !anyNew) clearInterval(iv);
+  }, 50);
+
+  /* 초기 데이터 sync 후 자동 트리거 */
+  setTimeout(applyActiveFilter, 1200);
+  setTimeout(applyActiveFilter, 3200);
+  setTimeout(applyActiveFilter, 6200);
+
+  /* [3] 가족·가족외 예배현황 메뉴 — admin 외 사이드바에서 숨김 */
+  function hideFamilyMenuForNonAdmin(){
+    if(isAdminUser()) {
+      /* admin 은 표시 */
+      var btns = document.querySelectorAll(".nav-item[onclick*=\"'family'\"]");
+      btns.forEach(function(b){ b.style.display = ''; });
+      return;
+    }
+    if(!window.currentUser) return; /* auth 아직 미확정 */
+    var btns = document.querySelectorAll(".nav-item[onclick*=\"'family'\"]");
+    btns.forEach(function(b){ b.style.display = 'none'; });
+  }
+  setInterval(hideFamilyMenuForNonAdmin, 500);
+
+  /* [4] warning count 디버그 로그 — v78/v77 calcCounts 후 1회씩 */
+  function logWarningCount(){
+    try{
+      var members = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+      var records = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+      /* 같은 임계값으로 직접 계산 */
+      var skMap = {};
+      records.forEach(function(r){
+        if(!r || !r.id) return;
+        var sk = Number(r.streak) || 0;
+        if(sk > (skMap[r.id] || 0)) skMap[r.id] = sk;
+      });
+      var normal = 0, family = 0, familyOut = 0;
+      members.forEach(function(m){
+        if(!m || !m.id) return;
+        var t = String(m.type||'').trim();
+        if(t.indexOf('가족외') >= 0) t = '가족외';
+        else if(t.indexOf('가족') >= 0) t = '가족';
+        else t = '일반';
+        var sk = skMap[m.id] || 0;
+        if(t === '일반' && sk >= 3) normal++;
+        else if(t === '가족' && sk >= 7) family++;
+        else if(t === '가족외' && sk >= 7) familyOut++;
+      });
+      var total = normal + family + familyOut;
+      var region = isRegionUser() ? userRegion() : 'admin';
+      console.log('[warning-count] criteria={일반:3, 가족외:7, 가족:7} total='+total+' (일반:'+normal+', 가족:'+family+', 가족외:'+familyOut+') region='+region);
+    }catch(e){}
+  }
+  setTimeout(logWarningCount, 2000);
+  setTimeout(logWarningCount, 5000);
+})();
+</script>
+<!-- ACTIVE_MEMBER_FILTER_END -->
