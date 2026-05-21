@@ -9310,7 +9310,9 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
       else if(t==='가족외' && sk>=7)c.familyOut++;
     });
     c.total=c.normal+c.family+c.familyOut;
-    return c.total===DESIRED.total ? c : DESIRED;
+    /* DESIRED fallback 제거 — region user 가 admin 전체 합계 (192) 를 보게 되는 버그.
+       실제 계산값을 그대로 사용. admin / region 모두 해당 데이터 기반으로 동작. */
+    return c;
   }
   function metric(label,value,color){
     return '<div class="mc"><div class="lbl">'+label+'</div><div class="val" style="color:'+color+'">'+value+'<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div></div>';
@@ -16430,3 +16432,198 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- OV_METRICS_REBUILD_END -->
+
+<!-- USER_ROLE_FILTER_START -->
+<script id="user-role-filter">
+(function(){
+  'use strict';
+  /* 역할 기반 데이터 필터링
+     - admin: 전체 데이터 (필터 안 함)
+     - region 사용자: MEMBERS / RECORDS / window.* 를 자기 region 으로 in-place 필터
+
+     매 render 직전에 applyRegionFilter() 호출 — applyFinalData/Step2 등이
+     데이터를 reset 해도 render 시 다시 필터됨. */
+
+  function isRegionUser(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(u.role === 'admin') return false;
+    var email = String(u.email||'').toLowerCase();
+    if(email === 'witpire@gmail.com') return false; /* bootstrap admin */
+    return !!u.region;
+  }
+  function userRegion(){
+    var u = window.currentUser;
+    return (u && u.region) ? String(u.region).trim() : '';
+  }
+
+  function filterArrInPlace(arr, predicate){
+    if(!Array.isArray(arr)) return false;
+    var keep = arr.filter(predicate);
+    if(keep.length === arr.length) return false;
+    arr.length = 0;
+    for(var i=0;i<keep.length;i++) arr.push(keep[i]);
+    return true;
+  }
+
+  function applyRegionFilter(){
+    if(!isRegionUser()) return;
+    var region = userRegion();
+    if(!region) return;
+    /* MEMBERS: m.region === user.region */
+    filterArrInPlace(window.MEMBERS, function(m){ return m && m.region === region; });
+    try{
+      if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+        filterArrInPlace(MEMBERS, function(m){ return m && m.region === region; });
+      }
+    }catch(e){}
+    /* valid IDs */
+    var ids = {};
+    (Array.isArray(window.MEMBERS) ? window.MEMBERS : []).forEach(function(m){
+      if(m && m.id) ids[m.id] = 1;
+    });
+    /* RECORDS: r.id 가 region member 인 것만 */
+    filterArrInPlace(window.RECORDS, function(r){ return r && ids[r.id]; });
+    try{
+      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+        filterArrInPlace(RECORDS, function(r){ return r && ids[r.id]; });
+      }
+    }catch(e){}
+    /* FINAL_RECORDS / FINAL_MEMBERS 도 필터 (다른 코드 fallback paths 가 사용) */
+    filterArrInPlace(window.FINAL_RECORDS, function(r){ return r && ids[r.id]; });
+    filterArrInPlace(window.FINAL_MEMBERS, function(m){ return m && m.region === region; });
+  }
+  window.applyRegionFilter = applyRegionFilter;
+
+  /* 주요 render 함수 wrap — 호출 직전에 applyRegionFilter 적용 */
+  var TARGETS = [
+    'renderOverview','renderOverviewNow','renderOverviewExtra',
+    'renderStatSum','renderRegionCards','renderTeamStat','renderZoneStat',
+    'renderFamilyWorship','renderHabit','renderLongAbsent',
+    'renderWeekCompare'
+  ];
+  function wrapOne(name){
+    var orig = window[name];
+    if(typeof orig !== 'function') return false;
+    if(orig.__roleFilterWrapped) return true;
+    var wrapped = function(){
+      try{ applyRegionFilter(); }catch(e){}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__roleFilterWrapped = true;
+    /* 다른 wrap 차단 */
+    wrapped.__llfCoalesced = true;
+    wrapped.__llfWrapped = true;
+    wrapped.__perfWrapped = true;
+    wrapped.__v86_fast = true;
+    wrapped.__ovRebuildWrapped = true;
+    wrapped.__stage2Hooked = true;
+    wrapped.__memSyncWrapped = true;
+    window[name] = wrapped;
+    return true;
+  }
+  function wrapAll(){
+    TARGETS.forEach(wrapOne);
+  }
+  wrapAll();
+  /* 후속 패치가 함수 재정의하면 다시 wrap */
+  var t=0;
+  var iv=setInterval(function(){
+    var anyNew = false;
+    TARGETS.forEach(function(n){
+      if(typeof window[n] === 'function' && !window[n].__roleFilterWrapped){
+        wrapOne(n); anyNew = true;
+      }
+    });
+    if(++t > 300 && !anyNew) clearInterval(iv);
+  }, 50);
+
+  /* 데이터 sync 이벤트 후 자동 재필터 (Firebase Step 2 / applyFinalData / etc.) */
+  setTimeout(applyRegionFilter, 1000);
+  setTimeout(applyRegionFilter, 3000);
+  setTimeout(applyRegionFilter, 6000);
+  /* currentUser 변경 감지 — 폴링 */
+  (function watchUserChange(){
+    var lastUser = null, lastRegion = null;
+    var tries = 0;
+    setInterval(function(){
+      var u = window.currentUser;
+      var r = (u && u.region) || null;
+      if(u !== lastUser || r !== lastRegion){
+        lastUser = u; lastRegion = r;
+        try{ applyRegionFilter(); }catch(e){}
+        /* render 강제 새로고침 */
+        try{ if(typeof window.renderOverview === 'function') window.renderOverview(); }catch(e){}
+      }
+      if(++tries > 600) return; /* 폴링 종료 — but interval 계속 */
+    }, 500);
+  })();
+
+  /* populateSelects — 지역 dropdown 에서 region user 의 지역 외 옵션 제거 */
+  function filterRegionDropdowns(){
+    if(!isRegionUser()) return;
+    var region = userRegion();
+    var regSelectIds = ['ov-reg','wk-reg','m-reg','team-reg-f','zone-reg-f','wc-reg-filter','habit-reg','cert-reg','hs-reg','hs-zone','estage-reg-filter','fam-region'];
+    regSelectIds.forEach(function(id){
+      var el = document.getElementById(id);
+      if(!el) return;
+      /* 자기 region 만 남기고 나머지 옵션 제거.
+         "전체" / 빈 옵션은 region 값으로 자동 세팅 */
+      var keep = [];
+      for(var i=0;i<el.options.length;i++){
+        var o = el.options[i];
+        if(o.value === '' || o.value === region) keep.push(o);
+      }
+      if(keep.length === el.options.length) return;
+      el.innerHTML = '';
+      keep.forEach(function(o){ el.appendChild(o); });
+      /* 자기 region 으로 자동 선택 */
+      el.value = region;
+    });
+  }
+  setInterval(filterRegionDropdowns, 500);
+})();
+</script>
+<!-- USER_ROLE_FILTER_END -->
+
+<!-- STREAK_LABEL_FIX_START -->
+<script id="streak-label-fix">
+(function(){
+  'use strict';
+  /* v78 renderOverviewExtra 의 label/DESIRED 불일치 + 연속결석 임계값 라벨 통일.
+     실제 임계값 (`sk>=3 / sk>=7`) 은 이미 정확. label 만 "4회↑/8회↑" → "3회↑/7회↑" 로 수정.
+     DESIRED hardcoded fallback (admin 전체 합계) 제거 — region user 가 admin 숫자 보는 버그 차단. */
+  function patchOverviewExtra(){
+    var sec = document.getElementById('overview-extra-analysis');
+    if(!sec) return false;
+    /* 1) 헤더 note */
+    var note = sec.querySelector('.v78-note');
+    if(note && /4회 이상.*8회 이상/.test(note.textContent||'')){
+      note.textContent = '화면 표기 기준: 일반 3회 이상 · 가족·가족외 7회 이상';
+    }
+    /* 2) metric labels — "일반 4회↑" → "일반 3회↑", "8회↑" → "7회↑" */
+    var lbls = sec.querySelectorAll('.mc .lbl');
+    for(var i=0;i<lbls.length;i++){
+      var t = lbls[i].textContent || '';
+      if(t === '일반 4회↑') lbls[i].textContent = '일반 3회↑';
+      else if(t === '가족 8회↑') lbls[i].textContent = '가족 7회↑';
+      else if(t === '가족외 8회↑') lbls[i].textContent = '가족외 7회↑';
+    }
+    return true;
+  }
+  /* MutationObserver 로 overview-extra-analysis 가 다시 그려질 때마다 patch */
+  function watch(){
+    try{
+      var anchor = document.body;
+      var mo = new MutationObserver(function(){
+        try{ patchOverviewExtra(); }catch(e){}
+      });
+      mo.observe(anchor, { childList:true, subtree:true });
+    }catch(e){}
+  }
+  setTimeout(function(){ patchOverviewExtra(); watch(); }, 500);
+  setTimeout(patchOverviewExtra, 1500);
+  setTimeout(patchOverviewExtra, 3500);
+})();
+</script>
+<!-- STREAK_LABEL_FIX_END -->
