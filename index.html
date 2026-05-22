@@ -17378,6 +17378,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
      ORIG_M / ORIG_R 자체 스냅샷 (ARS 와 독립). */
 
   var ORIG_M = null, ORIG_R = null;
+  /* polling 으로 max-length 보존 — window.* 우선, 작아도 보존 */
   function snapMax(){
     var m = window.MEMBERS, r = window.RECORDS;
     if(Array.isArray(m) && m.length && (!ORIG_M || m.length > ORIG_M.length)){
@@ -17386,20 +17387,51 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     if(Array.isArray(r) && r.length && (!ORIG_R || r.length > ORIG_R.length)){
       ORIG_R = r.slice();
     }
+    /* FINAL_* 도 함께 — ARS 가 window.* 만 필터하지 FINAL_* 은 초기 시점엔 full */
+    var fm = window.FINAL_MEMBERS, fr = window.FINAL_RECORDS;
+    if(Array.isArray(fm) && fm.length && (!ORIG_M || fm.length > ORIG_M.length)){
+      ORIG_M = fm.slice();
+    }
+    if(Array.isArray(fr) && fr.length && (!ORIG_R || fr.length > ORIG_R.length)){
+      ORIG_R = fr.slice();
+    }
   }
-  /* 첫 10초 polling 으로 full 데이터 캡처 */
+  /* 첫 10초 polling */
   var snapCnt = 0;
   var snapIv = setInterval(function(){
     snapMax();
     if(++snapCnt > 400) clearInterval(snapIv);
   }, 25);
 
-  /* Firebase 직접 fetch fallback — polling 이 ARS 필터 이후 데이터만 봐서 비어있을 때 */
-  var FB_M = null, FB_R = null, fbFetching = false;
+  /* __MINJI_FINAL_READY 시점에 FINAL_* 강제 snapshot — minjiFastLoad 가 이미 fetch 한 결과 재사용
+     (중복 Firebase fetch 제거 → 속도 최적화의 핵심) */
+  (function watchMinjiReady(){
+    var ticks = 0;
+    var done = false;
+    var iv = setInterval(function(){
+      if(window.__MINJI_FINAL_READY && !done){
+        var fm = window.FINAL_MEMBERS, fr = window.FINAL_RECORDS;
+        if(Array.isArray(fm) && fm.length) ORIG_M = fm.slice();
+        if(Array.isArray(fr) && fr.length) ORIG_R = fr.slice();
+        done = true;
+        console.log('[fix-region-cards] FINAL snap @ MINJI_READY: M='+(ORIG_M?ORIG_M.length:0)+' R='+(ORIG_R?ORIG_R.length:0));
+        clearInterval(iv);
+        setTimeout(function(){ try{ patchCards(); }catch(e){} }, 100);
+        return;
+      }
+      if(++ticks > 400) clearInterval(iv);
+    }, 50);
+  })();
+
+  /* Firebase lazy fetch fallback — ORIG (FINAL_*) 가 부족할 때만 1회 fetch.
+     첫 로딩 시엔 안 함 (속도 보존). */
+  var FB_M = null, FB_R = null, fbFetching = false, fbDone = false;
   function fbFetchOnce(){
-    if((FB_M && FB_R) || fbFetching) return Promise.resolve();
+    if(fbDone || fbFetching) return Promise.resolve();
     if(!window.fbDB) return Promise.resolve();
     fbFetching = true;
+    var t0 = Date.now();
+    console.log('[fix-region-cards] Firebase lazy fetch (fallback) 시작...');
     return Promise.all([
       window.fbDB.ref('members').once('value'),
       window.fbDB.ref('records').once('value')
@@ -17410,24 +17442,21 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       FB_R = []; Object.keys(rObj).forEach(function(k){
         var r = rObj[k];
         if(!r) return;
-        /* id 가 비어있으면 key prefix 에서 추출 */
         if(!r.id){
           var idx = k.lastIndexOf('_');
           if(idx > 0) r._idFromKey = k.substring(0, idx);
         }
         FB_R.push(r);
       });
+      fbDone = true;
       fbFetching = false;
-      console.log('[fix-region-cards] Firebase 직접 fetch 완료: members='+FB_M.length+' records='+FB_R.length);
-      setTimeout(function(){ try{ patchCards(); }catch(e){} }, 100);
+      console.log('[fix-region-cards] FB fallback fetch 완료 ('+(Date.now()-t0)+'ms): M='+FB_M.length+' R='+FB_R.length);
+      setTimeout(function(){ try{ patchCards(); }catch(e){} }, 50);
     }).catch(function(err){
       fbFetching = false;
       console.warn('[fix-region-cards] Firebase fetch 실패:', err);
     });
   }
-  /* 페이지 로드 후 1.5초 시점에 fetch 시도 (fbDB 초기화 완료 이후) */
-  setTimeout(fbFetchOnce, 1500);
-  setTimeout(fbFetchOnce, 4000); /* 재시도 */
 
   function effDateValue(){
     try{
