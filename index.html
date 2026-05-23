@@ -16718,9 +16718,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       return !!actives[m.id];
     });
     var after = (Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0);
-    /* [4] active count 디버그 로그 */
+    /* [4] active count 디버그 로그 — Phase 1.5: dedup (값이 변할 때만 출력) */
     var rsCount = Object.keys(actives).length;
-    console.log('[active-count] region='+(region||'admin')+' members='+before+' records-active='+rsCount+' total-active='+after);
+    var _msg = '[active-count] region='+(region||'admin')+' members='+before+' records-active='+rsCount+' total-active='+after;
+    if(_msg !== applyActiveFilter.__lastMsg){
+      console.log(_msg);
+      applyActiveFilter.__lastMsg = _msg;
+    }
   }
   window.applyActiveFilter = applyActiveFilter;
 
@@ -17522,10 +17526,19 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   function normId(v){ return String(v == null ? '' : v).replace(/[\s​-‏﻿]/g, '').trim(); }
 
   /* region 별 카드 5칸 값 재계산
-     소스 우선순위: FB_M/FB_R (Firebase 직접 fetch, 가장 신뢰) > ORIG_M/ORIG_R (polling) */
+     Phase 1.5: 소스 우선순위 변경 — __cache (Sub-step 1.1) > FB > ORIG (legacy fallback) */
   function computeRegionCardValues(region){
-    var srcM = (FB_M && FB_M.length) ? FB_M : ORIG_M;
-    var srcR = (FB_R && FB_R.length) ? FB_R : ORIG_R;
+    var cache = window.__cache;
+    var srcM, srcR, sourceLabel;
+    if(cache && Array.isArray(cache.members) && cache.members.length && Array.isArray(cache.records) && cache.records.length){
+      srcM = cache.members;
+      srcR = cache.records;
+      sourceLabel = 'cache';
+    } else if(FB_M && FB_M.length && FB_R && FB_R.length){
+      srcM = FB_M; srcR = FB_R; sourceLabel = 'FB';
+    } else {
+      srcM = ORIG_M; srcR = ORIG_R; sourceLabel = 'ORIG';
+    }
     if(!srcM || !srcR) return null;
     var dateVal = normDate(effDateValue());
     if(!dateVal) return null;
@@ -17555,7 +17568,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     return {
       total:total, qr:qr, sa:sa, ab:ab, rate:rate,
       dateMatch:dateMatch, idMatch:idMatch,
-      source: (srcM === FB_M ? 'FB' : 'ORIG')
+      source: sourceLabel
     };
   }
 
@@ -17632,10 +17645,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       console.log('[fix-region-cards] region='+region+' date='+normDate(effDateValue())+' source='+(v.source||'?')+' total='+v.total+' QR='+v.qr+' SA='+v.sa+' AB='+v.ab+' rate='+v.rate+'% (dateMatch='+v.dateMatch+' idMatch='+v.idMatch+')');
     }
     /* dateMatch=0 (records 캡처 못함) 또는 idMatch=0 (매칭 실패) → 진단 출력 */
+    /* Phase 1.5: __cache 가 주 source 가 되어 FB fetch lazy trigger 불필요.
+       idMatch=0 케이스만 1회 진단 출력 (diagIdMismatch 가 자체적으로 diagPrinted gate). */
     if(v && (v.dateMatch === 0 || v.idMatch === 0)){
       try{ diagIdMismatch(region); }catch(e){}
-      /* Firebase fetch 아직 안 됐으면 fetch 트리거 */
-      if(!FB_R) try{ fbFetchOnce(); }catch(e){}
     }
   }
 
