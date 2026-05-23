@@ -17028,60 +17028,67 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     for(var i=0;i<newItems.length;i++) arr.push(newItems[i]);
   }
   function applyView(region){
-    /* Path β (P2-4 hotfix): 전체 토글 시 page reload 로 깨끗하게 초기화.
-       ARS region 클릭이 lexical/window/FINAL records 를 in-place 필터해서 손상 →
-       전체 복귀 시 어떤 source 도 5/17 records 보유 안 함. 가장 안전한 우회. */
-    if(!region){ window.location.reload(); return; }
-    /* #7 정교화: region 클릭 시 가족·가족외 메뉴 즉시 숨김 (전체 복귀는 reload 후 showApp 가 처리) */
-    var _famNav = document.getElementById('family-nav-item');
-    if(_famNav) _famNav.style.display = 'none';
-    if(!ORIG_M || !ORIG_R){
-      console.warn('[ars] ORIG snapshot not ready (data still loading)');
-      return;
-    }
-    /* 1) ORIG 으로 복원 (window.MEMBERS / RECORDS 참조 유지) */
-    if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
-    if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
-    inplaceReplace(window.MEMBERS, ORIG_M);
-    inplaceReplace(window.RECORDS, ORIG_R);
-    try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS) && MEMBERS !== window.MEMBERS) inplaceReplace(MEMBERS, ORIG_M); }catch(e){}
-    try{
-      if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS !== window.RECORDS){
-        inplaceReplace(RECORDS, ORIG_R);
-        if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
+    /* Phase 1.2: __cache 단일 source 기반 read-only filter.
+       P2-4 reload 제거. ORIG 의존 제거 (lexical/FINAL stale 문제 우회).
+       window.MEMBERS / RECORDS 등은 다른 페이지 호환을 위해 in-place 동기화. */
+    var cache = window.__cache;
+    if(!cache || !Array.isArray(cache.members) || !Array.isArray(cache.records)){
+      console.warn('[ars] __cache not ready (data still loading), fallback to ORIG path');
+      /* fallback: 기존 ORIG path 로 회귀 */
+      if(!ORIG_M || !ORIG_R) return;
+      if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+      if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
+      inplaceReplace(window.MEMBERS, ORIG_M);
+      inplaceReplace(window.RECORDS, ORIG_R);
+      // 이전 동작 그대로
+    } else {
+      /* === __cache 기반 read-only filter === */
+      var members, ids = {};
+      if(region){
+        members = cache.members.filter(function(m){ return m && m.region === region; });
+      } else {
+        members = cache.members.slice();
       }
-    }catch(e){}
-    /* FINAL_* 도 ORIG 백업이 있으면 복원 — 없으면 그대로 (변경 없음) */
+      members.forEach(function(m){ if(m && m.id) ids[String(m.id).trim()] = 1; });
+      var records = region
+        ? cache.records.filter(function(r){ return r && ids[String(r.id).trim()]; })
+        : cache.records.slice();
 
-    /* 2) region 선택 시 in-place 필터 */
-    if(region){
-      var keepM = window.MEMBERS.filter(function(m){ return m && m.region === region; });
-      inplaceReplace(window.MEMBERS, keepM);
-      try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS) && MEMBERS !== window.MEMBERS) inplaceReplace(MEMBERS, keepM); }catch(e){}
-      var ids = {};
-      keepM.forEach(function(m){ if(m && m.id) ids[m.id] = 1; });
-      var keepR = window.RECORDS.filter(function(r){ return r && ids[r.id]; });
-      inplaceReplace(window.RECORDS, keepR);
+      /* window.__currentView 갱신 */
+      window.__currentView = {
+        region: region || null,
+        members: members,
+        records: records,
+        computedAt: Date.now()
+      };
+
+      /* window.MEMBERS / RECORDS / lexical / FINAL_* 동기화 (다른 페이지 호환) */
+      if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+      if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
+      inplaceReplace(window.MEMBERS, members);
+      inplaceReplace(window.RECORDS, records);
+      try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS) && MEMBERS !== window.MEMBERS) inplaceReplace(MEMBERS, members); }catch(e){}
       try{
         if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS) && RECORDS !== window.RECORDS){
-          inplaceReplace(RECORDS, keepR);
+          inplaceReplace(RECORDS, records);
           if(typeof invalidateRecordIndex === 'function') invalidateRecordIndex();
         }
       }catch(e){}
-      if(Array.isArray(window.FINAL_MEMBERS)){
-        var fm = window.FINAL_MEMBERS.filter(function(m){ return m && m.region === region; });
-        inplaceReplace(window.FINAL_MEMBERS, fm);
-      }
-      if(Array.isArray(window.FINAL_RECORDS)){
-        var fr = window.FINAL_RECORDS.filter(function(r){ return r && ids[r.id]; });
-        inplaceReplace(window.FINAL_RECORDS, fr);
-      }
+      if(Array.isArray(window.FINAL_MEMBERS)) inplaceReplace(window.FINAL_MEMBERS, members);
+      if(Array.isArray(window.FINAL_RECORDS)) inplaceReplace(window.FINAL_RECORDS, records);
     }
 
-    /* 3) 기존 applyActiveFilter 호출 — records 0건 멤버 제거 */
+    /* 가족 메뉴 visibility (region 선택 → 숨김, 전체 → admin 일 때 보임) */
+    var famNav = document.getElementById('family-nav-item');
+    if(famNav){
+      var u = window.currentUser || {};
+      famNav.style.display = (u.role === 'admin' && !region) ? '' : 'none';
+    }
+
+    /* 기존 applyActiveFilter 호출 — records 0건 멤버 제거 */
     try{ if(typeof window.applyActiveFilter === 'function') window.applyActiveFilter(); }catch(e){}
 
-    /* 4) 상태 표시 */
+    /* 상태 표시 */
     var status = document.getElementById('ars-status');
     var box = document.getElementById('ars-box');
     if(region){
@@ -17092,14 +17099,17 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       if(box) box.classList.remove('viewing');
     }
 
-    /* 5) 재렌더 */
+    /* 재렌더 */
     try{ if(typeof window.renderOverview === 'function') window.renderOverview(); }catch(e){}
     try{
       var active = document.querySelector('.page.active');
       var pageId = active ? active.id.replace('page-','') : 'overview';
       if(typeof window.renderPage === 'function') window.renderPage(pageId);
     }catch(e){}
-    console.log('[ars] view='+(region||'전체')+' MEMBERS='+window.MEMBERS.length+' RECORDS='+window.RECORDS.length);
+    console.log('[ars] view='+(region||'전체')+' MEMBERS='+window.MEMBERS.length+' RECORDS='+window.RECORDS.length+' source='+(cache && cache.members?'__cache':'ORIG fallback'));
+
+    /* view-changed 이벤트 dispatch (1.3 에서 listener 추가 예정) */
+    try{ window.dispatchEvent(new CustomEvent('view-changed', { detail: { region: region || null } })); }catch(e){}
   }
   window.__arsApply = applyView;
 })();
