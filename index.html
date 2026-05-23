@@ -17763,3 +17763,53 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- PHASE_1_1_CACHE_END -->
+
+<!-- PHASE_1_3_VIEW_CHANGED_AND_CHART_GUARD_START -->
+<script id="phase-1-3-view-changed-and-chart-guard">
+(function(){
+  'use strict';
+  /* Phase 1.3:
+     A. Chart.js ownerDocument TypeError 글로벌 가드 (canvas detached 케이스 suppress)
+     B. view-changed 이벤트 listener — 통계/지역 페이지 재렌더 트리거
+     C. 통계/지역 페이지가 이미 window.RECORDS 참조 → Sub-step 1.2 의 cache sync 로 자동 반영 */
+
+  /* A. 글로벌 Chart.js error 가드 */
+  window.addEventListener('error', function(e){
+    if(e && e.message && /ownerDocument/.test(e.message)){
+      console.warn('[chart-guard] Chart.js ownerDocument error suppressed');
+      if(e.preventDefault) e.preventDefault();
+      return false;
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    var msg = e && e.reason && (e.reason.message || String(e.reason));
+    if(msg && /ownerDocument/.test(msg)){
+      console.warn('[chart-guard] Chart.js ownerDocument promise rejection suppressed');
+      if(e.preventDefault) e.preventDefault();
+    }
+  });
+
+  /* B. view-changed 이벤트 listener — region 토글 시 active page 재렌더 */
+  var rerenderPending = false;
+  window.addEventListener('view-changed', function(ev){
+    var region = ev && ev.detail ? ev.detail.region : null;
+    console.log('[view-changed] region='+(region||'전체')+' MEMBERS='+(Array.isArray(window.MEMBERS)?window.MEMBERS.length:0)+' RECORDS='+(Array.isArray(window.RECORDS)?window.RECORDS.length:0));
+    if(rerenderPending) return;
+    rerenderPending = true;
+    setTimeout(function(){
+      rerenderPending = false;
+      try{
+        var active = document.querySelector('.page.active');
+        if(!active) return;
+        var pageId = active.id.replace('page-', '');
+        if(pageId === 'stats' && typeof window.renderStatSum === 'function') window.renderStatSum();
+        else if(pageId === 'region' && typeof window.renderRegionCards === 'function') window.renderRegionCards();
+        else if(pageId === 'family' && typeof window.renderFamilyWorship === 'function') window.renderFamilyWorship();
+        else if(pageId === 'longabsent' && typeof window.renderLongAbsent === 'function') window.renderLongAbsent();
+        else if(pageId === 'habit' && typeof window.renderHabit === 'function') window.renderHabit();
+      }catch(err){ console.warn('[view-changed] re-render error:', err); }
+    }, 80);
+  });
+})();
+</script>
+<!-- PHASE_1_3_VIEW_CHANGED_AND_CHART_GUARD_END -->
