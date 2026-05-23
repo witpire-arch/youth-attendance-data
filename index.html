@@ -17650,3 +17650,106 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- FIX_OV_REGION_CARDS_END -->
+
+<!-- PHASE_1_1_CACHE_START -->
+<script id="phase-1-1-cache">
+(function(){
+  'use strict';
+  /* Phase 1.1: window.__cache 도입 — Firebase 단일 source 의 raw snapshot.
+     기존 데이터 path (lexical RECORDS / window.RECORDS / FINAL_RECORDS / ORIG_R) 영향 X.
+     향후 Sub-step 1.2+ 에서 모든 데이터 참조를 __cache 로 통일 예정. */
+
+  window.__cache = window.__cache || {
+    members: null, membersById: null,
+    records: null,
+    loadedAt: null, loadError: null
+  };
+
+  function loadCache(){
+    if(!window.fbDB) return Promise.resolve();
+    if(window.__cache.records && window.__cache.members) return Promise.resolve();
+
+    var t0 = Date.now();
+    return Promise.all([
+      window.fbDB.ref('members').once('value'),
+      window.fbDB.ref('records').once('value')
+    ]).then(function(snaps){
+      var mObj = snaps[0].val() || {};
+      var rObj = snaps[1].val() || {};
+
+      var members = [], membersById = {};
+      Object.keys(mObj).forEach(function(key){
+        var m = mObj[key];
+        if(m && m.id){
+          members.push(m);
+          membersById[String(m.id).trim()] = m;
+        }
+      });
+
+      var records = [];
+      Object.keys(rObj).forEach(function(key){
+        var r = rObj[key];
+        if(r && r.id) records.push(r);
+      });
+
+      /* idMatch 진단 — record.id 가 member.id 와 매칭되는지 */
+      var matched = 0, orphan = 0;
+      records.forEach(function(r){
+        if(membersById[String(r.id).trim()]) matched++;
+        else orphan++;
+      });
+
+      window.__cache.members = members;
+      window.__cache.membersById = membersById;
+      window.__cache.records = records;
+      window.__cache.loadedAt = Date.now();
+      window.__cache.loadError = null;
+
+      console.log('[cache] loaded members='+members.length+' records='+records.length+' idMatch='+matched+'/'+records.length+' orphan='+orphan+' ms='+(Date.now()-t0));
+
+      try{ window.dispatchEvent(new Event('cache-loaded')); }catch(e){}
+    }).catch(function(err){
+      window.__cache.loadError = err;
+      console.warn('[cache] fetch error:', err);
+    });
+  }
+
+  /* fbDB 준비될 때까지 polling */
+  var attempts = 0;
+  var iv = setInterval(function(){
+    attempts++;
+    if(window.fbDB){
+      clearInterval(iv);
+      loadCache();
+    } else if(attempts > 200){
+      clearInterval(iv);
+      console.warn('[cache] fbDB never ready after 10s');
+    }
+  }, 50);
+
+  /* 수동 트리거 (refresh) */
+  window.__refreshCache = function(){
+    window.__cache.records = null;
+    window.__cache.members = null;
+    return loadCache();
+  };
+
+  /* 진단 헬퍼 */
+  window.__diagCache = function(){
+    var c = window.__cache;
+    console.log('[cache/diag] members='+(c.members?c.members.length:'null')+
+                ' records='+(c.records?c.records.length:'null')+
+                ' loadedAt='+(c.loadedAt?new Date(c.loadedAt).toISOString():'null')+
+                ' error='+(c.loadError||'none'));
+    if(c.records){
+      var dates = {};
+      c.records.forEach(function(r){ dates[String(r.date||'').slice(0,10)] = (dates[String(r.date||'').slice(0,10)]||0)+1; });
+      var keys = Object.keys(dates).sort();
+      console.log('  date range: '+keys[0]+' ~ '+keys[keys.length-1]+' (unique dates='+keys.length+')');
+      console.log('  recent: '+keys.slice(-5).map(function(d){return d+'='+dates[d];}).join(', '));
+    }
+    return c;
+  };
+})();
+</script>
+<!-- PHASE_1_1_CACHE_END -->
