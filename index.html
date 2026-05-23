@@ -17839,3 +17839,172 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- PHASE_1_3_VIEW_CHANGED_AND_CHART_GUARD_END -->
+
+<!-- PHASE_1_6_INTEGRITY_CHECK_START -->
+<script id="phase-1-6-integrity-check">
+(function(){
+  'use strict';
+  /* Phase 1.6: 정합성 진단 도구 — 화면 영향 X, 콘솔 호출만.
+     호출: window.__checkIntegrity()
+     반환: { regionTable, newMembers, orphanIds, regionShift, typeShift, typeTable } */
+
+  function normId(v){ return String(v == null ? '' : v).trim(); }
+  function normStr(v){ return String(v == null ? '' : v).trim(); }
+
+  window.__checkIntegrity = function(opts){
+    opts = opts || {};
+    var SAMPLE = opts.sample || 30;
+    var c = window.__cache;
+    if(!c || !Array.isArray(c.members) || !Array.isArray(c.records)){
+      console.warn('[integrity] window.__cache not ready — try after F5');
+      return null;
+    }
+    var members = c.members, records = c.records;
+    var membersById = {};
+    members.forEach(function(m){ if(m && m.id) membersById[normId(m.id)] = m; });
+    var recIds = {};
+    records.forEach(function(r){ if(r && r.id) recIds[normId(r.id)] = true; });
+
+    var result = {};
+
+    /* 1. 지역별 members + records-active 비교 */
+    var memByRegion = {}, recByRegion = {};
+    members.forEach(function(m){
+      var rg = normStr(m.region) || '(no region)';
+      memByRegion[rg] = (memByRegion[rg]||0) + 1;
+    });
+    var memSeen = {};
+    records.forEach(function(r){
+      var mid = normId(r.id);
+      if(memSeen[mid]) return;
+      memSeen[mid] = true;
+      var m = membersById[mid];
+      if(m){
+        var rg = normStr(m.region) || '(no region)';
+        recByRegion[rg] = (recByRegion[rg]||0) + 1;
+      }
+    });
+    var allRegs = Object.keys(memByRegion).concat(Object.keys(recByRegion))
+      .filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
+    var regionTable = allRegs.map(function(rg){
+      var mc = memByRegion[rg]||0, rc = recByRegion[rg]||0;
+      return { region:rg, members:mc, records_active:rc, diff:(mc-rc) };
+    });
+    console.log('[integrity] === 지역별 (members vs records-active) ===');
+    console.table(regionTable);
+    result.regionTable = regionTable;
+
+    /* 2. 신규 등록 (members 있고 records 없음) */
+    var newMembers = members.filter(function(m){ return m && m.id && !recIds[normId(m.id)]; });
+    console.log('[integrity] 신규 등록 (members 있고 records 없음): '+newMembers.length+'명');
+    if(newMembers.length){
+      console.table(newMembers.slice(0,SAMPLE).map(function(m){
+        return { id:m.id, name:m.name||'?', region:m.region||'?', type:m.type||'?' };
+      }));
+      if(newMembers.length > SAMPLE) console.log('  ... +'+(newMembers.length-SAMPLE)+' more');
+    }
+    result.newMembers = newMembers;
+
+    /* 3. orphan records (records 있고 members 없음) */
+    var orphanIds = {};
+    records.forEach(function(r){
+      var mid = normId(r.id);
+      if(!membersById[mid]){
+        if(!orphanIds[mid]) orphanIds[mid] = [];
+        orphanIds[mid].push(r);
+      }
+    });
+    var orphanKeys = Object.keys(orphanIds);
+    var orphanRecsTotal = orphanKeys.reduce(function(a,k){return a+orphanIds[k].length;},0);
+    console.log('[integrity] orphan records (records 있고 members 없음): '+orphanKeys.length+'명 / '+orphanRecsTotal+'건');
+    if(orphanKeys.length){
+      console.table(orphanKeys.slice(0,SAMPLE).map(function(id){
+        var s = orphanIds[id][0];
+        return { id:id, record_count:orphanIds[id].length, sample_date:s.date, sample_st:s.st, sample_region:s.region||'-', sample_type:s.type||'-' };
+      }));
+      if(orphanKeys.length > SAMPLE) console.log('  ... +'+(orphanKeys.length-SAMPLE)+' more');
+    }
+    result.orphanIds = orphanIds;
+
+    /* 4. region shift (record.region != 현재 member.region) */
+    var regionShift = [];
+    records.forEach(function(r){
+      var mid = normId(r.id);
+      var m = membersById[mid];
+      if(m && r.region && normStr(r.region) && normStr(r.region) !== normStr(m.region)){
+        regionShift.push({ id:mid, name:m.name||'?', date:r.date, record_region:r.region, current_region:m.region });
+      }
+    });
+    console.log('[integrity] region shift (record.region != 현재 member.region): '+regionShift.length+'건');
+    if(regionShift.length){
+      console.table(regionShift.slice(0,SAMPLE));
+      if(regionShift.length > SAMPLE) console.log('  ... +'+(regionShift.length-SAMPLE)+' more');
+    }
+    result.regionShift = regionShift;
+
+    /* 5. type shift (record.type != 현재 member.type) ★ user 강조 */
+    var typeShift = [];
+    var shiftByPair = {}; /* (record_type → current_type) 패턴별 count */
+    records.forEach(function(r){
+      var mid = normId(r.id);
+      var m = membersById[mid];
+      if(m && r.type && normStr(r.type) && normStr(r.type) !== normStr(m.type)){
+        typeShift.push({ id:mid, name:m.name||'?', date:r.date, record_type:r.type, current_type:m.type });
+        var key = normStr(r.type) + ' → ' + normStr(m.type);
+        shiftByPair[key] = (shiftByPair[key]||0) + 1;
+      }
+    });
+    console.log('[integrity] type shift (record.type != 현재 member.type): '+typeShift.length+'건');
+    if(typeShift.length){
+      console.table(typeShift.slice(0,SAMPLE));
+      if(typeShift.length > SAMPLE) console.log('  ... +'+(typeShift.length-SAMPLE)+' more');
+      /* 패턴별 집계 — 마이그레이션 시 type 손실 추적 */
+      var pairTable = Object.keys(shiftByPair).sort(function(a,b){return shiftByPair[b]-shiftByPair[a];})
+        .map(function(k){return { shift_pattern:k, count:shiftByPair[k] };});
+      console.log('[integrity] type shift 패턴별 집계:');
+      console.table(pairTable);
+      result.typeShiftPatterns = pairTable;
+    }
+    result.typeShift = typeShift;
+
+    /* 6. type 분포 비교 — 현재 members 기준 vs records 기준 */
+    var typeMembers = {}, typeRecords = {};
+    members.forEach(function(m){ var t = normStr(m.type) || '(no type)'; typeMembers[t] = (typeMembers[t]||0) + 1; });
+    var seenForType = {};
+    records.forEach(function(r){
+      var mid = normId(r.id);
+      if(seenForType[mid]) return;
+      seenForType[mid] = true;
+      var m = membersById[mid];
+      if(m){
+        var t = normStr(m.type) || '(no type)';
+        typeRecords[t] = (typeRecords[t]||0) + 1;
+      } else if(r.type){
+        var t2 = '[orphan] ' + (normStr(r.type) || '(no type)');
+        typeRecords[t2] = (typeRecords[t2]||0) + 1;
+      }
+    });
+    var allTypes = Object.keys(typeMembers).concat(Object.keys(typeRecords))
+      .filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
+    var typeTable = allTypes.map(function(t){
+      return { type:t, members:typeMembers[t]||0, records_active:typeRecords[t]||0 };
+    });
+    console.log('[integrity] === type 분포 (members vs records-active) ===');
+    console.table(typeTable);
+    result.typeTable = typeTable;
+
+    /* 7. 요약 */
+    console.log('[integrity] === 요약 ===');
+    console.log('  total members        : '+members.length);
+    console.log('  total records        : '+records.length);
+    console.log('  new members (no recs): '+newMembers.length);
+    console.log('  orphan record IDs    : '+orphanKeys.length+' ('+orphanRecsTotal+'건)');
+    console.log('  region shifts        : '+regionShift.length);
+    console.log('  type shifts          : '+typeShift.length);
+    return result;
+  };
+
+  console.log('[integrity] window.__checkIntegrity() 노출 — 콘솔에서 실행하여 정합성 진단');
+})();
+</script>
+<!-- PHASE_1_6_INTEGRITY_CHECK_END -->
