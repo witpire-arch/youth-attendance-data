@@ -4780,6 +4780,37 @@ function saveHabitDetailPlan(id) {
   else delete targets[id+'_habit'];
   savePlans(plans);
   saveTargets(targets);
+  /* HOTFIX: STAGE2 cycle plans (att_habitual_plans_v1) 에도 sync —
+     상세에서 입력한 월목표/주차계획이 사이클 명단 리스트에서도 보이도록.
+     이 회원이 속한 사이클 모두 갱신 (snapshotMembers 또는 addedMembers 에 있는 경우). */
+  try{
+    var s2 = JSON.parse(localStorage.getItem('att_habitual_plans_v1')||'{}');
+    var changed = false;
+    Object.keys(s2).forEach(function(cycleId){
+      var c = s2[cycleId];
+      if(!c) return;
+      var inSnap = Array.isArray(c.snapshotMembers) && c.snapshotMembers.indexOf(id) >= 0;
+      var inAdded = Array.isArray(c.addedMembers) && c.addedMembers.some(function(a){ return a && (a.personId===id || a.id===id); });
+      if(!inSnap && !inAdded) return;
+      if(!c.goals) c.goals = {};
+      if(!c.goals[id]) c.goals[id] = { monthlyGoal:'', weeklyPlan:[null,null,null,null,null] };
+      c.goals[id].monthlyGoal = String(plan.goal||'').trim();
+      /* weeklyPlan 도 함께 sync (w1~w5) */
+      if(!Array.isArray(c.goals[id].weeklyPlan)) c.goals[id].weeklyPlan = [null,null,null,null,null];
+      for(var w=1; w<=5; w++){
+        if(plan['w'+w]){
+          c.goals[id].weeklyPlan[w-1] = {
+            plan: plan['w'+w].plan||'',
+            date: plan['w'+w].date||'',
+            done: plan['w'+w].done||'',
+            reason: plan['w'+w].reason||''
+          };
+        }
+      }
+      changed = true;
+    });
+    if(changed) localStorage.setItem('att_habitual_plans_v1', JSON.stringify(s2));
+  }catch(e){ console.warn('[habit-detail] STAGE2 sync 실패', e); }
   showToast('상세 내용이 저장됐어요!');
 }
 
