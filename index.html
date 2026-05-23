@@ -879,7 +879,7 @@ body.llf-pin-loading::before{
     <button class="nav-item" onclick="nav('region',this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 1 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>지역·팀·구역
     </button>
-    <button class="nav-item" onclick="nav('family',this)">
+    <button class="nav-item" id="family-nav-item" onclick="nav('family',this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>가족·가족외 예배현황
     </button>
   </div>
@@ -12905,6 +12905,12 @@ console.log('[MFV2] Loaded');
     }
     var adminNav = $('admin-nav-section');
     if(adminNav) adminNav.style.display = (u.role === 'admin') ? '' : 'none';
+    var familyNav = $('family-nav-item');
+    if(familyNav){
+      var arsSel = $('ars-sel');
+      var curRegion = arsSel ? (arsSel.value || null) : null;
+      familyNav.style.display = (u.role === 'admin' && !curRegion) ? '' : 'none';
+    }
     var box = $('sb-user-box'); if(box) box.style.display = '';
     var em = $('sb-user-email'); if(em) em.textContent = u.email || '';
   }
@@ -17026,6 +17032,9 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
        ARS region 클릭이 lexical/window/FINAL records 를 in-place 필터해서 손상 →
        전체 복귀 시 어떤 source 도 5/17 records 보유 안 함. 가장 안전한 우회. */
     if(!region){ window.location.reload(); return; }
+    /* #7 정교화: region 클릭 시 가족·가족외 메뉴 즉시 숨김 (전체 복귀는 reload 후 showApp 가 처리) */
+    var _famNav = document.getElementById('family-nav-item');
+    if(_famNav) _famNav.style.display = 'none';
     if(!ORIG_M || !ORIG_R){
       console.warn('[ars] ORIG snapshot not ready (data still loading)');
       return;
