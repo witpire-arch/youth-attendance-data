@@ -11053,8 +11053,14 @@ function getLongAbsentList(regFilter,typeFilter){
   }, []);
   if(regFilter) members=members.filter(function(m){return clean(m.region)===regFilter;});
   if(typeFilter) members=members.filter(function(m){return clean(m.type)===clean(typeFilter);});
-  return members.filter(function(m){return getStreakOf(m.id)>=7;})
-    .sort(function(a,b){return getStreakOf(b.id)-getStreakOf(a.id)||clean(a.region).localeCompare(clean(b.region),'ko')||clean(a.name).localeCompare(clean(b.name),'ko');});
+  /* Phase 1.4: 차등 threshold (일반 4회+ / 가족·가족외 8회+) */
+  return members.filter(function(m){
+    var streak = getStreakOf(m.id);
+    var t = '';
+    try{ t = (typeof normType === 'function') ? normType(m.type) : clean(m.type); }catch(e){ t = clean(m.type); }
+    var threshold = (t === '가족' || t === '가족외') ? 8 : 4;
+    return streak >= threshold;
+  }).sort(function(a,b){return getStreakOf(b.id)-getStreakOf(a.id)||clean(a.region).localeCompare(clean(b.region),'ko')||clean(a.name).localeCompare(clean(b.name),'ko');});
 }
 
 function populateLAFilters(){
@@ -11076,11 +11082,18 @@ window.renderLongAbsent=function(){
     var total=list.length;
     var byType={};
     list.forEach(function(m){var t=safe(function(){return typeof normType!=='undefined'?normType(m.type):m.type;},'일반');byType[t]=(byType[t]||0)+1;});
+    /* Phase 1.4: 최신 예배일 자동 산출 (MAX(records.date)) */
+    var latestDate='';
+    try{
+      var _src = (window.__cache && Array.isArray(window.__cache.records)) ? window.__cache.records : (Array.isArray(window.RECORDS) ? window.RECORDS : []);
+      _src.forEach(function(r){ var d=String(r&&r.date||'').slice(0,10); if(d && d>latestDate) latestDate=d; });
+    }catch(e){}
+    var dateLabel = latestDate ? '기준: '+latestDate+' (최근 예배일)' : '기준: 최근 예배일';
     metricsEl.innerHTML=
-      '<div class="mc"><div class="lbl">총 인원</div><div class="val" style="color:var(--red)">'+total+'<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">연속결석 8회 이상</div></div>'+
-      '<div class="mc"><div class="lbl">가족</div><div class="val">'+(byType['가족']||0)+'</div></div>'+
-      '<div class="mc"><div class="lbl">가족외</div><div class="val">'+(byType['가족외']||0)+'</div></div>'+
-      '<div class="mc"><div class="lbl">일반</div><div class="val">'+(byType['일반']||0)+'</div></div>';
+      '<div class="mc"><div class="lbl">총 인원</div><div class="val" style="color:var(--red)">'+total+'<span style="font-size:13px;font-weight:400;color:var(--text3)">명</span></div><div class="sub">일반 4회+ / 가족·가족외 8회+ · '+dateLabel+'</div></div>'+
+      '<div class="mc"><div class="lbl">가족</div><div class="val">'+(byType['가족']||0)+'</div><div class="sub">8회+</div></div>'+
+      '<div class="mc"><div class="lbl">가족외</div><div class="val">'+(byType['가족외']||0)+'</div><div class="sub">8회+</div></div>'+
+      '<div class="mc"><div class="lbl">일반</div><div class="val">'+(byType['일반']||0)+'</div><div class="sub">4회+</div></div>';
   }
 
   /* 카운트 */
