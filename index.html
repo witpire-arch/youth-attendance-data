@@ -17022,6 +17022,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     for(var i=0;i<newItems.length;i++) arr.push(newItems[i]);
   }
   function applyView(region){
+    /* Path β (P2-4 hotfix): 전체 토글 시 page reload 로 깨끗하게 초기화.
+       ARS region 클릭이 lexical/window/FINAL records 를 in-place 필터해서 손상 →
+       전체 복귀 시 어떤 source 도 5/17 records 보유 안 함. 가장 안전한 우회. */
+    if(!region){ window.location.reload(); return; }
     if(!ORIG_M || !ORIG_R){
       console.warn('[ars] ORIG snapshot not ready (data still loading)');
       return;
