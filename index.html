@@ -11376,6 +11376,19 @@ window.addEventListener('load',function(){
   function latestStreak(id){var r=latestRec(id); return r?Number(r.streak)||0:0;}
   function badgeType(t){var nt=normType(t), cls=nt==='가족'?'b-fam':nt==='가족외'?'b-famx':'b-gen'; return '<span class="badge '+cls+'">'+esc(nt)+'</span>';}
   function detailBadge(d){ if(!d)return '<span style="color:var(--text3)">전월 기록 없음</span>'; var cls=d==='QR인증'?'b-qr':d==='사유결석'?'b-ab':d==='대체예배'?'b-fam':d==='온라인예배'?'b-sa':d==='인증오류'?'b-ab':'b-sa'; return '<span class="badge '+cls+'">'+esc(d)+'</span>';}
+  /* 작업 2 fix (재적용): detailFull(r) — st badge + rsn 괄호 형식.
+     v1.1.1 reset 시 손실됐던 phase2.0a 패치. cycle confirmed 모드에서도 정상 표시 보장. */
+  function detailFull(r){
+    if(!r) return '<span style="color:var(--text3)">전월 기록 없음</span>';
+    var st = clean(r.st || r['출석유형'] || r['출결']);
+    var rsn = clean(r.rsn || r.reason || r['사유'] || r['세부사유']);
+    if(!st && !rsn) return '<span style="color:var(--text3)">전월 기록 없음</span>';
+    if(!st) return esc(rsn);
+    var cls = st==='QR인증'?'b-qr':st==='사유결석'?'b-ab':st==='사유출석'?'b-sa':st==='대체예배'?'b-fam':st==='인증오류'?'b-ab':'b-sa';
+    var html = '<span class="badge '+cls+'">'+esc(st)+'</span>';
+    if(rsn && rsn !== st) html += '<span style="font-size:11px;color:var(--text3);margin-left:4px">('+esc(rsn)+')</span>';
+    return html;
+  }
   function ensureHabitUI(){
     var ySel=document.getElementById('habit-year');
     var mSel=document.getElementById('habit-month');
@@ -11525,9 +11538,9 @@ window.addEventListener('load',function(){
     if(!body) return;
     var _plansForList = (typeof getPlans==='function')?getPlans():{};
     body.innerHTML=data.length?data.map(function(m){
-      var r=latestPrevRec(m.id,got.mo), d=detail(r), mid=esc(m.id), cnt=prevRecordCount(m.id,got.mo);
+      var r=latestPrevRec(m.id,got.mo), mid=esc(m.id), cnt=prevRecordCount(m.id,got.mo);
       var goal=((_plansForList[m.id]||{}).goal)||'';
-      return '<tr><td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td><td>'+esc(m.region)+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td><td style="font-weight:700;cursor:pointer;color:var(--blue)" onclick="openHabitDetail(\''+mid+'\',\''+esc(got.mo)+'\')">'+esc(m.name)+'</td><td>'+badgeType(m.type)+'</td><td>'+detailBadge(d)+'</td><td><input class="habit-goal-inp" data-id="'+mid+'" value="'+esc(goal)+'" placeholder="월 목표 입력" onchange="saveHabitGoalFromList(this.dataset.id,this.value)" style="width:100%;padding:3px 6px;font-size:11.5px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);font-family:inherit"></td></tr>';
+      return '<tr><td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td><td>'+esc(m.region)+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td><td style="font-weight:700;cursor:pointer;color:var(--blue)" onclick="openHabitDetail(\''+mid+'\',\''+esc(got.mo)+'\')">'+esc(m.name)+'</td><td>'+badgeType(m.type)+'</td><td>'+detailFull(r)+'</td><td><input class="habit-goal-inp" data-id="'+mid+'" value="'+esc(goal)+'" placeholder="월 목표 입력" onchange="saveHabitGoalFromList(this.dataset.id,this.value)" style="width:100%;padding:3px 6px;font-size:11.5px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);font-family:inherit"></td></tr>';
     }).join(''):'<tr><td colspan="7" class="empty">해당 인원 없음</td></tr>';
   };
   // 리스트의 월목표 입력 → plans 저장 + 상세 화면의 hd-goal과 동기화
@@ -18615,7 +18628,9 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
   /* admin 한정 - s2 bar 옆에 작은 "💾 백업" 버튼 자동 삽입 */
   function injectBackupButton(){
-    var bar = document.getElementById('s2-status-bar');
+    /* 실제 ID = 's2-bar' (line 15474). 폴백: s2-create-btn 의 부모 */
+    var bar = document.getElementById('s2-bar') ||
+              (document.getElementById('s2-create-btn') && document.getElementById('s2-create-btn').parentNode);
     if(!bar) return false;
     if(document.getElementById('s2-backup-btn')) return true;
     var u = window.currentUser || {};
@@ -18629,6 +18644,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     btn.innerHTML = '💾 백업';
     btn.addEventListener('click', function(){ window.__exportCycleData(); });
     bar.appendChild(btn);
+    console.log('[cycle-backup] 💾 백업 버튼 inject 완료 (s2-bar)');
     return true;
   }
   /* 보고 주제 탭 진입 시 / 주기적으로 버튼 inject 시도 */
