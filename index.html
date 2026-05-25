@@ -18697,3 +18697,248 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- CYCLE_BACKUP_TOOL_END -->
+
+<!-- PHASE_5B_A_FB_SYNC_PHASE_B_START -->
+<script id="phase-5b-a-fb-sync-phase-b">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Phase 5b-A / Phase B — LocalStorage → Firebase dual-write 시작
+     (Phase A spec 승인: cycleId="YYYY-MM", dual-write 2-3주, Phase F=별도 작업)
+
+     범위:
+       att_targets            ↔ attendanceTargets/<personId>_<type>
+       att_plans              ↔ monthlyPlans/<personId>
+       att_habitual_plans_v1  ↔ habitualPlans/<cycleId>
+
+     동작:
+       1) localStorage.setItem 인터셉트 — watched key 만 FB 도 함께 write (admin only)
+       2) 양방향 1회 seed (로드 시):
+            a) admin: LS 데이터 있고 FB 비어있으면 → FB seed (LS→FB)
+            b) 모든 사용자: FB 데이터 있고 LS 비어있으면 → LS 미러 (FB→LS)
+       3) 읽기 경로 변경 없음 (Phase C 작업)
+       4) fbDB / currentUser 미준비 시 silent skip + 폴링 후 재시도
+
+     안전:
+       - LS write 는 항상 먼저 성공 (인터셉트는 wrap 이지 replace 아님)
+       - 모든 FB 호출 try/catch + .catch() — 실패해도 LS 무손상
+       - region user 는 FB write 시도 안 함 (admin only)
+       - seed 중복 방지: 디바이스별 LS 마커 (phase5bA_seed_v1)
+       - 롤백: 이 IIFE 통째로 삭제 + sentinel 키 삭제
+
+     디버그: window.__phase5bA.stats() / seedNow() / syncNow(key) / reset()
+     ════════════════════════════════════════════════════════════════ */
+
+  var SCHEMA_VERSION = 1;
+  var SEED_SENTINEL_KEY = 'phase5bA_seed_v' + SCHEMA_VERSION;
+
+  /* watched key → Firebase 경로 매핑 */
+  var WATCHED = {
+    'att_targets':           { fbPath: 'attendanceTargets' },
+    'att_plans':             { fbPath: 'monthlyPlans' },
+    'att_habitual_plans_v1': { fbPath: 'habitualPlans' }
+  };
+
+  function isAdmin(){
+    try{
+      var u = window.currentUser; if(!u) return false;
+      if(u.role === 'admin') return true;
+      return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+    }catch(e){ return false; }
+  }
+  function hasFB(){ return !!(window.fbDB && typeof window.fbDB.ref === 'function'); }
+  function nowIso(){ return new Date().toISOString(); }
+  function curUserMeta(){
+    var u = window.currentUser || {};
+    return { email: String(u.email||''), role: String(u.role||''), ts: nowIso() };
+  }
+
+  /* dict obj → FB payload (_meta 첨부) */
+  function withMeta(obj, source){
+    var meta = { schemaVersion: SCHEMA_VERSION, lastWriter: curUserMeta(), source: source||'' };
+    var payload = {};
+    for(var k in obj){ if(Object.prototype.hasOwnProperty.call(obj,k) && k !== '_meta'){ payload[k] = obj[k]; } }
+    payload._meta = meta;
+    return payload;
+  }
+  /* FB val → dict (_meta 제거) */
+  function stripMeta(val){
+    if(!val || typeof val !== 'object') return {};
+    var out = {};
+    for(var k in val){ if(Object.prototype.hasOwnProperty.call(val,k) && k !== '_meta'){ out[k] = val[k]; } }
+    return out;
+  }
+  function dictSize(obj){
+    if(!obj || typeof obj !== 'object') return 0;
+    var n = 0;
+    for(var k in obj){ if(Object.prototype.hasOwnProperty.call(obj,k) && k !== '_meta') n++; }
+    return n;
+  }
+  function lsParse(key){
+    try{ var raw = localStorage.getItem(key); if(!raw) return null; return JSON.parse(raw); }
+    catch(e){ console.warn('[5bA-phaseB] LS parse fail', key, e); return null; }
+  }
+
+  /* ── 1. LS write 인터셉트 ──────────────────────────────────────── */
+  var _origSetItem;
+  try{
+    _origSetItem = localStorage.setItem.bind(localStorage);
+    Object.defineProperty(localStorage, 'setItem', {
+      value: function(key, value){
+        var ret = _origSetItem(key, value);  /* LS write 먼저 — 실패 시 throw, FB 시도 안 함 */
+        if(WATCHED[key]){
+          try{ syncKeyToFB(key, value, 'intercept'); }
+          catch(e){ console.warn('[5bA-phaseB] FB sync exception (silent):', key, e); }
+        }
+        return ret;
+      },
+      writable: true, configurable: true
+    });
+  }catch(e){
+    console.error('[5bA-phaseB] localStorage.setItem hook 실패 — Phase B 비활성:', e);
+    return;
+  }
+
+  function syncKeyToFB(lsKey, valueStr, source){
+    if(!isAdmin()) return;
+    if(!hasFB()) return;
+    var cfg = WATCHED[lsKey]; if(!cfg) return;
+    var obj; try{ obj = JSON.parse(valueStr); }catch(e){ console.warn('[5bA-phaseB] JSON parse fail:', lsKey); return; }
+    if(!obj || typeof obj !== 'object') obj = {};
+    var payload = withMeta(obj, source || 'intercept');
+    window.fbDB.ref(cfg.fbPath).set(payload).catch(function(err){
+      console.warn('[5bA-phaseB] FB write failed:', cfg.fbPath, err && err.message);
+    });
+  }
+
+  /* ── 2. 양방향 1회 seed ────────────────────────────────────────── */
+  function seedPass(){
+    if(!hasFB()){ console.log('[5bA-phaseB] seed skip: no fbDB'); return; }
+    if(!window.currentUser){ console.log('[5bA-phaseB] seed skip: no currentUser'); return; }
+    /* sentinel 체크: 같은 디바이스에서 동일 schemaVersion seed 시도 1회만 */
+    if(localStorage.getItem(SEED_SENTINEL_KEY)){
+      console.log('[5bA-phaseB] seed skip: sentinel 존재 (reset 하려면 window.__phase5bA.reset())');
+      return;
+    }
+
+    var jobs = Object.keys(WATCHED).map(function(lsKey){
+      var cfg = WATCHED[lsKey];
+      return window.fbDB.ref(cfg.fbPath).once('value').then(function(snap){
+        var fbDict = stripMeta(snap.exists() ? snap.val() : null);
+        var fbN = dictSize(fbDict);
+        /* TOCTOU 방어: FB read 완료 직후 LS 를 다시 읽음 — 사용자가 그 사이에 write 했을 수 있음 */
+        var lsObj = lsParse(lsKey) || {};
+        var lsN = dictSize(lsObj);
+
+        /* (a) FB→LS 미러: FB 가 풍부하고 LS 가 비어있으면 LS 채움 (모든 사용자) */
+        if(fbN > 0 && lsN === 0){
+          try{
+            _origSetItem(lsKey, JSON.stringify(fbDict));  /* 인터셉터 우회 — FB 재write 방지 */
+            console.log('[5bA-phaseB] FB→LS mirror', lsKey, '(' + fbN + ' keys from FB)');
+          }catch(e){ console.warn('[5bA-phaseB] LS mirror write fail', lsKey, e); }
+          return;
+        }
+        /* (b) LS→FB seed: LS 가 풍부하고 FB 가 비어있으면 FB 채움 (admin only) */
+        if(lsN > 0 && fbN === 0){
+          if(!isAdmin()){ console.log('[5bA-phaseB] seed skip (non-admin):', lsKey); return; }
+          var payload = withMeta(lsObj, 'seed');
+          return window.fbDB.ref(cfg.fbPath).set(payload).then(function(){
+            console.log('[5bA-phaseB] LS→FB seed', cfg.fbPath, '(' + lsN + ' keys from LS)');
+          });
+        }
+        /* (c) 양쪽 모두 데이터 — 비교 로그만 (Phase C 에서 충돌 처리) */
+        if(lsN > 0 && fbN > 0){
+          console.log('[5bA-phaseB] both populated', lsKey, 'LS=' + lsN, 'FB=' + fbN, lsN===fbN?'(같은 개수)':'(개수 다름 — Phase C 에서 병합 처리)');
+          return;
+        }
+        /* (d) 양쪽 비어있음 — 할 일 없음 */
+        console.log('[5bA-phaseB] both empty', lsKey);
+      }).catch(function(err){
+        console.warn('[5bA-phaseB] seed pass error', cfg.fbPath, err && err.message);
+      });
+    });
+
+    Promise.all(jobs).then(function(){
+      try{ _origSetItem(SEED_SENTINEL_KEY, nowIso()); }catch(e){}
+      console.log('[5bA-phaseB] seed pass complete — sentinel set');
+    });
+  }
+
+  /* ── 3. boot: fbDB+currentUser 준비 될 때까지 폴링 후 seed ─────── */
+  function waitAndSeed(){
+    var attempts = 0, MAX = 120;  /* 120 * 500ms = 60s */
+    var iv = setInterval(function(){
+      attempts++;
+      if(hasFB() && window.currentUser){
+        clearInterval(iv);
+        seedPass();
+        return;
+      }
+      if(attempts >= MAX){
+        clearInterval(iv);
+        console.log('[5bA-phaseB] wait timeout — fbDB/currentUser 미준비, seed deferred (page reload 시 재시도)');
+      }
+    }, 500);
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(waitAndSeed, 1500); });
+  } else {
+    setTimeout(waitAndSeed, 1500);
+  }
+
+  /* ── 4. 디버그 도구 노출 ───────────────────────────────────────── */
+  window.__phase5bA = {
+    seedNow: function(){
+      try{ localStorage.removeItem(SEED_SENTINEL_KEY); }catch(e){}
+      seedPass();
+    },
+    syncNow: function(key){
+      var raw = localStorage.getItem(key);
+      if(raw){ syncKeyToFB(key, raw, 'manual'); console.log('[5bA-phaseB] manual sync triggered for', key); }
+      else console.warn('[5bA-phaseB] no LS data for', key);
+    },
+    stats: function(){
+      console.group('[5bA-phaseB stats]');
+      console.log('admin:', isAdmin(), '| hasFB:', hasFB(), '| user:', window.currentUser && window.currentUser.email);
+      console.log('sentinel:', localStorage.getItem(SEED_SENTINEL_KEY) || '(미설정)');
+      if(!hasFB()){ console.warn('fbDB 없음 — 비교 불가'); console.groupEnd(); return; }
+      Object.keys(WATCHED).forEach(function(lsKey){
+        var cfg = WATCHED[lsKey];
+        window.fbDB.ref(cfg.fbPath).once('value').then(function(snap){
+          var fbDict = stripMeta(snap.val());
+          var fbN = dictSize(fbDict);
+          var lsObj = lsParse(lsKey) || {};
+          var lsN = dictSize(lsObj);
+          var match = (lsN === fbN) ? '✅ 동기' : '⚠️ 불일치';
+          console.log(lsKey, '→', cfg.fbPath, '| LS=' + lsN, 'FB=' + fbN, match);
+        }).catch(function(err){
+          console.warn(lsKey, 'FB read error:', err && err.message);
+        });
+      });
+      console.groupEnd();
+    },
+    reset: function(){
+      try{ localStorage.removeItem(SEED_SENTINEL_KEY); console.log('[5bA-phaseB] sentinel 삭제 — 다음 새로고침 시 seed 재시도'); }
+      catch(e){ console.warn(e); }
+    },
+    WATCHED: WATCHED,
+    SCHEMA_VERSION: SCHEMA_VERSION,
+    SEED_SENTINEL_KEY: SEED_SENTINEL_KEY,
+    /* Phase C 가 사용할 helpers — 직접 호출 가능 */
+    fbReadDict: function(lsKey){
+      var cfg = WATCHED[lsKey]; if(!cfg) return Promise.reject(new Error('unknown key: '+lsKey));
+      if(!hasFB()) return Promise.reject(new Error('no fbDB'));
+      return window.fbDB.ref(cfg.fbPath).once('value').then(function(snap){ return stripMeta(snap.val()); });
+    },
+    fbWriteDict: function(lsKey, obj){
+      var cfg = WATCHED[lsKey]; if(!cfg) return Promise.reject(new Error('unknown key: '+lsKey));
+      if(!hasFB()) return Promise.reject(new Error('no fbDB'));
+      if(!isAdmin()) return Promise.reject(new Error('admin only'));
+      return window.fbDB.ref(cfg.fbPath).set(withMeta(obj||{}, 'fbWriteDict'));
+    }
+  };
+
+  console.log('[5bA-phaseB] dual-write 활성 (intercept + 1회 seed). 디버그: window.__phase5bA.stats()');
+})();
+</script>
+<!-- PHASE_5B_A_FB_SYNC_PHASE_B_END -->
