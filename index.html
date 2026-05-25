@@ -15003,6 +15003,41 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   function membersAll(){ return Array.isArray(window.MEMBERS) ? window.MEMBERS : []; }
   function nowIso(){ return new Date().toISOString(); }
 
+  /* Phase 2 작업 5a: admin 권한 가드 + 감사 로그 helper */
+  function isAdmin(){
+    var u = window.currentUser;
+    if(!u) return false;
+    if(u.role === 'admin') return true;
+    /* bootstrap admin email fallback */
+    return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+  }
+  function guardAdmin(actionLabel){
+    if(isAdmin()) return true;
+    try{ alert('관리자만 사용 가능합니다.\n액션: ' + (actionLabel||'사이클 변경')); }catch(e){}
+    console.warn('[stage2/guard] non-admin blocked:', actionLabel, 'user:', window.currentUser);
+    return false;
+  }
+  /* cycleChangeLog/<unix>_<rand> = {ts, userEmail, userName, role, region, action, details} */
+  function logCycleAction(action, details){
+    try{
+      if(!window.fbDB) return; /* Firebase 없으면 silent skip */
+      var u = window.currentUser || {};
+      var entry = {
+        ts: nowIso(),
+        userEmail: String(u.email||''),
+        userName: String(u.name||''),
+        role: String(u.role||''),
+        region: String(u.region||''),
+        action: String(action||''),
+        details: details || {}
+      };
+      var key = Date.now() + '_' + Math.random().toString(36).slice(2,8);
+      window.fbDB.ref('cycleChangeLog/' + key).set(entry).catch(function(err){
+        console.warn('[stage2/audit] log write failed:', err);
+      });
+    }catch(e){ console.warn('[stage2/audit] log exception:', e); }
+  }
+
   function prevMonth(mo){
     var y = +mo.slice(0,4), m = +mo.slice(5,7) - 1;
     if(m < 1){ y--; m = 12; }
@@ -15244,6 +15279,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
      기존 plan 있으면 덮어쓰기 confirm — 예 누르면 snapshotMembers 갱신, goals 유지. */
   function createPlanForNextCycle(viewingMo, opts){
     opts = opts || {};
+    /* Phase 2 작업 5a: admin 만 사이클 생성/덮어쓰기 가능. console 우회도 차단 */
+    if(!guardAdmin('사이클 생성/덮어쓰기 (' + (opts.overwrite?'overwrite':'create') + ')')){
+      return { created:false, reason:'permission-denied' };
+    }
     var baseMo = prevMonth(viewingMo);
     var cycleStart = viewingMo;
     var cycleEnd = nextMonth(viewingMo);
@@ -15275,6 +15314,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       ids.forEach(function(id){ if(!existing.goals[id]) existing.goals[id] = emptyGoal(); });
       setPlan(cycleId, existing);
       var ev1 = evaluateAndAdvance(cycleId);
+      /* 감사 로그 — overwrite */
+      logCycleAction('overwriteCycle', { cycleId:cycleId, snapshotCount:ids.length, snapshotSource:idsSource, baseMonth:baseMo });
       return { created:false, overwritten:true,
         cycleId:cycleId, cycleStart:cycleStart, cycleEnd:cycleEnd,
         snapshotCount:ids.length, snapshotSource:idsSource,
@@ -15299,6 +15340,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     ids.forEach(function(id){ plan.goals[id] = emptyGoal(); });
     setPlan(cycleId, plan);
     var result = evaluateAndAdvance(cycleId);
+    /* 감사 로그 — 신규 사이클 생성 */
+    logCycleAction('createCycle', { cycleId:cycleId, snapshotCount:ids.length, snapshotSource:idsSource, baseMonth:baseMo });
     return { created:true,
       cycleId:cycleId, cycleStart:cycleStart, cycleEnd:cycleEnd,
       snapshotCount:ids.length, snapshotSource:idsSource,
@@ -15370,6 +15413,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
   /* addedMembers 에 ID 추가 + goals 에 빈 항목 생성. 중복 추가 방지. */
   function addMemberToPlan(cycleId, personId, reason){
+    /* Phase 2 작업 5a: admin 만 사이클 멤버 추가 가능 */
+    if(!guardAdmin('사이클 멤버 추가 (' + personId + ')')) return false;
     var plan = getPlan(cycleId);
     if(!plan) return false;
     if(!Array.isArray(plan.addedMembers)) plan.addedMembers = [];
@@ -15383,6 +15428,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     });
     if(!plan.goals[personId]) plan.goals[personId] = emptyGoal();
     setPlan(cycleId, plan);
+    /* 감사 로그 */
+    logCycleAction('addMember', { cycleId:cycleId, personId:personId, reason:reason||'baseMonth-recompute' });
     return true;
   }
 
@@ -15456,6 +15503,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
      baseMonth 재계산 결과 중 snapshot/added 에 없는 ID 들을 사용자에게 알리고
      addedMembers 에 추가. */
   function onDetectClick(){
+    /* Phase 2 작업 5a: admin 만 사이클 멤버 추가 가능 */
+    if(!guardAdmin('추가 명단 감지/추가')) return;
     var p = currentPlan();
     if(!p) return;
     var newIds = detectNewMembers(p.cycleId);
@@ -15575,6 +15624,22 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var badge = $('s2-badge'), info = $('s2-info');
     var createBtn = $('s2-create-btn'), diffBtn = $('s2-diff-btn');
     var detectBtn = $('s2-detect-btn');
+    /* Phase 2 작업 5a: admin 외 사용자에게는 destructive 버튼 disabled + tooltip */
+    var admin = isAdmin();
+    [createBtn, detectBtn].forEach(function(b){
+      if(!b) return;
+      if(admin){
+        b.disabled = false;
+        b.title = '';
+        b.style.opacity = '';
+        b.style.cursor = '';
+      } else {
+        b.disabled = true;
+        b.title = '관리자 전용 — 사이클 변경은 관리자만 가능합니다';
+        b.style.opacity = '0.5';
+        b.style.cursor = 'not-allowed';
+      }
+    });
     /* viewing M 기준 cycle 라벨: cycleStart=M, cycleEnd=nextMonth(M) */
     var startN = monthNum(viewingMo), endN = monthNum(nextMonth(viewingMo));
     var nextRange = startN+'-'+endN+'월';
@@ -15658,6 +15723,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   }
 
   function onCreateClick(){
+    /* Phase 2 작업 5a: admin 만 사이클 생성 가능 */
+    if(!guardAdmin('사이클 만들기')) return;
     var viewing = selectedMonth();
     var result = createPlanForNextCycle(viewing);
     var rng;
