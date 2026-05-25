@@ -18864,26 +18864,90 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     });
   }
 
-  /* ── 3. boot: fbDB+currentUser 준비 될 때까지 폴링 후 seed ─────── */
-  function waitAndSeed(){
+  /* ── 2b. Phase C: forceMirrorFromFB — FB 를 source-of-truth 로 격상 ───
+       매 boot 마다 FB→LS 강제 동기화 (sentinel 무관).
+       Phase B 의 1회 seed 는 "LS 비어있을 때만" 미러였음 — Phase C 는 "FB 에 데이터 있으면 무조건 미러".
+       다기기 사용 시: 기기 A 의 변경 → FB → 기기 B 의 다음 boot 시 LS overwrite → 항상 최신 상태.
+       FB 미존재 (legacy/offline) 시는 LS 보존. */
+  var _phaseC_inFlight = false;
+  function forceMirrorFromFB(opts){
+    opts = opts || {};
+    if(!hasFB()){ if(!opts.silent) console.log('[5bA-phaseC] mirror skip: no fbDB'); return Promise.resolve(); }
+    if(!window.currentUser){ if(!opts.silent) console.log('[5bA-phaseC] mirror skip: no currentUser'); return Promise.resolve(); }
+    if(_phaseC_inFlight){ if(!opts.silent) console.log('[5bA-phaseC] mirror skip: already in-flight'); return Promise.resolve(); }
+    _phaseC_inFlight = true;
+
+    var jobs = Object.keys(WATCHED).map(function(lsKey){
+      var cfg = WATCHED[lsKey];
+      return window.fbDB.ref(cfg.fbPath).once('value').then(function(snap){
+        if(!snap.exists()){
+          if(!opts.silent) console.log('[5bA-phaseC] FB empty', cfg.fbPath, '— LS 보존');
+          return;
+        }
+        var fbVal = snap.val();
+        var fbDict = stripMeta(fbVal);
+        var fbN = dictSize(fbDict);
+        if(fbN === 0){
+          if(!opts.silent) console.log('[5bA-phaseC] FB has only _meta', cfg.fbPath, '— LS 보존');
+          return;
+        }
+        var lsRaw = localStorage.getItem(lsKey);
+        var lsObj = lsRaw ? (function(){ try{return JSON.parse(lsRaw);}catch(e){return null;} })() : null;
+        var lsN = dictSize(lsObj);
+        var fbJson = JSON.stringify(fbDict);
+        var lsJson = JSON.stringify(lsObj || {});
+        if(lsRaw && lsJson === fbJson){
+          if(!opts.silent) console.log('[5bA-phaseC] sync ok', lsKey, '(' + fbN + ' keys, identical)');
+          return;
+        }
+        /* FB 가 ground truth — LS overwrite */
+        try{
+          _origSetItem(lsKey, fbJson);   /* 인터셉터 우회 — FB 재write 방지 */
+          console.log('[5bA-phaseC] FB→LS refresh', lsKey, 'LS=' + lsN + ' → FB=' + fbN);
+        }catch(e){
+          console.warn('[5bA-phaseC] LS write fail', lsKey, e);
+        }
+      }).catch(function(err){
+        console.warn('[5bA-phaseC] FB read error', cfg.fbPath, err && err.message);
+      });
+    });
+
+    return Promise.all(jobs).then(function(){
+      _phaseC_inFlight = false;
+      if(!opts.silent) console.log('[5bA-phaseC] forceMirrorFromFB complete');
+      /* refresh 후 화면 자동 갱신: habit 페이지가 active 이면 renderHabit 재호출 */
+      try{
+        var active = document.getElementById('page-report') && document.getElementById('page-report').classList.contains('active');
+        if(active && typeof window.renderHabit === 'function'){
+          window.renderHabit();
+        }
+      }catch(e){}
+    });
+  }
+
+  /* ── 3. boot: fbDB+currentUser 준비 될 때까지 폴링 후 seed + Phase C mirror ─── */
+  function waitAndBoot(){
     var attempts = 0, MAX = 120;  /* 120 * 500ms = 60s */
     var iv = setInterval(function(){
       attempts++;
       if(hasFB() && window.currentUser){
         clearInterval(iv);
+        /* (1) Phase B: 1회 seed (sentinel 미설정 시) */
         seedPass();
+        /* (2) Phase C: FB→LS force mirror — 매 boot, 2초 후 (seed 의 LS→FB write 가 끝나도록) */
+        setTimeout(function(){ forceMirrorFromFB(); }, 2000);
         return;
       }
       if(attempts >= MAX){
         clearInterval(iv);
-        console.log('[5bA-phaseB] wait timeout — fbDB/currentUser 미준비, seed deferred (page reload 시 재시도)');
+        console.log('[5bA-phaseB] wait timeout — fbDB/currentUser 미준비, boot deferred (page reload 시 재시도)');
       }
     }, 500);
   }
   if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', function(){ setTimeout(waitAndSeed, 1500); });
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(waitAndBoot, 1500); });
   } else {
-    setTimeout(waitAndSeed, 1500);
+    setTimeout(waitAndBoot, 1500);
   }
 
   /* ── 4. 디버그 도구 노출 ───────────────────────────────────────── */
@@ -18921,6 +18985,11 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       try{ localStorage.removeItem(SEED_SENTINEL_KEY); console.log('[5bA-phaseB] sentinel 삭제 — 다음 새로고침 시 seed 재시도'); }
       catch(e){ console.warn(e); }
     },
+    /* Phase C — FB→LS 강제 동기화 (수동 트리거) */
+    refreshFromFB: function(){
+      console.log('[5bA-phaseC] 수동 FB→LS refresh 시작...');
+      return forceMirrorFromFB();
+    },
     WATCHED: WATCHED,
     SCHEMA_VERSION: SCHEMA_VERSION,
     SEED_SENTINEL_KEY: SEED_SENTINEL_KEY,
@@ -18938,7 +19007,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[5bA-phaseB] dual-write 활성 (intercept + 1회 seed). 디버그: window.__phase5bA.stats()');
+  console.log('[5bA-phaseB+C] dual-write 활성 (intercept + 1회 seed + 매 boot FB→LS refresh). 디버그: window.__phase5bA.stats() / refreshFromFB()');
 })();
 </script>
 <!-- PHASE_5B_A_FB_SYNC_PHASE_B_END -->
