@@ -1164,6 +1164,9 @@ body.llf-pin-loading::before{
           <select class="fc" id="habit-reg" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto">
             <option value="">전체 지역</option>
           </select>
+          <select class="fc" id="habit-team" onchange="renderHabit&&renderHabit()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto">
+            <option value="">전체 팀</option>
+          </select>
           <select class="fc" id="habit-zone" onchange="renderHabit&&renderHabit()" style="height:28px;font-size:11.5px;padding:2px 7px;width:auto">
             <option value="">전체 팀-구역</option>
           </select>
@@ -11290,7 +11293,43 @@ window.addEventListener('load',function(){
   function prevMonth(mo){var y=+mo.slice(0,4), m=+mo.slice(5,7)-1; if(m<1){y--;m=12;} return y+'-'+String(m).padStart(2,'0');}
   function normType(t){t=clean(t).replace(/\s+/g,''); if(t.indexOf('가족외')>-1||t.indexOf('가족外')>-1)return '가족외'; if(t.indexOf('가족')>-1)return '가족'; return '일반';}
   function recs(){return Array.isArray(window.RECORDS)?window.RECORDS:[];}
-  function allMembers(){var arr=Array.isArray(window.MEMBERS)?window.MEMBERS:[]; if(window.currentUser&&window.currentUser.role!=='admin')arr=arr.filter(function(m){return clean(m.region)===clean(window.currentUser.region);}); var reg=clean(document.getElementById('habit-reg')&&document.getElementById('habit-reg').value); if(reg)arr=arr.filter(function(m){return clean(m.region)===reg;}); var zone=clean(document.getElementById('habit-zone')&&document.getElementById('habit-zone').value); if(zone){var _znorm=(typeof normalizeTeamZone==='function')?normalizeTeamZone(zone):zone;arr=arr.filter(function(m){var _mz=(typeof normalizeTeamZone==='function')?normalizeTeamZone((m.team||'')+'-'+(m.zone||'')):clean((m.team||'')+'-'+(m.zone||''));return _mz===_znorm;});} return arr.filter(function(m){return m&&m.id;});}
+  /* Phase 2 작업 0-2: 팀 표기 정규화 — "1" → "1팀", "사랑" → "사랑팀", "1팀" → 그대로 */
+  function normTeamLabel(t){ var s=clean(t); if(!s)return ''; if(s.indexOf('팀')>=0)return s; return s+'팀'; }
+  function allMembers(){
+    var arr=Array.isArray(window.MEMBERS)?window.MEMBERS:[];
+    if(window.currentUser&&window.currentUser.role!=='admin')arr=arr.filter(function(m){return clean(m.region)===clean(window.currentUser.region);});
+    var reg=clean(document.getElementById('habit-reg')&&document.getElementById('habit-reg').value);
+    if(reg)arr=arr.filter(function(m){return clean(m.region)===reg;});
+    /* Phase 2 작업 0-2: 팀 필터 (team 단위, zone 무관) */
+    var team=clean(document.getElementById('habit-team')&&document.getElementById('habit-team').value);
+    if(team){ var teamN=normTeamLabel(team); arr=arr.filter(function(m){return normTeamLabel(m.team)===teamN;}); }
+    var zone=clean(document.getElementById('habit-zone')&&document.getElementById('habit-zone').value);
+    if(zone){var _znorm=(typeof normalizeTeamZone==='function')?normalizeTeamZone(zone):zone;arr=arr.filter(function(m){var _mz=(typeof normalizeTeamZone==='function')?normalizeTeamZone((m.team||'')+'-'+(m.zone||'')):clean((m.team||'')+'-'+(m.zone||''));return _mz===_znorm;});}
+    return arr.filter(function(m){return m&&m.id;});
+  }
+  /* habit-team 드롭다운 populate — 선택된 region 기준 unique 팀 목록 (region 변경 시 자동 갱신) */
+  window.populateHabitTeams=function(){
+    var sel=document.getElementById('habit-team'); if(!sel) return;
+    var prev=sel.value;
+    var base=Array.isArray(window.MEMBERS)?window.MEMBERS:[];
+    if(window.currentUser && window.currentUser.role!=='admin') base=base.filter(function(m){return clean(m.region)===clean(window.currentUser.region);});
+    var reg=clean(document.getElementById('habit-reg')&&document.getElementById('habit-reg').value);
+    if(reg) base=base.filter(function(m){return clean(m.region)===reg;});
+    var seen={}, teams=[];
+    base.forEach(function(m){var t=normTeamLabel(m.team); if(t && !seen[t]){seen[t]=1; teams.push(t);}});
+    teams.sort(function(a,b){var na=parseInt(a,10), nb=parseInt(b,10), ax=isFinite(na), bx=isFinite(nb); if(ax&&bx)return na-nb; if(ax)return -1; if(bx)return 1; return a.localeCompare(b,'ko');});
+    sel.innerHTML='<option value="">전체 팀</option>'+teams.map(function(t){return '<option value="'+esc(t)+'">'+esc(t)+'</option>';}).join('');
+    if(prev && seen[prev]) sel.value=prev; else sel.value='';
+  };
+  /* habit-reg 변경 시 팀 드롭다운 재populate */
+  document.addEventListener('change', function(e){
+    if(e.target && e.target.id==='habit-reg'){
+      try{ window.populateHabitTeams(); }catch(err){}
+    }
+  }, true);
+  /* 페이지 로드 후 자동 populate (data 로드 대기) */
+  setTimeout(function(){ try{ window.populateHabitTeams(); }catch(e){} }, 1500);
+  setTimeout(function(){ try{ window.populateHabitTeams(); }catch(e){} }, 4000);
   function detail(r){ if(!r)return ''; var st=clean(r.st||r['출석유형']||r['출결']); var rsn=clean(r.rsn||r.reason||r['사유']||r['세부사유']); if(st==='사유출석'){var rv=rsn||'인증안함'; return (rv===''||rv==='미입력')?'인증안함':rv;} if(st==='QR인증')return 'QR인증'; if(st==='사유결석'||st==='결석사유'||st==='결석'||st==='미출석')return '사유결석'; return st||rsn; }
   function weekOf(r){var d=nd(r.date); if(!d)return 1; var day=+d.slice(8,10); return Math.ceil(day/7)||1;}
   function monthRecs(mo){
