@@ -18455,3 +18455,190 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- RESTORE_FAMILY_TYPES_END -->
+
+<!-- CYCLE_BACKUP_TOOL_START -->
+<script id="cycle-backup-tool">
+(function(){
+  'use strict';
+  /* Phase 2 작업 5b-B: 사이클/목표/타겟 LocalStorage 데이터 export/import 도구.
+     사이클 데이터는 Firebase 미저장 → 브라우저 손실 시 영구 손실 → 정기 백업 권장.
+
+     사용법:
+       window.__exportCycleData()        — JSON 파일 다운로드 (admin only)
+       window.__importCycleData(jsonText) — JSON 텍스트로 복원 (confirm)
+       window.__cycleBackupStats()        — 현재 LocalStorage 상태 콘솔 출력 */
+
+  var KEYS = ['att_habitual_plans_v1', 'att_plans', 'att_targets'];
+  var VERSION = 'v1.1.2-cycle-backup';
+
+  function readKey(k){
+    try{
+      var raw = localStorage.getItem(k);
+      return raw ? JSON.parse(raw) : null;
+    }catch(e){ return null; }
+  }
+
+  function buildExportObject(){
+    var u = window.currentUser || {};
+    var data = {};
+    KEYS.forEach(function(k){ data[k] = readKey(k); });
+    /* 통계 계산 */
+    var habitualPlans = data['att_habitual_plans_v1'] || {};
+    var plans = data['att_plans'] || {};
+    var targets = data['att_targets'] || {};
+    var cycles = Object.keys(habitualPlans).length;
+    var totalSnapshot = 0, totalAdded = 0, totalGoals = 0;
+    Object.keys(habitualPlans).forEach(function(cid){
+      var c = habitualPlans[cid] || {};
+      totalSnapshot += (Array.isArray(c.snapshotMembers) ? c.snapshotMembers.length : 0);
+      totalAdded += (Array.isArray(c.addedMembers) ? c.addedMembers.length : 0);
+      totalGoals += Object.keys(c.goals || {}).length;
+    });
+    return {
+      exportedAt: new Date().toISOString(),
+      version: VERSION,
+      user: {
+        email: String(u.email||''),
+        name: String(u.name||''),
+        role: String(u.role||''),
+        region: String(u.region||'')
+      },
+      stats: {
+        cycles: cycles,
+        totalSnapshotMembers: totalSnapshot,
+        totalAddedMembers: totalAdded,
+        totalGoalsInCycles: totalGoals,
+        totalPlans: Object.keys(plans).length,
+        totalTargets: Object.keys(targets).length
+      },
+      keys: data
+    };
+  }
+
+  function ymd_hm(){
+    var d = new Date();
+    function p(n){ return String(n).padStart(2,'0'); }
+    return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes());
+  }
+
+  window.__cycleBackupStats = function(){
+    var obj = buildExportObject();
+    console.log('[cycle-backup/stats] === 현재 LocalStorage 상태 ===');
+    console.log('  사이클 수             :', obj.stats.cycles);
+    console.log('  총 snapshotMembers    :', obj.stats.totalSnapshotMembers);
+    console.log('  총 addedMembers       :', obj.stats.totalAddedMembers);
+    console.log('  총 goals (사이클 안)  :', obj.stats.totalGoalsInCycles);
+    console.log('  총 plans (별도)       :', obj.stats.totalPlans);
+    console.log('  총 targets            :', obj.stats.totalTargets);
+    console.log('  user                  :', obj.user.email, '(' + obj.user.role + ')');
+    return obj.stats;
+  };
+
+  window.__exportCycleData = function(){
+    var u = window.currentUser || {};
+    var admin = (u.role === 'admin') || (String(u.email||'').toLowerCase() === 'witpire@gmail.com');
+    if(!admin){
+      console.warn('[cycle-backup/export] admin 만 사용 가능 (현재:', u.email || '비로그인', ')');
+      try{ alert('관리자만 사용 가능합니다.'); }catch(e){}
+      return;
+    }
+    var obj = buildExportObject();
+    if(obj.stats.cycles === 0 && obj.stats.totalPlans === 0 && obj.stats.totalTargets === 0){
+      console.warn('[cycle-backup/export] LocalStorage 에 백업할 데이터 없음');
+      if(!window.confirm('백업할 사이클/목표/타겟 데이터가 없습니다.\n빈 파일을 다운로드할까요?')) return;
+    }
+    var fileName = 'kmjj-cycle-backup-' + ymd_hm() + '.json';
+    var blob = new Blob([JSON.stringify(obj, null, 2)], { type:'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = fileName;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 500);
+    console.log('[cycle-backup/export] ✅ 다운로드 완료:', fileName);
+    console.log('[cycle-backup/export] stats:', obj.stats);
+  };
+
+  window.__importCycleData = function(jsonText){
+    var u = window.currentUser || {};
+    var admin = (u.role === 'admin') || (String(u.email||'').toLowerCase() === 'witpire@gmail.com');
+    if(!admin){
+      console.warn('[cycle-backup/import] admin 만 사용 가능');
+      try{ alert('관리자만 사용 가능합니다.'); }catch(e){}
+      return;
+    }
+    if(!jsonText){
+      console.warn('[cycle-backup/import] 사용법: window.__importCycleData(\'<JSON text>\')');
+      console.log('  Tip: copy(jsonContent) → window.__importCycleData(jsonContent) — paste 어렵으면');
+      console.log('  Tip: var x = await fetch("URL_to_backup.json").then(r=>r.text()); window.__importCycleData(x);');
+      return;
+    }
+    var parsed;
+    try{ parsed = JSON.parse(jsonText); }
+    catch(e){ console.error('[cycle-backup/import] JSON 파싱 실패:', e); return; }
+    if(!parsed || !parsed.keys || !parsed.version){
+      console.error('[cycle-backup/import] 잘못된 백업 파일 형식 (version/keys 누락)');
+      return;
+    }
+    /* 현재 상태 미리보기 */
+    var current = buildExportObject();
+    var newStats = parsed.stats || {};
+    var msg = '⚠️ LocalStorage 사이클/목표/타겟 데이터를 백업 파일로 덮어씁니다.\n\n'+
+              '[현재 → 백업파일]\n'+
+              '  사이클        : ' + current.stats.cycles + ' → ' + (newStats.cycles||0) + '\n'+
+              '  snapshotMembers: ' + current.stats.totalSnapshotMembers + ' → ' + (newStats.totalSnapshotMembers||0) + '\n'+
+              '  addedMembers  : ' + current.stats.totalAddedMembers + ' → ' + (newStats.totalAddedMembers||0) + '\n'+
+              '  goals         : ' + current.stats.totalGoalsInCycles + ' → ' + (newStats.totalGoalsInCycles||0) + '\n'+
+              '  plans         : ' + current.stats.totalPlans + ' → ' + (newStats.totalPlans||0) + '\n'+
+              '  targets       : ' + current.stats.totalTargets + ' → ' + (newStats.totalTargets||0) + '\n\n'+
+              '백업 파일 정보:\n'+
+              '  exportedAt: ' + parsed.exportedAt + '\n'+
+              '  user      : ' + (parsed.user ? parsed.user.email : '?') + '\n\n'+
+              '진행할까요? (취소 가능)';
+    if(!window.confirm(msg)){
+      console.log('[cycle-backup/import] 사용자 취소');
+      return;
+    }
+    /* 적용 — 각 key 별로 LocalStorage 갱신 */
+    var applied = 0;
+    KEYS.forEach(function(k){
+      if(parsed.keys[k] !== undefined && parsed.keys[k] !== null){
+        try{
+          localStorage.setItem(k, JSON.stringify(parsed.keys[k]));
+          applied++;
+          console.log('[cycle-backup/import] ✓', k);
+        }catch(e){ console.warn('[cycle-backup/import] ✗', k, e); }
+      }
+    });
+    console.log('[cycle-backup/import] ✅ 복원 완료 —', applied, '개 key 적용');
+    console.log('[cycle-backup/import] 페이지 새로고침 권장 (사이클/목표 즉시 반영)');
+  };
+
+  /* admin 한정 - s2 bar 옆에 작은 "💾 백업" 버튼 자동 삽입 */
+  function injectBackupButton(){
+    var bar = document.getElementById('s2-status-bar');
+    if(!bar) return false;
+    if(document.getElementById('s2-backup-btn')) return true;
+    var u = window.currentUser || {};
+    var admin = (u.role === 'admin') || (String(u.email||'').toLowerCase() === 'witpire@gmail.com');
+    if(!admin) return false;
+    var btn = document.createElement('button');
+    btn.id = 's2-backup-btn';
+    btn.className = 'btn btn-sm';
+    btn.style.cssText = 'background:var(--surface2,#f5f5f0);color:var(--text2,#555);font-size:11px';
+    btn.title = '사이클/목표/타겟 LocalStorage 데이터를 JSON 파일로 다운로드 (정기 백업 권장)';
+    btn.innerHTML = '💾 백업';
+    btn.addEventListener('click', function(){ window.__exportCycleData(); });
+    bar.appendChild(btn);
+    return true;
+  }
+  /* 보고 주제 탭 진입 시 / 주기적으로 버튼 inject 시도 */
+  setInterval(function(){ try{ injectBackupButton(); }catch(e){} }, 2000);
+
+  console.log('[cycle-backup] 도구 노출 (admin only):');
+  console.log('  1. window.__cycleBackupStats()    — 현재 상태 확인');
+  console.log('  2. window.__exportCycleData()     — JSON 다운로드');
+  console.log('  3. window.__importCycleData(json) — JSON 으로 복원 (confirm)');
+  console.log('  💾 백업 버튼: 보고 주제 → 습관성 결석자 페이지 s2 bar 우측');
+})();
+</script>
+<!-- CYCLE_BACKUP_TOOL_END -->
