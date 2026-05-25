@@ -18925,7 +18925,140 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     });
   }
 
-  /* ── 3. boot: fbDB+currentUser 준비 될 때까지 폴링 후 seed + Phase C mirror ─── */
+  /* ── 2c. Phase D: onValue 실시간 리스너 — 새로고침 없이 다기기 sync ────
+       다른 기기에서 FB 가 갱신되면 5-10초 내에 자동으로 LS 업데이트 + 화면 재렌더.
+       Echo loop 방지: stable JSON 비교 — FB 와 LS 가 동일하면 자신의 echo 로 간주.
+       Input race 방지: focus + caret 위치 보존, 입력 중인 row 와 동일하면 갱신 지연.
+       Initial fire skip: Firebase 의 on('value') 는 attach 직후 1회 fire — Phase C 가 이미 처리. */
+
+  var _phaseD_listeners = {};   /* fbPath → unsubscribe fn */
+  var _phaseD_firstFire = {};   /* fbPath → bool (true until first event consumed) */
+
+  /* 키 순서 무관 stable JSON — echo 비교용 */
+  function stableJson(v){
+    if(v === null || v === undefined) return 'null';
+    if(typeof v !== 'object') return JSON.stringify(v);
+    if(Array.isArray(v)) return '[' + v.map(stableJson).join(',') + ']';
+    var keys = Object.keys(v).sort();
+    return '{' + keys.map(function(k){ return JSON.stringify(k) + ':' + stableJson(v[k]); }).join(',') + '}';
+  }
+
+  /* UI refresh — focus/caret 보존 + debounce */
+  var _phaseD_refreshTimer = null;
+  function scheduleUIRefresh(reason){
+    if(_phaseD_refreshTimer) clearTimeout(_phaseD_refreshTimer);
+    _phaseD_refreshTimer = setTimeout(function(){
+      _phaseD_refreshTimer = null;
+      try{
+        /* 입력 중인 input 의 focus/caret 저장 */
+        var active = document.activeElement;
+        var saved = null;
+        if(active && active.tagName === 'INPUT' && active.classList &&
+           (active.classList.contains('s2-goal-inp') || active.classList.contains('habit-goal-inp'))){
+          saved = {
+            pid: active.dataset.pid || active.dataset.id || '',
+            value: active.value,
+            selStart: active.selectionStart,
+            selEnd: active.selectionEnd,
+            cls: active.classList.contains('s2-goal-inp') ? 's2-goal-inp' : 'habit-goal-inp'
+          };
+        }
+        /* 화면 재렌더 (report 페이지가 active 이고 renderHabit 정의됐을 때만) */
+        var page = document.getElementById('page-report');
+        if(page && page.classList.contains('active') && typeof window.renderHabit === 'function'){
+          window.renderHabit();
+          console.log('[5bA-phaseD] UI refresh triggered ('+ (reason||'remote-change') +')');
+        }
+        /* focus/caret 복원 (사용자 입력 중이면 그대로 유지) */
+        if(saved && saved.pid){
+          setTimeout(function(){
+            try{
+              var inps = document.querySelectorAll('.' + saved.cls);
+              for(var i = 0; i < inps.length; i++){
+                var pid = inps[i].dataset.pid || inps[i].dataset.id || '';
+                if(pid === saved.pid){
+                  /* 사용자가 미저장 입력 중이었다면 그 값을 유지 */
+                  if(saved.value !== inps[i].value){
+                    inps[i].value = saved.value;
+                  }
+                  inps[i].focus();
+                  try{ inps[i].setSelectionRange(saved.selStart, saved.selEnd); }catch(_){}
+                  break;
+                }
+              }
+            }catch(e){}
+          }, 0);
+        }
+      }catch(e){ console.warn('[5bA-phaseD] UI refresh error', e); }
+    }, 600);  /* 600ms debounce — 빠른 연속 변경 흡수 */
+  }
+
+  function attachListeners(){
+    if(!hasFB()){ console.log('[5bA-phaseD] attach skip: no fbDB'); return; }
+    if(!window.currentUser){ console.log('[5bA-phaseD] attach skip: no currentUser'); return; }
+
+    Object.keys(WATCHED).forEach(function(lsKey){
+      var cfg = WATCHED[lsKey];
+      if(_phaseD_listeners[cfg.fbPath]){
+        console.log('[5bA-phaseD] already attached:', cfg.fbPath);
+        return;
+      }
+      var ref = window.fbDB.ref(cfg.fbPath);
+      _phaseD_firstFire[cfg.fbPath] = true;
+
+      var handler = function(snap){
+        try{
+          /* (1) Initial fire — attach 직후 1회 (Phase C 가 이미 처리) */
+          if(_phaseD_firstFire[cfg.fbPath]){
+            _phaseD_firstFire[cfg.fbPath] = false;
+            console.log('[5bA-phaseD] initial fire skipped:', cfg.fbPath);
+            return;
+          }
+
+          var fbDict = stripMeta(snap.val());
+          var lsRaw = localStorage.getItem(lsKey);
+          var lsObj = (function(){ try{ return lsRaw ? JSON.parse(lsRaw) : {}; }catch(e){ return {}; } })();
+
+          /* (2) Echo 감지 — stable JSON 비교. 자신의 write 가 돌아온 경우 skip. */
+          var fbJson = stableJson(fbDict);
+          var lsJson = stableJson(lsObj);
+          if(fbJson === lsJson){
+            console.log('[5bA-phaseD] echo skipped (LS===FB):', cfg.fbPath);
+            return;
+          }
+
+          /* (3) Remote change — LS 갱신 + UI 재렌더 */
+          _origSetItem(lsKey, JSON.stringify(fbDict));   /* 인터셉터 우회 */
+          var lsN = dictSize(lsObj), fbN = dictSize(fbDict);
+          console.log('[5bA-phaseD] remote change applied:', lsKey, 'LS=' + lsN + ' → FB=' + fbN);
+          scheduleUIRefresh(lsKey);
+        }catch(e){ console.warn('[5bA-phaseD] handler error', cfg.fbPath, e); }
+      };
+
+      ref.on('value', handler);
+      _phaseD_listeners[cfg.fbPath] = function(){
+        try{ ref.off('value', handler); }catch(e){}
+      };
+    });
+    console.log('[5bA-phaseD] listeners attached:', Object.keys(_phaseD_listeners));
+  }
+
+  function detachListeners(){
+    var paths = Object.keys(_phaseD_listeners);
+    paths.forEach(function(path){
+      try{ _phaseD_listeners[path](); }catch(e){}
+    });
+    _phaseD_listeners = {};
+    _phaseD_firstFire = {};
+    if(paths.length) console.log('[5bA-phaseD] listeners detached:', paths);
+  }
+
+  /* 페이지 unload 시 listener 정리 — leak 방지 */
+  window.addEventListener('beforeunload', detachListeners);
+  /* 모바일 Safari 등 beforeunload 미지원 환경 대비 */
+  window.addEventListener('pagehide', detachListeners);
+
+  /* ── 3. boot: fbDB+currentUser 준비 후 seed → mirror → 실시간 리스너 attach ─── */
   function waitAndBoot(){
     var attempts = 0, MAX = 120;  /* 120 * 500ms = 60s */
     var iv = setInterval(function(){
@@ -18935,7 +19068,12 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         /* (1) Phase B: 1회 seed (sentinel 미설정 시) */
         seedPass();
         /* (2) Phase C: FB→LS force mirror — 매 boot, 2초 후 (seed 의 LS→FB write 가 끝나도록) */
-        setTimeout(function(){ forceMirrorFromFB(); }, 2000);
+        setTimeout(function(){
+          forceMirrorFromFB().then(function(){
+            /* (3) Phase D: mirror 완료 후 실시간 리스너 attach */
+            attachListeners();
+          });
+        }, 2000);
         return;
       }
       if(attempts >= MAX){
@@ -18990,6 +19128,14 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       console.log('[5bA-phaseC] 수동 FB→LS refresh 시작...');
       return forceMirrorFromFB();
     },
+    /* Phase D — onValue 실시간 리스너 수동 제어 */
+    attachListeners: function(){ attachListeners(); },
+    detachListeners: function(){ detachListeners(); },
+    listenerStatus: function(){
+      var paths = Object.keys(_phaseD_listeners);
+      console.log('[5bA-phaseD] active listeners:', paths.length ? paths : '(없음)');
+      return paths;
+    },
     WATCHED: WATCHED,
     SCHEMA_VERSION: SCHEMA_VERSION,
     SEED_SENTINEL_KEY: SEED_SENTINEL_KEY,
@@ -19007,7 +19153,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[5bA-phaseB+C] dual-write 활성 (intercept + 1회 seed + 매 boot FB→LS refresh). 디버그: window.__phase5bA.stats() / refreshFromFB()');
+  console.log('[5bA-phaseB+C+D] dual-write + 매 boot mirror + onValue 실시간 sync 활성. 디버그: window.__phase5bA.stats() / refreshFromFB() / listenerStatus()');
 })();
 </script>
 <!-- PHASE_5B_A_FB_SYNC_PHASE_B_END -->
