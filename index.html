@@ -4137,7 +4137,31 @@ function exportCSV(){
 function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}
 function closeMbg(e,id){if(e.target===document.getElementById(id))closeModal(id);}
-function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}
+/* Phase 2 작업 0: showToast throttle + focus 보존
+   - 같은 메시지 5초 내 중복 출력 차단 (입력 흐름 방해 최소화)
+   - toast 표시 직전 activeElement 캡처 → 표시 후 focus 복원 (커서/입력 유지)
+   - toast 표시 시간 단축 2500ms → 1200ms (덜 방해) */
+function showToast(msg){
+  var t=document.getElementById('toast'); if(!t) return;
+  /* dedupe: same message within 5초 → skip */
+  var key = String(msg||'');
+  var now = Date.now();
+  if(showToast.__last && showToast.__last.key === key && (now - showToast.__last.t) < 5000) return;
+  showToast.__last = { key:key, t:now };
+  /* focus 보존: 표시 전 activeElement 기억, 표시 후 복원 (toast 자체는 pointer-events:none 이라 focus steal 안 함이 정상이지만 안전망) */
+  var prev = document.activeElement;
+  t.textContent=msg; t.classList.add('show');
+  setTimeout(function(){
+    t.classList.remove('show');
+    /* focus 복원 (input/textarea 만 — button 등은 원래 의도 안 깨기) */
+    try{
+      if(prev && (prev.tagName==='INPUT' || prev.tagName==='TEXTAREA' || prev.tagName==='SELECT')
+        && document.activeElement !== prev && document.body.contains(prev)){
+        prev.focus();
+      }
+    }catch(e){}
+  }, 1200);
+}
 
 // ══════════════════════════════════════════
 // MONTH CHANGE
