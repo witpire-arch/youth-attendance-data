@@ -12403,6 +12403,7 @@ console.log('[MFV2] Loaded');
         var recLen=(Array.isArray(window.RECORDS)?window.RECORDS.length:0);
         var memLen=(Array.isArray(window.MEMBERS)?window.MEMBERS.length:0);
         var reg=(document.getElementById('habit-reg')||{}).value||'';
+        var team=(document.getElementById('habit-team')||{}).value||'';  /* Phase 2 작업 0-2: 캐시 키에 팀 포함 */
         var zone=(document.getElementById('habit-zone')||{}).value||'';
         var y=(document.getElementById('habit-year')||{}).value||'';
         var mo=(document.getElementById('habit-month')||{}).value||'';
@@ -12410,7 +12411,7 @@ console.log('[MFV2] Loaded');
         var st=(document.getElementById('habit-st')||{}).value||'';
         var tgtCnt=0;
         try{ var tg=(typeof window.getTargets==='function')?window.getTargets():{}; tgtCnt=Object.keys(tg).filter(function(k){return k.indexOf('_habit')>-1&&tg[k];}).length; }catch(e){}
-        var key=[recLen,memLen,reg,zone,y,mo,only,st,tgtCnt].join('|');
+        var key=[recLen,memLen,reg,team,zone,y,mo,only,st,tgtCnt].join('|');
         if(_ghdCache && _ghdCache.key===key){ return _ghdCache.val; }
         var val=_origGHD.apply(this,arguments);
         _ghdCache={key:key,val:val};
