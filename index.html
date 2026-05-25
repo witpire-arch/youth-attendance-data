@@ -15624,8 +15624,18 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var badge = $('s2-badge'), info = $('s2-info');
     var createBtn = $('s2-create-btn'), diffBtn = $('s2-diff-btn');
     var detectBtn = $('s2-detect-btn');
-    /* Phase 2 작업 5a: admin 외 사용자에게는 destructive 버튼 disabled + tooltip */
+    /* Phase 2 작업 5a (모바일 호환 보강): admin 외 사용자에게는 사이클 UI 전체 숨김.
+       사이클 데이터는 LocalStorage 만 — region 사용자가 봐도 빈 화면이라 혼란만. */
     var admin = isAdmin();
+    var bar = document.getElementById('s2-status-bar') || (createBtn && createBtn.parentNode);
+    if(bar){
+      if(admin){
+        bar.style.display = '';
+      } else {
+        bar.style.display = 'none'; /* region 사용자에게 사이클 bar 전체 숨김 */
+      }
+    }
+    /* defense in depth: 개별 버튼도 disabled (bar 가 안 잡힐 경우 대비) */
     [createBtn, detectBtn].forEach(function(b){
       if(!b) return;
       if(admin){
@@ -15633,13 +15643,27 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         b.title = '';
         b.style.opacity = '';
         b.style.cursor = '';
+        b.style.display = '';
       } else {
         b.disabled = true;
-        b.title = '관리자 전용 — 사이클 변경은 관리자만 가능합니다';
-        b.style.opacity = '0.5';
+        b.title = '🔒 관리자 전용 — 사이클 변경은 관리자만 가능합니다';
+        b.style.opacity = '0.4';
         b.style.cursor = 'not-allowed';
+        b.style.display = 'none';
       }
     });
+    /* region 사용자에겐 admin 만 보는 분리 안내 — 사이클 UI 가 안 보여도 빈 카드만 남지 않게 */
+    var habitCard = document.querySelector('#rt-habit .card');
+    if(habitCard && !admin && !document.getElementById('s2-region-notice')){
+      var notice = document.createElement('div');
+      notice.id = 's2-region-notice';
+      notice.style.cssText = 'padding:8px 12px;margin-bottom:10px;background:var(--surface2,#f5f5f0);border:1px dashed var(--border,#ddd);border-radius:6px;font-size:12px;color:var(--text2,#555)';
+      notice.innerHTML = '🔒 사이클 생성/변경은 관리자만 가능합니다. 명단 조회 및 월목표 입력은 가능합니다.';
+      habitCard.insertBefore(notice, habitCard.firstChild);
+    } else if(admin){
+      var oldNotice = document.getElementById('s2-region-notice');
+      if(oldNotice) oldNotice.remove();
+    }
     /* viewing M 기준 cycle 라벨: cycleStart=M, cycleEnd=nextMonth(M) */
     var startN = monthNum(viewingMo), endN = monthNum(nextMonth(viewingMo));
     var nextRange = startN+'-'+endN+'월';
