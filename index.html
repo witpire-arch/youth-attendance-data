@@ -18103,3 +18103,264 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- PHASE_1_6_INTEGRITY_CHECK_END -->
+
+<!-- RESTORE_FAMILY_TYPES_START -->
+<script id="restore-family-types">
+(function(){
+  'use strict';
+  /* Phase 2 작업 4: members.type 가족/가족외 228명 복구 도구.
+     절차:
+       1. window.__restoreFamilyTypes()         — dry-run (변경 X)
+       2. window.__restoreFamilyTypes_backup()  — 현재 members 백업 JSON 다운로드
+       3. window.__restoreFamilyTypes_apply()   — Firebase 적용 (confirm 필요)
+     매핑 source: 출결현황_2026-04-26.csv (검증된 type_restore_mapping.json) */
+
+  var TYPE_MAPPING = {
+    "00381127-01289":"가족","00270601-00033":"가족","00281224-00893":"가족","00241211-00002":"가족",
+    "00330728-00051":"가족","00350831-00640":"가족외","00361105-00532":"가족","00370215-00030":"가족외",
+    "00401026-05217":"가족","00371124-00248":"가족외","00361228-00640":"가족외","00390530-00256":"가족",
+    "00360909-00462":"가족","00361105-00565":"가족","00390530-00282":"가족","00400227-00905":"가족",
+    "00320730-00198":"가족","00310630-00248":"가족","00381018-00064":"가족","00320129-00016":"가족",
+    "00231022-00295":"가족","00410926-00883":"가족","00360928-00601":"가족외","00351120-00013":"가족",
+    "00381127-01319":"가족","00371210-00584":"가족외","00290829-00087":"가족","00271114-00026":"가족",
+    "00310821-00042":"가족","00351023-00059":"가족","00390530-00314":"가족","00371210-00575":"가족",
+    "00340727-00045":"가족외","00391121-00021":"가족","00341230-00304":"가족","00300125-00048":"가족외",
+    "00270830-00046":"가족","00360624-00296":"가족","00200827-00005":"가족","00340313-00127":"가족",
+    "00380427-00073":"가족외","00321020-00018":"가족","00351120-00018":"가족","00400626-01421":"가족",
+    "00290201-00082":"가족","00360624-00274":"가족외","00320831-00077":"가족외","00360521-00258":"가족",
+    "00290717-00097":"가족","00270607-00019":"가족","00380427-00033":"가족","00280317-00023":"가족",
+    "00390225-00180":"가족외","00361105-00687":"가족외","00360521-00249":"가족","00370214-00045":"가족",
+    "00420424-00045":"가족외","00331213-00025":"가족","00360729-00701":"가족","00381127-01366":"가족외",
+    "00360521-00257":"가족","00290831-00279":"가족","00370214-00094":"가족외","00301118-00184":"가족",
+    "00330728-00182":"가족","00310927-00342":"가족외","00280405-00005":"가족외","00301129-00134":"가족",
+    "00290424-00165":"가족","00400525-02312":"가족","00390225-00181":"가족","00320526-00387":"가족",
+    "00360729-00227":"가족","00301223-00164":"가족","00231004-00003":"가족","00360910-00111":"가족외",
+    "00320321-00120":"가족외","00301118-00159":"가족","00330315-00124":"가족","00210307-00021":"가족",
+    "00300927-00353":"가족","00290105-00001":"가족","00390326-00406":"가족","00360624-00288":"가족",
+    "00230225-00153":"가족","00290105-00002":"가족","00400330-00558":"가족외","00361228-02810":"가족외",
+    "00290205-00023":"가족","00290201-00081":"가족","00381127-01291":"가족","00360820-00106":"가족",
+    "00380930-00010":"가족","00351120-00176":"가족","00210307-00067":"가족","00261026-00087":"가족",
+    "00361228-00633":"가족","00360610-00197":"가족외","00370217-00019":"가족","00350626-00150":"가족",
+    "00281102-00034":"가족","00290205-00021":"가족","00220501-00049":"가족","00150517-00005":"가족",
+    "00390628-00643":"가족","00301118-00208":"가족외","00360729-00039":"가족외","00390225-00182":"가족외",
+    "00331115-00034":"가족외","00360610-00219":"가족","00301223-00180":"가족","00290717-00111":"가족",
+    "00230825-00084":"가족","00340923-00057":"가족","00240810-00092":"가족","00270118-00018":"가족",
+    "00371124-00257":"가족외","00361015-00502":"가족외","00300108-00082":"가족","00411128-00196":"가족외",
+    "00411223-00113":"가족","00301223-00169":"가족","00310128-00337":"가족","00390326-00522":"가족",
+    "00330520-00015":"가족외","00390225-00260":"가족외","00290831-00222":"가족외","00321027-00229":"가족",
+    "00410729-00223":"가족외","00370215-00028":"가족외","00290530-00240":"가족","00401026-05219":"가족외",
+    "00350724-00067":"가족","00370214-00120":"가족","00390530-00385":"가족","00310726-00300":"가족",
+    "00410118-00120":"가족","00310529-00815":"가족","00391219-00153":"가족외","00360225-00386":"가족외",
+    "00400525-02321":"가족","00251019-00122":"가족","00260611-00005":"가족","00390428-00307":"가족외",
+    "00350626-00162":"가족외","00301118-00207":"가족외","00301021-00037":"가족","00370214-00040":"가족",
+    "00360225-00578":"가족","00410729-00218":"가족","00400330-00561":"가족외","00371203-00339":"가족",
+    "00371203-00380":"가족외","00360729-00708":"가족","00380427-00040":"가족외","00330728-00028":"가족외",
+    "00411128-00192":"가족외","00420425-00098":"가족외","00390628-00646":"가족","00311207-00004":"가족",
+    "00321027-00210":"가족","00400227-00910":"가족외","00350514-00049":"가족","00340117-00069":"가족외",
+    "00320831-00092":"가족","00300108-00079":"가족외","00351220-00297":"가족","00240819-00003":"가족",
+    "00291029-00005":"가족","00271218-00004":"가족","00390628-00723":"가족외","00381127-01321":"가족",
+    "00311213-00407":"가족","00310128-00375":"가족","00340428-00164":"가족","00340725-00533":"가족",
+    "00330926-00129":"가족","00390628-00714":"가족","00350514-00029":"가족외","00330926-00128":"가족",
+    "00361105-00682":"가족외","00340912-00120":"가족외","00381127-01280":"가족외","00391219-00156":"가족외",
+    "00340912-00105":"가족외","00230209-00001":"가족","00210201-00085":"가족","00301223-00182":"가족",
+    "00340313-00133":"가족","00371124-00245":"가족","00320131-00003":"가족","00410926-00874":"가족외",
+    "00290224-00129":"가족","00360624-00262":"가족","00371203-00363":"가족","00300906-00138":"가족",
+    "00391219-00155":"가족외","00361105-00405":"가족","00360624-00277":"가족","00350724-00080":"가족",
+    "00321027-00123":"가족","00391029-00741":"가족","00330926-00127":"가족외","00330728-00040":"가족",
+    "00370214-00010":"가족외","00390326-00486":"가족","00360820-00108":"가족","00390628-00766":"가족",
+    "00351120-00009":"가족","00381127-01288":"가족","00341009-00002":"가족","00390530-00406":"가족",
+    "00361121-00014":"가족","00240819-00004":"가족","00351120-00012":"가족","00360820-00094":"가족",
+    "00360820-00092":"가족","00380427-00021":"가족","00241207-00002":"가족","00390628-00028":"가족",
+    "00360820-00105":"가족","00371203-00361":"가족외","00380726-00018":"가족","00410729-00219":"가족외",
+    "00390628-00640":"가족외","00180825-00016":"가족","00240425-00081":"가족","00390326-00404":"가족"
+  };
+
+  function ymd_hm(){
+    var d = new Date();
+    function p(n){ return String(n).padStart(2, '0'); }
+    return d.getFullYear() + p(d.getMonth()+1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes());
+  }
+
+  function fetchMembers(){
+    return new Promise(function(resolve, reject){
+      if(!window.fbDB){ reject(new Error('Firebase 미초기화 (window.fbDB 없음)')); return; }
+      window.fbDB.ref('members').once('value').then(function(snap){
+        resolve(snap.val() || {});
+      }).catch(reject);
+    });
+  }
+
+  function countTypes(members){
+    var c = { '일반':0, '가족':0, '가족외':0, '기타':0 };
+    Object.keys(members).forEach(function(id){
+      var t = (members[id] && members[id].type) || '일반';
+      if(c[t] != null) c[t]++; else c['기타']++;
+    });
+    return c;
+  }
+
+  /* === Dry-run === */
+  window.__restoreFamilyTypes = function(){
+    console.log('[restore-family-types] dry-run 시작 (Firebase 변경 X)');
+    fetchMembers().then(function(members){
+      var before = countTypes(members);
+      console.log('[dry-run] 현재 분포:', before, '(기대 before: 일반 1575, 가족 26, 가족외 16)');
+
+      var willUpdate = [], skipAlready = [], skipNoMember = [], skipNotIlban = [];
+      var mappingIds = Object.keys(TYPE_MAPPING);
+      console.log('[dry-run] mapping 총', mappingIds.length, '건 검증 중...');
+
+      mappingIds.forEach(function(id){
+        var newType = TYPE_MAPPING[id];
+        var m = members[id];
+        if(!m){ skipNoMember.push(id); return; }
+        var current = m.type || '일반';
+        if(current === newType){ skipAlready.push(id); return; }
+        if(current !== '일반'){
+          skipNotIlban.push({ id:id, name:m.name||'?', region:m.region||'?', currentType:current, targetType:newType });
+          return;
+        }
+        willUpdate.push({ id:id, name:m.name||'?', region:m.region||'?', currentType:current, targetType:newType });
+      });
+
+      console.log('[dry-run] === 결과 ===');
+      console.log('  업데이트 예정     :', willUpdate.length, '건');
+      console.log('  skip (이미 일치)  :', skipAlready.length, '건');
+      console.log('  skip (id 없음)    :', skipNoMember.length, '건');
+      console.log('  skip (일반 아님)  :', skipNotIlban.length, '건');
+
+      if(skipNotIlban.length){
+        console.warn('[dry-run] ⚠️ 일반 아닌 멤버 (수동 검토 필요):');
+        console.table(skipNotIlban);
+      }
+      if(skipNoMember.length){
+        console.warn('[dry-run] ⚠️ id 없는 멤버:');
+        console.log(skipNoMember);
+      }
+
+      /* 예상 사후 분포 */
+      var willToFam = willUpdate.filter(function(u){return u.targetType==='가족';}).length;
+      var willToFamX = willUpdate.filter(function(u){return u.targetType==='가족외';}).length;
+      var expectedAfter = {
+        '일반': before['일반'] - willToFam - willToFamX,
+        '가족': before['가족'] + willToFam,
+        '가족외': before['가족외'] + willToFamX,
+        '기타': before['기타']
+      };
+      console.log('[dry-run] 예상 사후 분포:', expectedAfter);
+      console.log('[dry-run] 기대 after: 일반 1347, 가족 190, 가족외 80');
+
+      console.log('---');
+      console.log('[restore-family-types] 다음 단계:');
+      console.log('  1. window.__restoreFamilyTypes_backup()  ← 백업 다운로드 (필수)');
+      console.log('  2. window.__restoreFamilyTypes_apply()   ← Firebase 적용 (confirm)');
+
+      window.__lastDryRun = {
+        willUpdate: willUpdate,
+        skipAlready: skipAlready,
+        skipNoMember: skipNoMember,
+        skipNotIlban: skipNotIlban,
+        before: before,
+        expectedAfter: expectedAfter,
+        membersSnapshot: members
+      };
+    }).catch(function(err){
+      console.error('[dry-run] 실패:', err);
+    });
+  };
+
+  /* === Backup === */
+  window.__restoreFamilyTypes_backup = function(){
+    console.log('[backup] 시작...');
+    fetchMembers().then(function(members){
+      var fileName = 'kmjj-members-backup-before-task4-' + ymd_hm() + '.json';
+      var content = {
+        savedAt: new Date().toISOString(),
+        purpose: 'Phase 2 작업 4: members.type 가족/가족외 228명 복구 직전 백업',
+        memberCount: Object.keys(members).length,
+        typeDistribution: countTypes(members),
+        members: members
+      };
+      var blob = new Blob([JSON.stringify(content, null, 2)], { type:'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = fileName;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 500);
+      console.log('[backup] ✅ 다운로드 완료:', fileName, '(', content.memberCount, '명)');
+      console.log('[backup] type 분포:', content.typeDistribution);
+      window.__lastBackup = fileName;
+    }).catch(function(err){
+      console.error('[backup] 실패:', err);
+    });
+  };
+
+  /* === Apply (with confirm) === */
+  window.__restoreFamilyTypes_apply = function(){
+    var lr = window.__lastDryRun;
+    if(!lr){
+      console.warn('[apply] 먼저 dry-run 실행 필요: window.__restoreFamilyTypes()');
+      return;
+    }
+    if(!window.__lastBackup){
+      if(!window.confirm('백업이 아직 안 됐습니다 (window.__restoreFamilyTypes_backup()).\n그래도 진행할까요?')){
+        console.log('[apply] 백업 안 됨 — 취소');
+        return;
+      }
+    }
+    var msg = 'members.type 필드 ' + lr.willUpdate.length + '건 Firebase 적용.\n\n'+
+              '  before: 일반 ' + lr.before['일반'] + ' / 가족 ' + lr.before['가족'] + ' / 가족외 ' + lr.before['가족외'] + '\n'+
+              '  after  : 일반 ' + lr.expectedAfter['일반'] + ' / 가족 ' + lr.expectedAfter['가족'] + ' / 가족외 ' + lr.expectedAfter['가족외'] + '\n\n'+
+              'type 필드만 수정 (id/name/region/team/zone 보존).\n'+
+              '진행할까요?';
+    if(!window.confirm(msg)){
+      console.log('[apply] 사용자 취소');
+      return;
+    }
+    if(!window.fbDB){
+      console.error('[apply] Firebase 미초기화');
+      return;
+    }
+    /* multi-path update */
+    var updates = {};
+    lr.willUpdate.forEach(function(u){
+      updates['members/' + u.id + '/type'] = u.targetType;
+    });
+    console.log('[apply] Firebase update 호출:', Object.keys(updates).length, '건');
+    var t0 = Date.now();
+    window.fbDB.ref().update(updates).then(function(){
+      console.log('[apply] ✅ Firebase 업데이트 완료 (' + (Date.now()-t0) + 'ms)');
+      console.log('[apply] 사후 검증 시작 (1초 대기 후 재조회)...');
+      setTimeout(function(){
+        fetchMembers().then(function(members2){
+          var after = countTypes(members2);
+          console.log('[verify] 사후 분포:', after);
+          console.log('[verify] 기대 after: 일반 1347, 가족 190, 가족외 80');
+          var ok = (after['일반']===1347 && after['가족']===190 && after['가족외']===80);
+          if(ok){
+            console.log('[verify] ✅ 기대값 일치 — 작업 완료');
+          } else {
+            console.warn('[verify] ⚠️ 기대값 불일치 — dry-run skipNotIlban (' + lr.skipNotIlban.length + '건) 또는 skipNoMember (' + lr.skipNoMember.length + '건) 영향 가능');
+            console.warn('[verify] 실제 vs 기대 차이:');
+            console.table([{
+              type:'일반', actual: after['일반'], expected: 1347, diff: after['일반']-1347
+            }, {
+              type:'가족', actual: after['가족'], expected: 190, diff: after['가족']-190
+            }, {
+              type:'가족외', actual: after['가족외'], expected: 80, diff: after['가족외']-80
+            }]);
+          }
+        });
+      }, 1000);
+    }).catch(function(err){
+      console.error('[apply] Firebase update 실패:', err);
+    });
+  };
+
+  console.log('[restore-family-types] 도구 노출 — 절차:');
+  console.log('  1. window.__restoreFamilyTypes()         (dry-run, 변경 X)');
+  console.log('  2. window.__restoreFamilyTypes_backup()  (백업 다운로드)');
+  console.log('  3. window.__restoreFamilyTypes_apply()   (적용, confirm)');
+})();
+</script>
+<!-- RESTORE_FAMILY_TYPES_END -->
