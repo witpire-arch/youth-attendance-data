@@ -20312,9 +20312,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     };
   }
 
-  /* ── 2. window.MEMBERS 변화 감지 + drop 로그 ────────────────────── */
+  /* ── 2. window.MEMBERS 변화 감지 + drop 로그 (v5: throttle) ──────── */
   var _lastMembersSnapshot = {};
   var _lastMembersLength = 0;
+  var _stats = { dropCount: 0, rescueCount: 0, lastSummaryAt: 0, firstDropLogged: false, firstAddLogged: false };
 
   function detectChanges(){
     if(!Array.isArray(window.MEMBERS)) return;
@@ -20343,11 +20344,18 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         if(!_lastMembersSnapshot[id]) added.push({ id: id, name: current[id].name||'?' });
       });
       var t = new Date().toISOString().slice(11, 23);
+      /* v5 throttle: 첫 1회만 verbose, 이후 stats 만 누적 */
       if(dropped.length){
-        console.warn('[bug-2-track] ' + t + ' window.MEMBERS ' + lastLen + ' → ' + currentLen + ' (drop ' + dropped.length + '명):', dropped.slice(0, 5));
+        _stats.dropCount += dropped.length;
+        if(!_stats.firstDropLogged){
+          console.warn('[bug-2-track] ' + t + ' window.MEMBERS ' + lastLen + ' → ' + currentLen + ' (drop ' + dropped.length + '명):', dropped.slice(0, 5));
+          console.warn('[bug-2-track] (이후 drop 로그는 30초마다 요약. window.__bug2Rescue.verbose() 로 verbose 토글)');
+          _stats.firstDropLogged = true;
+        }
       }
-      if(added.length){
+      if(added.length && !_stats.firstAddLogged){
         console.log('[bug-2-track] ' + t + ' window.MEMBERS ' + lastLen + ' → ' + currentLen + ' (add ' + added.length + '명):', added.slice(0, 5));
+        _stats.firstAddLogged = true;
       }
     }
 
@@ -20356,7 +20364,20 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   }
   setInterval(detectChanges, 100);
 
-  /* ── 3. Brute force rescue — protected 멤버가 없으면 push ───────── */
+  /* 30초마다 누적 stats 요약 1줄 */
+  setInterval(function(){
+    if(_stats.dropCount > 0 || _stats.rescueCount > 0){
+      console.log('[bug-2-stats] 누적 drop ' + _stats.dropCount + '회 / rescue ' + _stats.rescueCount + '회 (지난 30초). 현재 MEMBERS=' + (window.MEMBERS||[]).length);
+      _stats.dropCount = 0;
+      _stats.rescueCount = 0;
+    }
+  }, 30000);
+
+  /* ── 3. Brute force rescue — protected 멤버가 없으면 push (v5: render 미트리거) ── */
+  /* v5 핵심: scheduleRender 제거. render 호출이 applyActiveFilter 를 트리거 →
+     window.RECORDS 에 없는 멤버 drop → 무한 cycle 발생 (1.5초 주기).
+     대신 window.RECORDS 에 record 가 있으면 render 도 drop 안 함 (근본 fix).
+     UI 는 다른 render trigger (사용자 클릭, onValue, 페이지 전환) 에서 자동 반영. */
   function ensureProtected(){
     if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
     var memIds = {};
@@ -20373,26 +20394,16 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       try{ if(Array.isArray(window.FINAL_MEMBERS)) window.FINAL_MEMBERS.push(_protectedMembers[id]); }catch(e){}
       try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) MEMBERS.push(_protectedMembers[id]); }catch(e){}
     });
-    console.log('[bug-2-rescue] ' + missing.length + '명 brute-force 재추가:', missing.slice(0, 5).map(function(id){ return _protectedMembers[id].name + '(' + id + ')'; }));
+    _stats.rescueCount += missing.length;
+    /* v5: 첫 1회만 verbose, 이후 stats 누적 */
+    if(!ensureProtected.__firstLogged){
+      console.log('[bug-2-rescue] ' + missing.length + '명 brute-force 재추가:', missing.slice(0, 5).map(function(id){ return _protectedMembers[id].name + '(' + id + ')'; }));
+      ensureProtected.__firstLogged = true;
+    }
     /* LS 갱신 */
     try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
-    /* UI 강제 갱신 (debounce 1초) — 너무 잦은 재렌더 방지 */
-    scheduleRender();
-  }
-
-  var _renderTimer = null;
-  function scheduleRender(){
-    if(_renderTimer) clearTimeout(_renderTimer);
-    _renderTimer = setTimeout(function(){
-      _renderTimer = null;
-      try{
-        if(typeof window.renderOverview === 'function') window.renderOverview();
-        var active = document.querySelector('.page.active');
-        if(active && typeof window.renderPage === 'function'){
-          window.renderPage(active.id.replace('page-',''));
-        }
-      }catch(e){}
-    }, 1000);
+    /* v5: scheduleRender 제거 — render 호출이 applyActiveFilter 트리거하여 cycle 유발.
+       window.RECORDS 가 fetchAndProtect 단계에서 보강되었으므로 다음 render 에서도 drop 안 함. */
   }
 
   setInterval(ensureProtected, 200);
@@ -20441,6 +20452,71 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }, 300);
   }
 
+  /* v5: window.RECORDS 에 missing record 가 있는지 확인 + Firebase 에서 query 해서 보강.
+     applyActiveFilter (line 16935) 가 actives = activeIdSet(window.RECORDS) 로 멤버를 필터 →
+     window.RECORDS 에 record 없는 protected 멤버는 매 render 마다 drop 됨.
+     근본 fix: Firebase /records 에서 해당 멤버의 record 를 fetch 해서 window.RECORDS 에 inject. */
+  function ensureRecordsForProtected(){
+    if(!window.fbDB || typeof window.fbDB.ref !== 'function') return Promise.resolve(0);
+    if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
+
+    /* 현재 window.RECORDS 의 unique id set */
+    var existingRecIds = {};
+    window.RECORDS.forEach(function(r){ if(r && r.id) existingRecIds[clean(r.id)] = true; });
+
+    /* protected 멤버 중 record 없는 id */
+    var orphanIds = Object.keys(_protectedMembers).filter(function(id){ return !existingRecIds[id]; });
+    if(!orphanIds.length) return Promise.resolve(0);
+
+    if(!ensureRecordsForProtected.__loggedOrphan){
+      console.log('[bug-2-rescue] window.RECORDS 에 record 없는 protected 멤버 ' + orphanIds.length + '명 (drop cycle 의 근본 원인):', orphanIds.slice(0, 5));
+      ensureRecordsForProtected.__loggedOrphan = true;
+    }
+
+    /* 각 id 별로 records fetch (orderByChild('id').equalTo(id)) — 병렬 */
+    var fetches = orphanIds.map(function(id){
+      return window.fbDB.ref('records').orderByChild('id').equalTo(_protectedMembers[id].id).once('value')
+        .then(function(snap){
+          if(!snap.exists()) return { id: id, added: 0 };
+          var v = snap.val();
+          var added = 0;
+          Object.keys(v).forEach(function(k){
+            var r = v[k];
+            if(r && r.id && r.date){
+              var dup = window.RECORDS.some(function(x){ return x.id === r.id && x.date === r.date; });
+              if(!dup){
+                var rec = {
+                  id: r.id, date: r.date, wk: r.wk||1, day: r.day||'일',
+                  st: r.st||'', rsn: r.rsn||'', streak: r.streak||0,
+                  _bug2RecordInjected: true
+                };
+                window.RECORDS.push(rec);
+                /* lexical RECORDS sync */
+                try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) RECORDS.push(rec); }catch(e){}
+                added++;
+              }
+            }
+          });
+          return { id: id, added: added };
+        }).catch(function(err){
+          console.warn('[bug-2-rescue] record fetch fail for id=' + id, err && err.message);
+          return { id: id, added: 0 };
+        });
+    });
+
+    return Promise.all(fetches).then(function(results){
+      var totalAdded = results.reduce(function(s, r){ return s + r.added; }, 0);
+      if(totalAdded > 0){
+        console.log('[bug-2-rescue] ✅ window.RECORDS 에 ' + totalAdded + '건 record inject 완료 (' + orphanIds.length + '명 — drop cycle 차단).');
+        /* LS records 도 갱신 */
+        try{ localStorage.setItem('att_records_v1', JSON.stringify(window.RECORDS)); }catch(e){}
+      } else if(orphanIds.length > 0){
+        console.warn('[bug-2-rescue] ⚠️ orphan ' + orphanIds.length + '명 의 record 가 Firebase 에도 없음 — 진짜 record 없는 회원으로 간주');
+      }
+      return totalAdded;
+    });
+  }
+
   function fetchAndProtect(){
     if(!window.fbDB || typeof window.fbDB.ref !== 'function') return Promise.resolve(0);
     return window.fbDB.ref('members').once('value').then(function(snap){
@@ -20460,10 +20536,14 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         }
       });
       _fbMembersDict = fbDict;
-      console.log('[bug-2-rescue] Firebase fetch → registry: ' + protectedCount + '명 protected');
+      if(!fetchAndProtect.__firstLogged){
+        console.log('[bug-2-rescue] Firebase fetch → registry: ' + protectedCount + '명 protected');
+        fetchAndProtect.__firstLogged = true;
+      }
       /* 즉시 한 번 rescue 실행 */
       ensureProtected();
-      return protectedCount;
+      /* v5: window.RECORDS 에 record 없는 protected 멤버에 대해 record fetch + inject */
+      return ensureRecordsForProtected().then(function(){ return protectedCount; });
     }).catch(function(err){
       console.warn('[bug-2-rescue] Firebase fetch error:', err && err.message);
       return 0;
@@ -20504,13 +20584,28 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     },
     forceFetch: fetchAndProtect,
     forceRescue: ensureProtected,
+    ensureRecordsNow: ensureRecordsForProtected,
+    stats: function(){
+      console.log('[bug-2-rescue] stats:', _stats);
+      return _stats;
+    },
+    /* verbose 토글 — 모든 drop/rescue 로그 출력 */
+    verbose: function(on){
+      var v = (on === false) ? false : true;
+      _stats.firstDropLogged = !v;
+      _stats.firstAddLogged = !v;
+      ensureProtected.__firstLogged = !v;
+      fetchAndProtect.__firstLogged = !v;
+      ensureRecordsForProtected.__loggedOrphan = !v;
+      console.log('[bug-2-rescue] verbose = ' + v);
+    },
     clear: function(){
       _protectedMembers = {};
       console.log('[bug-2-rescue] registry 비움');
     }
   };
 
-  console.log('[bug-2-rescue] v4 brute-force rescue 활성 (100ms track + 200ms rescue + setter trap). 디버그: window.__bug2Rescue');
+  console.log('[bug-2-rescue] v5 활성 (cycle 차단 + records inject + 로그 throttle). 디버그: window.__bug2Rescue');
 })();
 </script>
 <!-- BUG_2_BRUTE_FORCE_RESCUE_END -->
