@@ -19728,8 +19728,68 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     });
     return s;
   }
+
+  /* ── Firebase /members live cache — v2: union 소스에 Firebase 포함 ─── */
+  var _fbCache = { ts: 0, dict: null };   /* dict: id → member obj */
+  var _fbFetchInFlight = null;            /* Promise — 중복 fetch 방지 */
+  var FB_CACHE_TTL_MS = 30000;
+
+  function fetchFirebaseMembers(force){
+    if(_fbFetchInFlight) return _fbFetchInFlight;
+    if(!force && _fbCache.dict && (Date.now() - _fbCache.ts) < FB_CACHE_TTL_MS){
+      return Promise.resolve(_fbCache.dict);
+    }
+    if(!window.fbDB || typeof window.fbDB.ref !== 'function'){
+      return Promise.resolve(null);
+    }
+    _fbFetchInFlight = window.fbDB.ref('members').once('value').then(function(snap){
+      var dict = {};
+      var rawKeys = 0, validIds = 0, withoutId = [];
+      if(snap.exists()){
+        var v = snap.val();
+        if(v && typeof v === 'object'){
+          var keys = Object.keys(v);
+          rawKeys = keys.length;
+          keys.forEach(function(k){
+            var m = v[k];
+            if(m && m.id != null){
+              var id = clean(m.id);
+              if(id){
+                validIds++;
+                dict[id] = {
+                  id: m.id,
+                  region: m.region || '',
+                  team: m.team || '',
+                  zone: m.zone || '',
+                  name: m.name || '',
+                  type: m.type || '일반',
+                  regType: m.regType || '총회등록',
+                  _retired: !!m._retired
+                };
+                return;
+              }
+            }
+            withoutId.push({ key: k, value: m });
+          });
+        }
+      }
+      _fbCache = { ts: Date.now(), dict: dict };
+      _fbFetchInFlight = null;
+      console.log('[bug-2-guard] Firebase /members fetched: ' + rawKeys + ' raw keys → ' + validIds + ' valid ids' + (rawKeys !== validIds ? ' ⚠️ ' + withoutId.length + ' entries id 누락' : ''));
+      if(withoutId.length){
+        console.warn('[bug-2-guard] id 없는 entries (앞 5개):', withoutId.slice(0, 5));
+      }
+      return dict;
+    }).catch(function(err){
+      _fbFetchInFlight = null;
+      console.warn('[bug-2-guard] Firebase fetch error:', err && err.message);
+      return null;
+    });
+    return _fbFetchInFlight;
+  }
+
   function gatherCurrentMembers(){
-    /* 모든 소스에서 가장 풍부한 멤버 set 수집 (id → member obj) */
+    /* 모든 소스 union (sync — Firebase 는 캐시에서 읽음, async fetch 는 별도) */
     var bag = {};
     function add(arr, src){
       if(!Array.isArray(arr)) return;
@@ -19746,6 +19806,12 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       var raw = localStorage.getItem('att_members_v1');
       if(raw){ var arr = JSON.parse(raw); add(arr, 'LS att_members_v1'); }
     }catch(e){}
+    /* Firebase 캐시 (있으면 추가) */
+    if(_fbCache.dict){
+      Object.keys(_fbCache.dict).forEach(function(id){
+        if(!bag[id]){ bag[id] = { _src: 'Firebase (cached)', m: _fbCache.dict[id] }; }
+      });
+    }
     return bag;
   }
 
@@ -19802,12 +19868,19 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         });
         if(dropped.length){
           console.error('[bug-2-guard] ⚠️ applyFinalData 후 ' + dropped.length + '명 MEMBERS drop 감지:', dropped.slice(0, 10));
-          /* 사용자 경고 — showToast 있으면 사용, 없으면 alert */
+          /* v2: 비동기 Firebase 복구 자동 트리거 */
           try{
-            if(typeof window.showToast === 'function'){
-              window.showToast('⚠️ ' + dropped.length + '명 회원 누락 감지 (콘솔 확인)', 'error');
-            }
-          }catch(e){}
+            restoreFromFirebase({ force: true }).then(function(res){
+              if(res && res.restored > 0){
+                console.log('[bug-2-guard] drop 후 자동 복구 완료: +' + res.restored + '명');
+              } else {
+                /* Firebase 도 1616 이거나 fbDB 미연결 — fallback 경고 */
+                try{ if(typeof window.showToast === 'function') window.showToast('⚠️ ' + dropped.length + '명 회원 누락 (Firebase 복구 실패)', 'error'); }catch(e){}
+              }
+            });
+          }catch(e){
+            try{ if(typeof window.showToast === 'function') window.showToast('⚠️ ' + dropped.length + '명 회원 누락', 'error'); }catch(_){}
+          }
         }
       }catch(e){ console.warn('[bug-2-guard] post-check 오류', e); }
 
@@ -19844,9 +19917,167 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }catch(e){}
   }, 5000);
 
+  /* ── v2: Firebase fetch + 자동 복구 ────────────────────────────── */
+
+  /* MEMBERS 가 Firebase 보다 적으면 즉시 복구: window.MEMBERS 에 누락 ID 직접 push
+     + LS 갱신 + UI 재렌더. applyFinalData 의존 없이 직접 복구. */
+  function restoreFromFirebase(opts){
+    opts = opts || {};
+    return fetchFirebaseMembers(opts.force).then(function(fbDict){
+      if(!fbDict){
+        console.warn('[bug-2-guard] restore skip: Firebase 미연결');
+        return { restored: 0, reason: 'no fbDB' };
+      }
+      var fbCount = Object.keys(fbDict).length;
+      if(!fbCount){
+        console.warn('[bug-2-guard] restore skip: Firebase 비어있음');
+        return { restored: 0, reason: 'fb empty' };
+      }
+
+      /* 1. FINAL_MEMBERS 보강 — Firebase 에 있는데 FINAL 에 없는 ID */
+      var finalIds = snapshotMemberIds(window.FINAL_MEMBERS || []);
+      var finalAdded = [];
+      Object.keys(fbDict).forEach(function(id){
+        if(!finalIds[id]){
+          if(Array.isArray(window.FINAL_MEMBERS)){
+            window.FINAL_MEMBERS.push(fbDict[id]);
+            finalAdded.push(id);
+          }
+        }
+      });
+
+      /* 2. window.MEMBERS 보강 — Firebase 에 있는데 MEMBERS 에 없는 ID */
+      if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+      var memIds = snapshotMemberIds(window.MEMBERS);
+      var memAdded = [];
+      Object.keys(fbDict).forEach(function(id){
+        if(!memIds[id]){
+          window.MEMBERS.push(fbDict[id]);
+          memAdded.push(id);
+        }
+      });
+
+      /* 3. lexical MEMBERS sync (v6 패턴 — 다른 코드가 lexical 참조) */
+      try{
+        if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+          var lexIds = snapshotMemberIds(MEMBERS);
+          Object.keys(fbDict).forEach(function(id){
+            if(!lexIds[id]) MEMBERS.push(fbDict[id]);
+          });
+        }
+      }catch(e){}
+
+      /* 4. LS 갱신 — 다음 boot 에서도 보존 */
+      try{
+        localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS));
+      }catch(e){}
+
+      /* 5. UI 재렌더 — 화면 즉시 갱신 */
+      try{
+        if(typeof window.renderOverview === 'function') window.renderOverview();
+        var active = document.querySelector('.page.active');
+        if(active && typeof window.renderPage === 'function'){
+          window.renderPage(active.id.replace('page-',''));
+        }
+      }catch(e){}
+
+      var sample = memAdded.slice(0, 5).map(function(id){ return (fbDict[id].name||'?')+'('+id+')'; }).join(', ');
+      var extra = memAdded.length > 5 ? ', +' + (memAdded.length-5) + '명 더' : '';
+      if(memAdded.length){
+        console.log('[bug-2-guard] ✅ Firebase 복구: window.MEMBERS 에 ' + memAdded.length + '명 추가 (' + sample + extra + '). 화면 갱신 완료.');
+        try{ if(typeof window.showToast === 'function') window.showToast('✅ ' + memAdded.length + '명 회원 자동 복구 (Firebase 동기)'); }catch(e){}
+      } else {
+        console.log('[bug-2-guard] Firebase 와 MEMBERS 이미 동기 (' + fbCount + '명)');
+      }
+      return {
+        restored: memAdded.length, finalAdded: finalAdded.length,
+        fbCount: fbCount, memCount: window.MEMBERS.length,
+        sample: memAdded.slice(0, 10)
+      };
+    });
+  }
+
+  /* boot — fbDB 준비되면 즉시 Firebase fetch + 복구 시도.
+     Step2 가 1617→1616 drop 할 가능성 있어서, Step2 보다 약간 늦게 (4-5초) 한 번 더 fetch + 복구. */
+  function waitForFbDB(cb, maxWaitMs){
+    maxWaitMs = maxWaitMs || 30000;
+    var elapsed = 0;
+    var iv = setInterval(function(){
+      if(window.fbDB && typeof window.fbDB.ref === 'function'){
+        clearInterval(iv); cb(); return;
+      }
+      elapsed += 300;
+      if(elapsed >= maxWaitMs){ clearInterval(iv); console.warn('[bug-2-guard] fbDB 대기 timeout'); }
+    }, 300);
+  }
+  waitForFbDB(function(){
+    /* 1차 fetch — 즉시 */
+    fetchFirebaseMembers(true).then(function(){
+      /* Step2 가 끝나기 전이라도 캐시는 갖춰짐 (drop 시 wrap 이 후처리 복구) */
+    });
+    /* 2차 복구 — Step2 처리 후 (drop 됐다면 여기서 복구) */
+    setTimeout(function(){ restoreFromFirebase({ force: true }); }, 4000);
+    /* 3차 안전망 — 추가 5초 후 */
+    setTimeout(function(){ restoreFromFirebase({ force: false }); }, 9000);
+    /* 주기적 refresh — 30초 간격, 처음 5분만 */
+    var refreshN = 0;
+    var refreshIv = setInterval(function(){
+      refreshN++;
+      if(refreshN > 10){ clearInterval(refreshIv); return; }
+      fetchFirebaseMembers(true);
+    }, 30000);
+  });
+
+  /* ── v2: fbDB.ref('members').once 진단 wrap — Step2 의 drop 원인 격리 ─ */
+  function wrapFbMembersOnce(){
+    if(!window.fbDB || typeof window.fbDB.ref !== 'function') return false;
+    if(window.fbDB.__bug2Wrapped) return true;
+    var origRef = window.fbDB.ref.bind(window.fbDB);
+    window.fbDB.ref = function(path){
+      var ref = origRef(path);
+      if(path === 'members' && ref && typeof ref.once === 'function' && !ref.__bug2Wrapped){
+        var origOnce = ref.once.bind(ref);
+        ref.once = function(eventType){
+          return origOnce(eventType).then(function(snap){
+            try{
+              if(snap && snap.exists()){
+                var v = snap.val();
+                if(v && typeof v === 'object'){
+                  var rawKeys = Object.keys(v).length;
+                  var validIds = 0;
+                  Object.keys(v).forEach(function(k){ if(v[k] && v[k].id) validIds++; });
+                  console.log('[bug-2-diag] fbDB.ref("members").once 결과: raw keys=' + rawKeys + ', valid id=' + validIds + (rawKeys !== validIds ? ' ⚠️ ' + (rawKeys-validIds) + ' entries id 누락' : ''));
+                }
+              }
+            }catch(e){}
+            return snap;
+          });
+        };
+        ref.__bug2Wrapped = true;
+      }
+      return ref;
+    };
+    window.fbDB.__bug2Wrapped = true;
+    console.log('[bug-2-guard] fbDB.ref wrap 활성 — members fetch 진단 ON');
+    return true;
+  }
+  waitForFbDB(function(){ wrapFbMembersOnce(); });
+
   /* 디버그 API */
   window.__bug2Guard = {
     promoteNow: promoteFinalMembersIfNeeded,
+    /* v2: Firebase 기반 복구 */
+    restoreFromFirebase: function(){
+      console.log('[bug-2-guard] 수동 Firebase 복구 시작...');
+      return restoreFromFirebase({ force: true });
+    },
+    fetchFirebase: function(force){
+      return fetchFirebaseMembers(!!force);
+    },
+    fbCacheInfo: function(){
+      console.log('[bug-2-guard] FB cache:', _fbCache.dict ? Object.keys(_fbCache.dict).length + '명, age=' + ((Date.now()-_fbCache.ts)/1000).toFixed(1) + 's' : '미설정');
+      return _fbCache.dict ? Object.keys(_fbCache.dict).length : 0;
+    },
     snapshotIds: function(){
       var c = gatherCurrentMembers();
       var f = snapshotMemberIds(window.FINAL_MEMBERS);
@@ -19884,7 +20115,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     rewrap: wrap
   };
 
-  console.log('[bug-2-guard] FINAL_MEMBERS drop 보호 활성. 디버그: window.__bug2Guard.snapshotIds() / findMember("김재남")');
+  console.log('[bug-2-guard] v2 활성 (Firebase live 복구 + Step2 진단). 디버그: window.__bug2Guard.restoreFromFirebase() / snapshotIds() / findMember("김재남") / fbCacheInfo()');
 })();
 </script>
 <!-- BUG_2_MEMBERS_DROP_GUARD_END -->
