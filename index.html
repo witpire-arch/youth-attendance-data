@@ -19934,6 +19934,11 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         return { restored: 0, reason: 'fb empty' };
       }
 
+      /* v3: 각 복구 멤버에 _bug2Restored=true 마커 추가 — applyActiveFilter wrap 이 보존 */
+      Object.keys(fbDict).forEach(function(id){
+        fbDict[id]._bug2Restored = true;
+      });
+
       /* 1. FINAL_MEMBERS 보강 — Firebase 에 있는데 FINAL 에 없는 ID */
       var finalIds = snapshotMemberIds(window.FINAL_MEMBERS || []);
       var finalAdded = [];
@@ -20119,6 +20124,146 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- BUG_2_MEMBERS_DROP_GUARD_END -->
+
+<!-- BUG_2_ACTIVE_FILTER_AWARE_START -->
+<script id="bug-2-active-filter-aware">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Bug 2 v3: applyActiveFilter (line 16935) 가 진짜 drop point.
+
+     발견: bug-2-guard v2 가 김재남을 push 한 직후 applyActiveFilter 가 실행되어
+       window.RECORDS 에 김재남의 record 가 없으면 (sync race 또는 records load 지연)
+       → m.id not in actives → 김재남 drop.
+
+     해결:
+       1) bug-2-guard 의 restored 멤버에 _bug2Restored=true 마커 (이미 v3 에서 추가)
+       2) 이 IIFE 가 window.applyActiveFilter wrap:
+          - Pre: window.MEMBERS snapshot (id → member obj)
+          - orig 호출 (기존 drop 동작 그대로)
+          - Post: drop 된 _bug2Restored 멤버 자동 재추가 (rescue)
+       3) drop 발생 시 명시적 로그 (id + name + reason)
+       4) 첫 3회 호출 stack trace — 누가 호출하는지 식별
+     ════════════════════════════════════════════════════════════════ */
+
+  function snap(arr){
+    var s = {};
+    if(!Array.isArray(arr)) return s;
+    arr.forEach(function(m){ if(m && m.id) s[String(m.id).trim()] = m; });
+    return s;
+  }
+  function recordSet(){
+    var s = {};
+    var rs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    for(var i=0;i<rs.length;i++){ if(rs[i] && rs[i].id) s[String(rs[i].id).trim()] = 1; }
+    return s;
+  }
+
+  var _callCount = 0;
+  var _rescueLogged = false;
+
+  function wrapAAF(){
+    var orig = window.applyActiveFilter;
+    if(typeof orig !== 'function') return false;
+    if(orig.__bug2AafWrapped) return true;
+
+    var wrapped = function(){
+      _callCount++;
+
+      /* 1. Pre — 현재 MEMBERS snapshot (id → obj) */
+      var beforeIds = snap(window.MEMBERS);
+      var beforeCount = Object.keys(beforeIds).length;
+
+      /* 2. 첫 3회 호출 stack trace */
+      if(_callCount <= 3){
+        try{
+          var stack = (new Error()).stack || '';
+          var lines = stack.split('\n').slice(2, 6).map(function(l){ return l.trim(); }).join(' ← ');
+          console.log('[bug-2-aaf] applyActiveFilter call #' + _callCount + ' caller: ' + lines);
+        }catch(e){}
+      }
+
+      /* 3. orig 호출 — drop 발생 */
+      var ret = orig.apply(this, arguments);
+
+      /* 4. Post — drop 된 멤버 분류 */
+      try{
+        var afterIds = snap(window.MEMBERS);
+        var afterCount = Object.keys(afterIds).length;
+        var hasRecord = recordSet();
+        var dropped = [];
+        var restoredCandidates = [];
+
+        Object.keys(beforeIds).forEach(function(id){
+          if(!afterIds[id]){
+            var m = beforeIds[id];
+            var reasons = [];
+            if(!hasRecord[id]) reasons.push('no-record');
+            if(m && m._bug2Restored) reasons.push('bug-2-restored');
+            dropped.push({ id: id, name: (m&&m.name)||'?', region: (m&&m.region)||'', reasons: reasons });
+            if(m && m._bug2Restored){
+              restoredCandidates.push(m);
+            }
+          }
+        });
+
+        /* 5. Rescue — _bug2Restored 멤버 재추가 */
+        if(restoredCandidates.length){
+          restoredCandidates.forEach(function(m){
+            try{ if(Array.isArray(window.MEMBERS)) window.MEMBERS.push(m); }catch(e){}
+            try{ if(Array.isArray(window.FINAL_MEMBERS)) window.FINAL_MEMBERS.push(m); }catch(e){}
+            try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) MEMBERS.push(m); }catch(e){}
+          });
+          /* 첫 rescue 시 1회만 자세히 로그, 이후 압축 */
+          if(!_rescueLogged){
+            console.warn('[bug-2-aaf] ⚠️ applyActiveFilter 가 ' + dropped.length + '명 drop (rescue ' + restoredCandidates.length + '명):', dropped.slice(0, 5));
+            console.warn('[bug-2-aaf] 🔧 rescue 완료 — _bug2Restored 멤버 ' + restoredCandidates.length + '명 재추가. window.MEMBERS=' + (window.MEMBERS||[]).length);
+            _rescueLogged = true;
+          } else {
+            console.warn('[bug-2-aaf] rescue: ' + restoredCandidates.length + '명 재추가 (총 drop ' + dropped.length + ')');
+          }
+          /* LS sync — 다음 boot 보존 */
+          try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
+        } else if(dropped.length && _callCount <= 3){
+          /* rescue 대상 없어도 drop 자체 진단 로그 (첫 3회만) */
+          console.log('[bug-2-aaf] applyActiveFilter dropped ' + dropped.length + '명 (rescue 대상 없음):', dropped.slice(0, 3));
+        }
+      }catch(e){ console.warn('[bug-2-aaf] post-check 오류', e); }
+
+      return ret;
+    };
+    wrapped.__bug2AafWrapped = true;
+    window.applyActiveFilter = wrapped;
+    return true;
+  }
+
+  /* applyActiveFilter 가 늦게 정의됨 — 폴링 */
+  if(!wrapAAF()){
+    var t = 0;
+    var iv = setInterval(function(){
+      if(wrapAAF() || ++t > 600) clearInterval(iv);
+    }, 50);
+  }
+
+  /* 디버그 — 강제 rescue 트리거 */
+  window.__bug2AAF = {
+    snapshotCallStats: function(){
+      console.log('[bug-2-aaf] applyActiveFilter 호출 횟수:', _callCount);
+      return _callCount;
+    },
+    rewrap: wrapAAF,
+    /* MEMBERS 에서 _bug2Restored 마커 가진 멤버 list */
+    listRestored: function(){
+      var arr = (window.MEMBERS||[]).filter(function(m){ return m && m._bug2Restored; });
+      console.log('[bug-2-aaf] _bug2Restored 마커 멤버 ' + arr.length + '명:', arr.slice(0,10).map(function(m){return m.name+'('+m.id+')';}));
+      return arr;
+    }
+  };
+
+  console.log('[bug-2-aaf] applyActiveFilter 보호 활성 (drop 시 _bug2Restored 자동 rescue). 디버그: window.__bug2AAF');
+})();
+</script>
+<!-- BUG_2_ACTIVE_FILTER_AWARE_END -->
 
 <!-- MOBILE_AUTH_COMPAT_START -->
 <script id="mobile-auth-compat">
