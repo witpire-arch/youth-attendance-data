@@ -20912,3 +20912,509 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- MOBILE_AUTH_COMPAT_END -->
+
+<!-- TASK_3_CYCLE_REGEN_START -->
+<script id="task-3-cycle-regen">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     작업 3 — 사이클 재생성 (새 정책)
+       OLD: 사유결석 = 'excused' 로 잘못 분류 → 매주 온라인예배 드린 멤버도 사이클 포함
+       NEW: EXCLUDED_RSN = [온라인예배, 대체예배, 인증안함, 인증오류] 는 실질 출석
+
+     5/26 dry-run 검증 완료: 5-6월 사이클 321명 정확 (현재 456명 → 321명).
+
+     정책:
+       classify(rec):
+         !rec                                  → 'missing'
+         st='QR인증'                            → 'attended'
+         st='사유출석'                          → 'attended' (모든 rsn)
+         st='사유결석', rsn in EXCLUDED_RSN     → 'attended' (실질 출석)
+         st='사유결석', rsn else                 → 'absent'
+         else                                  → 'missing'
+
+       classifyMember(m, 4 sundays):
+         all 'attended'           → 'allAttended' (매주 출석 - 사이클 제외)
+         all 'absent'             → 'allAbsent'   (매주 결석 - 별도 관리)
+         any 'missing'            → 'incomplete'  (데이터 부족 - 제외)
+         mixed (attended+absent)  → 'cycle'        (습결자 - 포함)
+
+     구조:
+       1) window.__task3.dryRun(cycleId)        — 적용 없이 결과만 계산
+       2) window.__task3.regenerate(cycleId)    — 모달 표시 + 백업 + 적용
+       3) UI 버튼 'task-3-regen-btn' s2-bar 에 inject (admin only)
+
+     안전:
+       - 적용 전 자동 백업 (CYCLE_BACKUP_TOOL __exportCycleData)
+       - admin 가드
+       - 5b-A Phase B 가 자동으로 LS+FB dual-write 처리
+     ════════════════════════════════════════════════════════════════ */
+
+  function clean(s){ return String(s==null?'':s).trim(); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function isAdmin(){
+    try{ var u = window.currentUser; if(!u) return false;
+      if(u.role === 'admin') return true;
+      return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+    }catch(e){ return false; }
+  }
+  function nowIso(){ return new Date().toISOString(); }
+  function prevMonth(mo){
+    var y = +mo.slice(0,4), m = +mo.slice(5,7) - 1;
+    if(m < 1){ y--; m = 12; }
+    return y + '-' + String(m).padStart(2,'0');
+  }
+
+  /* ── 1. 정책 상수 + classify ────────────────────────────────────── */
+  var EXCLUDED_RSN = ['온라인예배', '대체예배', '인증안함', '인증오류'];
+  var EXCLUDED_RSN_SET = {};
+  EXCLUDED_RSN.forEach(function(r){ EXCLUDED_RSN_SET[r] = true; });
+
+  function classify(rec){
+    if(!rec) return 'missing';
+    var st = clean(rec.st);
+    var rsn = clean(rec.rsn);
+    if(st === 'QR인증') return 'attended';
+    if(st === '사유출석') return 'attended';
+    if(st === '사유결석'){
+      if(EXCLUDED_RSN_SET[rsn]) return 'attended';
+      return 'absent';
+    }
+    return 'missing';
+  }
+
+  /* ── 2. 멤버 분류 (4주 sunday 기준) ────────────────────────────── */
+  function classifyMember(member, sundays, recsByMember){
+    var memberRecs = recsByMember[member.id] || {};
+    var classes = sundays.map(function(d){
+      return classify(memberRecs[d]);
+    });
+    var hasAttended = false, hasAbsent = false, hasMissing = false;
+    classes.forEach(function(c){
+      if(c === 'attended') hasAttended = true;
+      else if(c === 'absent') hasAbsent = true;
+      else hasMissing = true;
+    });
+    var category;
+    if(hasMissing) category = 'incomplete';
+    else if(hasAttended && !hasAbsent) category = 'allAttended';
+    else if(!hasAttended && hasAbsent) category = 'allAbsent';
+    else category = 'cycle';
+    return { category: category, classes: classes };
+  }
+
+  /* ── 3. baseMonth 의 일요일 (records 에 등장한 날짜) ─────────────── */
+  function sundaysOf(baseMo){
+    var dates = {};
+    var recs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    recs.forEach(function(r){
+      if(r && r.date && r.date.slice(0,7) === baseMo) dates[r.date.slice(0,10)] = 1;
+    });
+    return Object.keys(dates).sort();
+  }
+
+  /* ── 4. 새 정책 cycle 계산 ─────────────────────────────────────── */
+  function computeNewCyclePolicy(baseMo){
+    var sundays = sundaysOf(baseMo);
+    var members = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    if(!sundays.length){
+      return { error: 'baseMonth "' + baseMo + '" 에 일요일 기록이 없음', sundays: [] };
+    }
+    /* recsByMember[id][date] = rec */
+    var recsByMember = {};
+    (window.RECORDS||[]).forEach(function(r){
+      if(!r || !r.id || !r.date) return;
+      if(r.date.slice(0,7) !== baseMo) return;
+      var id = clean(r.id);
+      var d = r.date.slice(0,10);
+      (recsByMember[id] = recsByMember[id] || {})[d] = r;
+    });
+
+    var allAttended = [], allAbsent = [], cycle = [], incomplete = [];
+    members.forEach(function(m){
+      if(!m || !m.id) return;
+      var res = classifyMember(m, sundays, recsByMember);
+      var entry = { id: m.id, name: m.name||'', region: m.region||'', team: m.team||'', zone: m.zone||'', type: m.type||'', classes: res.classes };
+      if(res.category === 'allAttended') allAttended.push(entry);
+      else if(res.category === 'allAbsent') allAbsent.push(entry);
+      else if(res.category === 'incomplete') incomplete.push(entry);
+      else cycle.push(entry);
+    });
+    return { sundays: sundays, allAttended: allAttended, allAbsent: allAbsent, cycle: cycle, incomplete: incomplete };
+  }
+
+  /* ── 5. 현재 cycle plan 읽기 (LS, STAGE2_HABITUAL_PLAN 와 동일 키) ── */
+  function readCurrentPlan(cycleId){
+    try{
+      var raw = localStorage.getItem('att_habitual_plans_v1');
+      if(!raw) return null;
+      var all = JSON.parse(raw);
+      return all && all[cycleId] ? all[cycleId] : null;
+    }catch(e){ console.warn('[task-3] plan read fail', e); return null; }
+  }
+
+  function saveCurrentPlan(cycleId, plan){
+    try{
+      var raw = localStorage.getItem('att_habitual_plans_v1');
+      var all = raw ? JSON.parse(raw) : {};
+      all[cycleId] = plan;
+      /* localStorage.setItem 은 5b-A Phase B 가 가로채서 FB dual-write 자동 처리 */
+      localStorage.setItem('att_habitual_plans_v1', JSON.stringify(all));
+      return true;
+    }catch(e){ console.warn('[task-3] plan save fail', e); return false; }
+  }
+
+  /* ── 6. diff 계산 (current vs new) ──────────────────────────────── */
+  function computeDiff(cycleId){
+    var plan = readCurrentPlan(cycleId);
+    if(!plan) return { error: 'cycle "' + cycleId + '" plan 없음. 먼저 사이클 생성 필요.' };
+    var baseMo = plan.baseMonth || prevMonth(plan.cycleStart || cycleId);
+    var policy = computeNewCyclePolicy(baseMo);
+    if(policy.error) return { error: policy.error };
+
+    var currentIds = {};
+    (plan.snapshotMembers||[]).forEach(function(id){ currentIds[String(id)] = true; });
+    /* addedMembers 도 현재 cycle 의 일부로 간주 (그러나 재생성 시 보존할지는 별도 결정) */
+    var addedIds = {};
+    (plan.addedMembers||[]).forEach(function(am){
+      if(am && am.personId) addedIds[String(am.personId)] = true;
+    });
+
+    var newIds = {};
+    policy.cycle.forEach(function(m){ newIds[String(m.id)] = m; });
+
+    /* kept: 현재 cycle 에도 있고 새 cycle 에도 있음 */
+    /* added: 새 cycle 에만 (현재 snapshot 에 없음) */
+    /* removed: 현재 cycle 에만 (새 cycle 에서 빠짐) — 이유별 분류 */
+    var kept = [], added = [], removed = [];
+    Object.keys(newIds).forEach(function(id){
+      if(currentIds[id]) kept.push(newIds[id]);
+      else added.push(newIds[id]);
+    });
+    /* 제외 (removed) 의 이유 분류 */
+    var byIdAllAttended = {}; policy.allAttended.forEach(function(m){ byIdAllAttended[String(m.id)] = m; });
+    var byIdAllAbsent = {}; policy.allAbsent.forEach(function(m){ byIdAllAbsent[String(m.id)] = m; });
+    var byIdIncomplete = {}; policy.incomplete.forEach(function(m){ byIdIncomplete[String(m.id)] = m; });
+    Object.keys(currentIds).forEach(function(id){
+      if(newIds[id]) return; /* kept */
+      var reason = '알 수 없음', entry = { id: id };
+      if(byIdAllAttended[id]){ reason = '매주 출석'; entry = byIdAllAttended[id]; }
+      else if(byIdAllAbsent[id]){ reason = '매주 결석'; entry = byIdAllAbsent[id]; }
+      else if(byIdIncomplete[id]){ reason = '데이터 부족'; entry = byIdIncomplete[id]; }
+      else {
+        /* 명단에는 있지만 어떤 정책에도 안 잡힌 케이스 (예: 멤버 마스터에서 제거됨) */
+        reason = '멤버 없음';
+        var m = (window.MEMBERS||[]).find(function(x){ return x && String(x.id) === id; });
+        if(m) entry = { id: m.id, name: m.name||'', region: m.region||'', team: m.team||'', zone: m.zone||'' };
+      }
+      removed.push(Object.assign({}, entry, { reason: reason }));
+    });
+
+    return {
+      cycleId: cycleId,
+      baseMonth: baseMo,
+      sundays: policy.sundays,
+      currentCount: Object.keys(currentIds).length,
+      newCount: Object.keys(newIds).length,
+      kept: kept,
+      added: added,
+      removed: removed,
+      policy: policy,
+      currentPlan: plan
+    };
+  }
+
+  /* ── 7. 4주 패턴 시각화 ────────────────────────────────────────── */
+  function patternToString(classes){
+    return classes.map(function(c){
+      if(c === 'attended') return '<span style="color:#2a8c4a;font-weight:600">O</span>';
+      if(c === 'absent')  return '<span style="color:#c00;font-weight:600">X</span>';
+      return '<span style="color:#999">?</span>';
+    }).join(' ');
+  }
+
+  /* ── 8. 자동 백업 (CYCLE_BACKUP_TOOL 사용 또는 직접 다운로드) ───── */
+  function backupBeforeApply(){
+    /* CYCLE_BACKUP_TOOL 이 있으면 사용 */
+    if(typeof window.__exportCycleData === 'function'){
+      try{ window.__exportCycleData(); return Promise.resolve({ method: '__exportCycleData' }); }
+      catch(e){ console.warn('[task-3] __exportCycleData 실패, fallback', e); }
+    }
+    /* fallback — 직접 LS 다운로드 */
+    try{
+      var raw = localStorage.getItem('att_habitual_plans_v1') || '{}';
+      var ts = new Date();
+      var pad = function(n){ return String(n).padStart(2,'0'); };
+      var stamp = ts.getFullYear()+pad(ts.getMonth()+1)+pad(ts.getDate())+'_'+pad(ts.getHours())+pad(ts.getMinutes());
+      var payload = {
+        _backup_meta: {
+          createdAt: nowIso(),
+          createdBy: (window.currentUser&&window.currentUser.email)||'',
+          purpose: 'task-3 사이클 재생성 사전 백업',
+          schemaVersion: 1
+        },
+        att_habitual_plans_v1: JSON.parse(raw)
+      };
+      var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = 'kmjj-cycle-before-regen-'+stamp+'.json';
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+      return Promise.resolve({ method: 'fallback', fname: a.download });
+    }catch(e){ return Promise.reject(e); }
+  }
+
+  /* ── 9. plan 갱신 적용 ──────────────────────────────────────────── */
+  function applyNewCycle(cycleId, diff){
+    var plan = diff.currentPlan;
+    if(!plan) return false;
+    var newSnapshotIds = diff.kept.concat(diff.added).map(function(m){ return String(m.id); });
+    /* 기존 goals 중 새 명단에 포함된 id 만 유지 */
+    var keptIdSet = {}; newSnapshotIds.forEach(function(id){ keptIdSet[id] = true; });
+    var newGoals = {};
+    var archived = {};
+    Object.keys(plan.goals||{}).forEach(function(id){
+      if(keptIdSet[id]) newGoals[id] = plan.goals[id];
+      else archived[id] = plan.goals[id];
+    });
+    /* 기존 archivedGoals 보존 + 이번에 archive 된 것 병합 */
+    var prevArchived = plan.archivedGoals || {};
+    Object.keys(archived).forEach(function(id){
+      if(!prevArchived[id]) prevArchived[id] = archived[id];
+    });
+
+    plan.snapshotMembers = newSnapshotIds;
+    plan.snapshotAt = nowIso();
+    plan.goals = newGoals;
+    plan.archivedGoals = prevArchived;
+    /* addedMembers 는 유지 — 사용자가 수동으로 추가한 멤버는 새 정책과 별개 */
+    /* 정책 변경 메타데이터 */
+    plan._task3 = {
+      regeneratedAt: nowIso(),
+      regeneratedBy: (window.currentUser&&window.currentUser.email)||'',
+      policy: 'new-EXCLUDED_RSN-v1',
+      counts: {
+        kept: diff.kept.length, added: diff.added.length, removed: diff.removed.length,
+        total: newSnapshotIds.length
+      }
+    };
+
+    return saveCurrentPlan(cycleId, plan);
+  }
+
+  /* ── 10. Diff 모달 표시 ─────────────────────────────────────────── */
+  function showDiffModal(diff, callbacks){
+    var existing = document.getElementById('task3-diff-modal');
+    if(existing) existing.parentNode.removeChild(existing);
+
+    function sampleList(items, fmt, max){
+      max = max || 10;
+      if(!items.length) return '<div style="padding:6px 8px;font-size:11px;color:var(--text3)">(없음)</div>';
+      var shown = items.slice(0, max).map(fmt).join('');
+      var extra = items.length > max ? '<div style="padding:4px 8px;font-size:11px;color:var(--text3);font-style:italic">... +' + (items.length - max) + '명 더</div>' : '';
+      return shown + extra;
+    }
+    var keptSamples = sampleList(diff.kept, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px">'+esc(m.name)+' <span style="color:var(--text3)">('+esc(m.region)+' '+esc(m.team)+' '+esc(m.zone)+')</span></div>';
+    });
+    var addedSamples = sampleList(diff.added, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px;display:flex;justify-content:space-between;gap:8px"><span>'+esc(m.name)+' <span style="color:var(--text3)">('+esc(m.region)+' '+esc(m.team)+' '+esc(m.zone)+')</span></span><span style="font-family:monospace;font-size:11px">'+patternToString(m.classes)+'</span></div>';
+    });
+    /* 제외는 reason 별로 그룹 */
+    var removedByReason = {};
+    diff.removed.forEach(function(m){
+      var r = m.reason || '?';
+      (removedByReason[r] = removedByReason[r] || []).push(m);
+    });
+    var removedHtml = Object.keys(removedByReason).sort().map(function(reason){
+      var items = removedByReason[reason];
+      var color = reason === '매주 출석' ? '#2a8c4a' : reason === '매주 결석' ? '#b35a14' : '#666';
+      return '<details style="margin:4px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:var(--surface-2,#f8f8f8);border-radius:4px;color:'+color+'">'+esc(reason)+' ('+items.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid var(--border-md,#eee);border-radius:4px;margin-top:4px">'+sampleList(items, function(m){
+        return '<div style="padding:3px 8px;font-size:11.5px;display:flex;justify-content:space-between;gap:8px"><span>'+esc(m.name||'?')+' <span style="color:var(--text3)">('+esc(m.region||'')+' '+esc(m.team||'')+' '+esc(m.zone||'')+')</span></span>'+(m.classes ? '<span style="font-family:monospace;font-size:11px">'+patternToString(m.classes)+'</span>' : '')+'</div>';
+      })+'</div></details>';
+    }).join('');
+
+    var html =
+      '<div id="task3-diff-modal" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px">'
+      + '<div style="background:var(--surface,#fff);color:var(--text,#222);border-radius:12px;max-width:820px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 12px 48px rgba(0,0,0,0.3);padding:24px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border-md,#ddd)">'
+      + '<h2 style="margin:0;font-size:18px;font-weight:700">🔄 사이클 재생성 — 새 정책 적용</h2>'
+      + '<button id="task3-close" style="border:none;background:transparent;font-size:24px;cursor:pointer;color:var(--text3,#666)">×</button>'
+      + '</div>'
+      + '<div style="font-size:12px;color:var(--text2,#555);margin-bottom:12px">'
+      + 'cycle: <b>'+esc(diff.cycleId)+'</b> · baseMonth: <b>'+esc(diff.baseMonth)+'</b> · 일요일 '+diff.sundays.length+'개 ('+diff.sundays.join(', ')+')'
+      + '</div>'
+      + '<div style="background:#e6f4ff;padding:10px;border-radius:6px;margin-bottom:14px;font-size:11.5px;line-height:1.6">'
+      + '<b>정책 (EXCLUDED_RSN):</b> 사유결석의 사유가 [온라인예배 / 대체예배 / 인증안함 / 인증오류] 이면 <b>실질 출석</b> 으로 분류.'
+      + '</div>'
+      + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px">'
+      + '<div style="padding:10px;background:#e6f4ff;border-radius:6px;text-align:center"><div style="font-size:10.5px;color:var(--text2)">현재 사이클</div><div style="font-size:20px;font-weight:700">'+diff.currentCount+'</div></div>'
+      + '<div style="padding:10px;background:#e6f9ed;border-radius:6px;text-align:center"><div style="font-size:10.5px;color:var(--text2)">새 사이클</div><div style="font-size:20px;font-weight:700;color:#2a8c4a">'+diff.newCount+'</div></div>'
+      + '<div style="padding:10px;background:#fef0e6;border-radius:6px;text-align:center"><div style="font-size:10.5px;color:var(--text2)">유지 / 추가</div><div style="font-size:14px;font-weight:700">'+diff.kept.length+' / +'+diff.added.length+'</div></div>'
+      + '<div style="padding:10px;background:#fee;border-radius:6px;text-align:center"><div style="font-size:10.5px;color:var(--text2)">제외</div><div style="font-size:20px;font-weight:700;color:#c00">'+diff.removed.length+'</div></div>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--text2);margin-bottom:8px"><b>패턴 범례:</b> <span style="color:#2a8c4a;font-weight:600">O</span> 출석 · <span style="color:#c00;font-weight:600">X</span> 결석 · <span style="color:#999">?</span> 기록 없음</div>'
+      + '<details style="margin:6px 0" open><summary style="cursor:pointer;font-weight:600;padding:6px;background:#e6f9ed;border-radius:4px;color:#2a8c4a">🆕 신규 추가 ('+diff.added.length+'명) — 새 정책으로 추가됨</summary><div style="max-height:240px;overflow-y:auto;border:1px solid #cdedd6;border-radius:4px;margin-top:4px">'+addedSamples+'</div></details>'
+      + '<details style="margin:6px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:var(--surface-2,#f8f8f8);border-radius:4px">📌 유지 ('+diff.kept.length+'명) — 양쪽 모두 포함</summary><div style="max-height:240px;overflow-y:auto;border:1px solid var(--border-md,#eee);border-radius:4px;margin-top:4px">'+keptSamples+'</div></details>'
+      + '<div style="margin-top:8px"><div style="font-weight:600;padding:6px;background:#fee;border-radius:4px;color:#c00">🗑️ 제외 ('+diff.removed.length+'명) — 이유별 분류</div>'+removedHtml+'</div>'
+      + '<div style="background:#fff4e6;padding:10px;border-radius:6px;margin-top:14px;font-size:11.5px;line-height:1.6;color:#444">'
+      + '⚠️ <b>안전:</b> 적용 전 자동 백업 (JSON 다운로드). 사용자가 수동으로 추가한 멤버 (addedMembers) 는 유지. 제외되는 멤버의 goals 는 archivedGoals 로 보존.'
+      + '</div>'
+      + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;padding-top:14px;border-top:1px solid var(--border-md,#ddd)">'
+      + '<button id="task3-cancel" style="padding:10px 20px;border:1px solid var(--border-md,#ccc);background:var(--surface,#fff);color:var(--text,#222);border-radius:6px;cursor:pointer;font-weight:600">취소</button>'
+      + '<button id="task3-apply" style="padding:10px 24px;border:none;background:#1550a0;color:#fff;border-radius:6px;cursor:pointer;font-weight:600">💾 백업 + 적용</button>'
+      + '</div>'
+      + '</div></div>';
+
+    var div = document.createElement('div');
+    div.innerHTML = html;
+    document.body.appendChild(div.firstChild);
+
+    var modal = document.getElementById('task3-diff-modal');
+    function close(){ if(modal && modal.parentNode) modal.parentNode.removeChild(modal); }
+    document.getElementById('task3-close').addEventListener('click', function(){ close(); if(callbacks && callbacks.onCancel) callbacks.onCancel(); });
+    document.getElementById('task3-cancel').addEventListener('click', function(){ close(); if(callbacks && callbacks.onCancel) callbacks.onCancel(); });
+    document.getElementById('task3-apply').addEventListener('click', function(){
+      close();
+      if(callbacks && callbacks.onApply) callbacks.onApply();
+    });
+  }
+
+  /* ── 11. 메인 흐름 ───────────────────────────────────────────────── */
+  function regenerate(cycleId){
+    if(!isAdmin()){ alert('관리자만 사이클 재생성 가능합니다.'); return; }
+    if(!cycleId){ alert('cycleId 가 필요합니다 (예: "2026-05")'); return; }
+    if(!Array.isArray(window.MEMBERS) || !window.MEMBERS.length){ alert('회원 데이터 미로드'); return; }
+    if(!Array.isArray(window.RECORDS) || !window.RECORDS.length){ alert('출결 데이터 미로드'); return; }
+
+    var diff = computeDiff(cycleId);
+    if(diff.error){ alert('오류: ' + diff.error); return; }
+
+    console.log('[task-3] regenerate dry-run:', {
+      cycleId: cycleId, baseMonth: diff.baseMonth, sundays: diff.sundays.length,
+      current: diff.currentCount, new: diff.newCount,
+      kept: diff.kept.length, added: diff.added.length, removed: diff.removed.length
+    });
+
+    showDiffModal(diff, {
+      onCancel: function(){ console.log('[task-3] 사용자 취소'); },
+      onApply: async function(){
+        try{
+          console.log('[task-3] 백업 시작...');
+          var bk = await backupBeforeApply();
+          console.log('[task-3] 백업 완료:', bk);
+          var ok = applyNewCycle(cycleId, diff);
+          if(!ok){ alert('적용 실패 — 콘솔 확인'); return; }
+          console.log('[task-3] ✅ 사이클 재생성 적용 완료. 새 명단:', diff.newCount + '명');
+          /* 화면 갱신 */
+          try{ if(typeof window.renderHabit === 'function') window.renderHabit(); }catch(e){}
+          /* Phase B intercept 이 LS write 를 FB 로 자동 push */
+          alert('✅ 사이클 재생성 완료\n\n새 명단: ' + diff.newCount + '명\n유지: ' + diff.kept.length + ' · 신규: +' + diff.added.length + ' · 제외: ' + diff.removed.length + '\n\n5b-A Phase B 가 자동으로 Firebase 동기.');
+        }catch(err){
+          alert('적용 중 오류: ' + (err && err.message || err));
+          console.error('[task-3] apply error', err);
+        }
+      }
+    });
+  }
+
+  /* ── 12. UI 버튼 inject — s2-bar 에 추가 ──────────────────────────── */
+  function injectRegenButton(){
+    if(!isAdmin()) return false;
+    var bar = document.getElementById('s2-bar')
+            || (document.getElementById('s2-create-btn') && document.getElementById('s2-create-btn').parentNode);
+    if(!bar) return false;
+    if(document.getElementById('task-3-regen-btn')) return true; /* 이미 있음 */
+
+    var btn = document.createElement('button');
+    btn.id = 'task-3-regen-btn';
+    btn.type = 'button';
+    btn.textContent = '🔄 새 정책으로 재생성';
+    btn.title = '새 정책 (EXCLUDED_RSN) 으로 사이클 재계산 후 모달 확인';
+    btn.style.cssText = 'padding:6px 12px;font-size:11.5px;border:1px solid #1550a0;background:#fff;color:#1550a0;border-radius:6px;cursor:pointer;font-weight:600;margin-left:6px';
+    btn.addEventListener('click', function(){
+      /* 현재 가시 사이클 찾기 — habit-year/habit-month 또는 가장 최근 plan */
+      var ySel = document.getElementById('habit-year');
+      var mSel = document.getElementById('habit-month');
+      var cycleId = '';
+      if(ySel && mSel && ySel.value && mSel.value){
+        cycleId = ySel.value + '-' + String(+mSel.value).padStart(2, '0');
+      }
+      /* plan 조회 — cycleStart 또는 cycleEnd 매치 */
+      try{
+        var raw = localStorage.getItem('att_habitual_plans_v1');
+        if(raw){
+          var all = JSON.parse(raw);
+          var keys = Object.keys(all);
+          var matchedKey = '';
+          for(var i = 0; i < keys.length; i++){
+            var p = all[keys[i]];
+            if(p && (p.cycleStart === cycleId || p.cycleEnd === cycleId)){
+              matchedKey = p.cycleId || keys[i];
+              break;
+            }
+          }
+          if(matchedKey) cycleId = matchedKey;
+          else if(keys.length) cycleId = keys[keys.length - 1]; /* fallback: 마지막 plan */
+        }
+      }catch(e){}
+      if(!cycleId){ alert('cycleId 식별 실패 — habit-year/month 또는 현재 plan 확인 필요'); return; }
+      regenerate(cycleId);
+    });
+    bar.appendChild(btn);
+    return true;
+  }
+
+  setTimeout(injectRegenButton, 1500);
+  setInterval(function(){ try{ injectRegenButton(); }catch(e){} }, 2000);
+
+  /* ── 13. 디버그 API ──────────────────────────────────────────────── */
+  window.__task3 = {
+    EXCLUDED_RSN: EXCLUDED_RSN,
+    classify: classify,
+    classifyMember: classifyMember,
+    sundaysOf: sundaysOf,
+    computeNewCyclePolicy: computeNewCyclePolicy,
+    dryRun: function(cycleId){
+      cycleId = cycleId || '2026-05';
+      var diff = computeDiff(cycleId);
+      if(diff.error){ console.warn('[task-3]', diff.error); return diff; }
+      console.group('[task-3] dry-run cycle=' + cycleId + ' (baseMo=' + diff.baseMonth + ')');
+      console.log('현재 사이클:', diff.currentCount + '명');
+      console.log('새 사이클:', diff.newCount + '명');
+      console.log('유지:', diff.kept.length);
+      console.log('신규 추가:', diff.added.length);
+      console.log('제외:', diff.removed.length);
+      console.log('정책 분류:', { allAttended: diff.policy.allAttended.length, allAbsent: diff.policy.allAbsent.length, incomplete: diff.policy.incomplete.length, cycle: diff.policy.cycle.length });
+      console.log('일요일:', diff.sundays);
+      console.groupEnd();
+      return diff;
+    },
+    regenerate: regenerate,
+    injectButton: injectRegenButton,
+    /* 디버그: 특정 멤버의 분류 결과 */
+    classifyOne: function(idOrName, baseMo){
+      var q = clean(idOrName);
+      var m = (window.MEMBERS||[]).find(function(x){
+        return x && (String(x.id) === q || (x.name||'').indexOf(q) >= 0);
+      });
+      if(!m){ console.warn('멤버 없음:', idOrName); return null; }
+      baseMo = baseMo || '2026-04';
+      var sundays = sundaysOf(baseMo);
+      var recsByMember = {};
+      (window.RECORDS||[]).forEach(function(r){
+        if(!r || !r.id || !r.date) return;
+        if(r.date.slice(0,7) !== baseMo) return;
+        (recsByMember[r.id] = recsByMember[r.id] || {})[r.date.slice(0,10)] = r;
+      });
+      var res = classifyMember(m, sundays, recsByMember);
+      console.log('[task-3]', m.name, '(' + m.id + ')', '→', res.category, '|', res.classes.map(function(c,i){ return sundays[i]+':'+c; }).join(', '));
+      return { member: m, category: res.category, classes: res.classes, sundays: sundays };
+    }
+  };
+
+  console.log('[task-3] 사이클 재생성 (새 정책) 활성. 디버그: window.__task3.dryRun("2026-05") / classifyOne("김재남") / regenerate("2026-05")');
+})();
+</script>
+<!-- TASK_3_CYCLE_REGEN_END -->
