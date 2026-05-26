@@ -20265,6 +20265,256 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 </script>
 <!-- BUG_2_ACTIVE_FILTER_AWARE_END -->
 
+<!-- BUG_2_BRUTE_FORCE_RESCUE_START -->
+<script id="bug-2-brute-force-rescue">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Bug 2 v4: Closure-scope mismatch 발견 후 brute-force rescue.
+
+     문제 (v3 검증으로 확정):
+       - bug-2-aaf wrap 의 callcount=0, 그러나 [active-count] 는 출력됨
+       - 이유: line 16982 wrapOne 의 wrapped 함수가 IIFE-local closure 의
+         applyActiveFilter() 를 lexical 참조로 호출.
+         window.applyActiveFilter wrap 은 우회됨.
+       - 추가로 listRestored=[] — _bug2Restored 마커 사라짐
+         → window.MEMBERS 가 통째로 재할당되어 marker 객체들이 교체됨
+
+     해결 (외부 registry + brute force):
+       1. _protectedMembers 전역 registry — window.MEMBERS 와 독립적
+       2. 100ms 간격: window.MEMBERS 길이 변화 감지 + drop ID 명시 로그
+       3. 200ms 간격: protected 멤버가 window.MEMBERS 에 없으면 자동 push
+       4. window.MEMBERS setter trap — 재할당 로그 + stack trace
+       5. 부팅 시 Firebase fetch → registry 초기 채움
+
+     원칙:
+       - "어디서 drop 되든 200ms 내 자동 복구" — 정확한 drop point 몰라도 안전
+       - 모든 변화 콘솔 로그 (silent 금지)
+       - LS 도 함께 갱신 → 다음 boot 보존
+     ════════════════════════════════════════════════════════════════ */
+
+  function clean(s){ return String(s==null?'':s).trim(); }
+
+  /* ── 1. Protected registry ─────────────────────────────────────── */
+  /* id → member obj. 어떤 코드도 이 registry 를 건드릴 수 없음. */
+  var _protectedMembers = {};
+  /* Firebase 마지막 fetch 결과 — 부팅 후 초기 채움 + 30초 주기 refresh */
+  var _fbMembersDict = null;
+
+  function protectMember(m){
+    if(!m || !m.id) return;
+    var id = clean(m.id); if(!id) return;
+    _protectedMembers[id] = {
+      id: m.id, region: m.region||'', team: m.team||'', zone: m.zone||'',
+      name: m.name||'', type: m.type||'일반', regType: m.regType||'총회등록',
+      _retired: !!m._retired,
+      _bug2Protected: true
+    };
+  }
+
+  /* ── 2. window.MEMBERS 변화 감지 + drop 로그 ────────────────────── */
+  var _lastMembersSnapshot = {};
+  var _lastMembersLength = 0;
+
+  function detectChanges(){
+    if(!Array.isArray(window.MEMBERS)) return;
+    var current = {};
+    window.MEMBERS.forEach(function(m){
+      if(m && m.id){ current[clean(m.id)] = m; }
+    });
+    var currentLen = window.MEMBERS.length;
+    var lastLen = _lastMembersLength;
+
+    /* 첫 호출: snapshot 저장 */
+    if(lastLen === 0 && Object.keys(_lastMembersSnapshot).length === 0){
+      _lastMembersSnapshot = current;
+      _lastMembersLength = currentLen;
+      return;
+    }
+
+    /* 변화 감지 */
+    if(currentLen !== lastLen){
+      var dropped = [];
+      var added = [];
+      Object.keys(_lastMembersSnapshot).forEach(function(id){
+        if(!current[id]) dropped.push({ id: id, name: (_lastMembersSnapshot[id].name)||'?' });
+      });
+      Object.keys(current).forEach(function(id){
+        if(!_lastMembersSnapshot[id]) added.push({ id: id, name: current[id].name||'?' });
+      });
+      var t = new Date().toISOString().slice(11, 23);
+      if(dropped.length){
+        console.warn('[bug-2-track] ' + t + ' window.MEMBERS ' + lastLen + ' → ' + currentLen + ' (drop ' + dropped.length + '명):', dropped.slice(0, 5));
+      }
+      if(added.length){
+        console.log('[bug-2-track] ' + t + ' window.MEMBERS ' + lastLen + ' → ' + currentLen + ' (add ' + added.length + '명):', added.slice(0, 5));
+      }
+    }
+
+    _lastMembersSnapshot = current;
+    _lastMembersLength = currentLen;
+  }
+  setInterval(detectChanges, 100);
+
+  /* ── 3. Brute force rescue — protected 멤버가 없으면 push ───────── */
+  function ensureProtected(){
+    if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+    var memIds = {};
+    window.MEMBERS.forEach(function(m){ if(m && m.id) memIds[clean(m.id)] = true; });
+
+    var missing = [];
+    Object.keys(_protectedMembers).forEach(function(id){
+      if(!memIds[id]) missing.push(id);
+    });
+    if(!missing.length) return;
+
+    missing.forEach(function(id){
+      window.MEMBERS.push(_protectedMembers[id]);
+      try{ if(Array.isArray(window.FINAL_MEMBERS)) window.FINAL_MEMBERS.push(_protectedMembers[id]); }catch(e){}
+      try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) MEMBERS.push(_protectedMembers[id]); }catch(e){}
+    });
+    console.log('[bug-2-rescue] ' + missing.length + '명 brute-force 재추가:', missing.slice(0, 5).map(function(id){ return _protectedMembers[id].name + '(' + id + ')'; }));
+    /* LS 갱신 */
+    try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
+    /* UI 강제 갱신 (debounce 1초) — 너무 잦은 재렌더 방지 */
+    scheduleRender();
+  }
+
+  var _renderTimer = null;
+  function scheduleRender(){
+    if(_renderTimer) clearTimeout(_renderTimer);
+    _renderTimer = setTimeout(function(){
+      _renderTimer = null;
+      try{
+        if(typeof window.renderOverview === 'function') window.renderOverview();
+        var active = document.querySelector('.page.active');
+        if(active && typeof window.renderPage === 'function'){
+          window.renderPage(active.id.replace('page-',''));
+        }
+      }catch(e){}
+    }, 1000);
+  }
+
+  setInterval(ensureProtected, 200);
+
+  /* ── 4. window.MEMBERS setter trap — 재할당 감지 ───────────────── */
+  function installMemberTrap(){
+    try{
+      /* 현재 값 백킹 */
+      var _backing = window.MEMBERS;
+      var trapInstalled = false;
+      Object.defineProperty(window, 'MEMBERS', {
+        get: function(){ return _backing; },
+        set: function(v){
+          var beforeLen = Array.isArray(_backing) ? _backing.length : 0;
+          var afterLen = Array.isArray(v) ? v.length : 0;
+          if(beforeLen > afterLen + 2 || (beforeLen > 0 && afterLen === 0)){
+            try{
+              var stack = (new Error()).stack || '';
+              var lines = stack.split('\n').slice(2, 6).map(function(l){ return l.trim(); }).join(' ← ');
+              console.warn('[bug-2-trap] window.MEMBERS 재할당: ' + beforeLen + ' → ' + afterLen + ' | stack: ' + lines);
+            }catch(e){}
+          }
+          _backing = v;
+        },
+        configurable: true
+      });
+      trapInstalled = true;
+      console.log('[bug-2-trap] window.MEMBERS setter trap 설치 완료');
+      return true;
+    }catch(e){
+      console.warn('[bug-2-trap] setter trap 설치 실패:', e);
+      return false;
+    }
+  }
+
+  /* ── 5. 부팅: Firebase fetch → registry 채움 ───────────────────── */
+  function waitForFbDB(cb, maxWaitMs){
+    maxWaitMs = maxWaitMs || 30000;
+    var elapsed = 0;
+    var iv = setInterval(function(){
+      if(window.fbDB && typeof window.fbDB.ref === 'function'){
+        clearInterval(iv); cb(); return;
+      }
+      elapsed += 300;
+      if(elapsed >= maxWaitMs){ clearInterval(iv); console.warn('[bug-2-rescue] fbDB 대기 timeout'); }
+    }, 300);
+  }
+
+  function fetchAndProtect(){
+    if(!window.fbDB || typeof window.fbDB.ref !== 'function') return Promise.resolve(0);
+    return window.fbDB.ref('members').once('value').then(function(snap){
+      if(!snap.exists()){ console.warn('[bug-2-rescue] Firebase /members 비어있음'); return 0; }
+      var v = snap.val();
+      var fbDict = {};
+      var protectedCount = 0;
+      Object.keys(v).forEach(function(k){
+        var m = v[k];
+        if(m && m.id){
+          var id = clean(m.id);
+          if(id){
+            fbDict[id] = m;
+            protectMember(m);
+            protectedCount++;
+          }
+        }
+      });
+      _fbMembersDict = fbDict;
+      console.log('[bug-2-rescue] Firebase fetch → registry: ' + protectedCount + '명 protected');
+      /* 즉시 한 번 rescue 실행 */
+      ensureProtected();
+      return protectedCount;
+    }).catch(function(err){
+      console.warn('[bug-2-rescue] Firebase fetch error:', err && err.message);
+      return 0;
+    });
+  }
+
+  waitForFbDB(function(){
+    /* setter trap 먼저 설치 (Firebase fetch 전에) */
+    installMemberTrap();
+    /* 1차 fetch */
+    fetchAndProtect();
+    /* 30초 주기 refresh — 처음 10분간 */
+    var refreshN = 0;
+    var refreshIv = setInterval(function(){
+      refreshN++;
+      if(refreshN > 20){ clearInterval(refreshIv); return; }
+      fetchAndProtect();
+    }, 30000);
+  });
+
+  /* ── 6. 디버그 API ─────────────────────────────────────────────── */
+  window.__bug2Rescue = {
+    registry: function(){
+      console.log('[bug-2-rescue] _protectedMembers 등록 ' + Object.keys(_protectedMembers).length + '명');
+      return Object.keys(_protectedMembers).length;
+    },
+    findInRegistry: function(idOrName){
+      var q = clean(idOrName).toLowerCase();
+      var hits = [];
+      Object.keys(_protectedMembers).forEach(function(id){
+        var m = _protectedMembers[id];
+        if(id.toLowerCase().indexOf(q) >= 0 || (m.name||'').toLowerCase().indexOf(q) >= 0){
+          hits.push({ id: id, name: m.name, region: m.region, team: m.team });
+        }
+      });
+      console.log('[bug-2-rescue] 검색 "' + idOrName + '" hit ' + hits.length + ':', hits.slice(0, 5));
+      return hits;
+    },
+    forceFetch: fetchAndProtect,
+    forceRescue: ensureProtected,
+    clear: function(){
+      _protectedMembers = {};
+      console.log('[bug-2-rescue] registry 비움');
+    }
+  };
+
+  console.log('[bug-2-rescue] v4 brute-force rescue 활성 (100ms track + 200ms rescue + setter trap). 디버그: window.__bug2Rescue');
+})();
+</script>
+<!-- BUG_2_BRUTE_FORCE_RESCUE_END -->
+
 <!-- MOBILE_AUTH_COMPAT_START -->
 <script id="mobile-auth-compat">
 (function(){
