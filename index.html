@@ -9221,8 +9221,8 @@ body.v97-data-loading #login-screen{z-index:9999;}
       sm.innerHTML = [
         metricHtml('일반 3회↑', c.normal, 'var(--amber)'),
         metricHtml('가족 7회↑', c.family, 'var(--red)'),
-        metricHtml('가족외 7회↑', c.familyOut, 'var(--red)'),
-        metricHtml('주의 합계', c.total, 'var(--amber)')
+        metricHtml('가족외 7회↑', c.familyOut, 'var(--red)')
+        /* '주의 합계' 카드 제거 (사용자 요청 — 통계 분석 페이지 4번째 카드) */
       ].join('');
     }
     var sc=document.getElementById('sk-content');
@@ -9392,12 +9392,12 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     }
     var c=calcCounts();
     root.innerHTML =
-      '<div class="v78-section-title">연속결석 분석 <span class="v78-note">화면 표기 기준: 일반 4회 이상 · 가족·가족외 8회 이상</span></div>'+ 
+      '<div class="v78-section-title">연속결석 분석 <span class="v78-note">화면 표기 기준: 일반 4회 이상 · 가족·가족외 8회 이상</span></div>'+
       '<div class="mg" style="margin-bottom:14px">'+
         metric('일반 4회↑', c.normal, 'var(--amber)')+
         metric('가족 8회↑', c.family, 'var(--red)')+
         metric('가족외 8회↑', c.familyOut, 'var(--red)')+
-        metric('주의 합계', c.total, 'var(--amber)')+
+        /* '주의 합계' 카드 제거 (사용자 요청) */
       '</div>'+ 
       '<div class="v78-section-title">결석사유 분석 <span class="v78-note">선택월 사유결석 기준</span></div>'+ 
       '<div class="card"><div class="ct">사유결석 분포</div><div style="position:relative;height:210px"><canvas id="c-ov-reason">사유결석 분포</canvas></div><div id="ov-reason-list" class="v78-reason-list"></div></div>';
@@ -20100,9 +20100,82 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS));
       }catch(e){}
 
-      /* 5. UI 재렌더 — 화면 즉시 갱신 */
+      /* 5. v6: Phantom purge + stale field refresh — window.MEMBERS 의 entries 중
+         FB 에 없는 것 제거 + FB 에 있는 것은 region/team/zone/name/type 을 FB 로 sync.
+         사용자 보고: 강북 카드 227 vs FB 215 (+12 stale), 다른 region 도 -2/-3 차이.
+         원인: MEMBERS 가 stale region 정보 (FB 에서 region 바뀌었지만 MEMBERS 미반영). */
+      var fbIdSet = {};
+      Object.keys(fbDict).forEach(function(id){ fbIdSet[id] = true; });
+      var phantomRemoved = [];
+      var fieldsRefreshed = 0;
+      var purgedMembers = [];
+      window.MEMBERS.forEach(function(m){
+        if(!m || !m.id) return; /* null/empty drop */
+        var id = clean(m.id);
+        if(!fbIdSet[id]){
+          phantomRemoved.push({ id: id, name: m.name||'?', region: m.region||'' });
+          return;
+        }
+        /* Stale field refresh — FB 가 ground truth */
+        var fb = fbDict[id];
+        var changed = false;
+        if(fb.region !== m.region){ m.region = fb.region; changed = true; }
+        if(fb.team !== m.team){ m.team = fb.team; changed = true; }
+        if(fb.zone !== m.zone){ m.zone = fb.zone; changed = true; }
+        if(fb.name && fb.name !== m.name){ m.name = fb.name; changed = true; }
+        if(fb.type && fb.type !== m.type){ m.type = fb.type; changed = true; }
+        if(fb.regType && fb.regType !== m.regType){ m.regType = fb.regType; changed = true; }
+        if(changed) fieldsRefreshed++;
+        purgedMembers.push(m);
+      });
+      /* window.MEMBERS 재할당 — phantom 제거된 새 배열 */
+      window.MEMBERS.length = 0;
+      purgedMembers.forEach(function(m){ window.MEMBERS.push(m); });
+
+      /* lexical MEMBERS 도 동일 purge + sync (in-place) */
+      try{
+        if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+          for(var i = MEMBERS.length - 1; i >= 0; i--){
+            var m2 = MEMBERS[i];
+            if(!m2 || !m2.id || !fbIdSet[clean(m2.id)]){ MEMBERS.splice(i, 1); continue; }
+            var fb2 = fbDict[clean(m2.id)];
+            if(fb2){
+              if(fb2.region !== m2.region) m2.region = fb2.region;
+              if(fb2.team !== m2.team) m2.team = fb2.team;
+              if(fb2.zone !== m2.zone) m2.zone = fb2.zone;
+              if(fb2.name && fb2.name !== m2.name) m2.name = fb2.name;
+              if(fb2.type && fb2.type !== m2.type) m2.type = fb2.type;
+              if(fb2.regType && fb2.regType !== m2.regType) m2.regType = fb2.regType;
+            }
+          }
+        }
+      }catch(e){}
+      /* FINAL_MEMBERS phantom 도 정리 (재할당 시 stale 반영 방지) */
+      try{
+        if(Array.isArray(window.FINAL_MEMBERS)){
+          for(var j = window.FINAL_MEMBERS.length - 1; j >= 0; j--){
+            var m3 = window.FINAL_MEMBERS[j];
+            if(!m3 || !m3.id || !fbIdSet[clean(m3.id)]){ window.FINAL_MEMBERS.splice(j, 1); continue; }
+            var fb3 = fbDict[clean(m3.id)];
+            if(fb3){
+              if(fb3.region !== m3.region) m3.region = fb3.region;
+              if(fb3.team !== m3.team) m3.team = fb3.team;
+              if(fb3.zone !== m3.zone) m3.zone = fb3.zone;
+            }
+          }
+        }
+      }catch(e){}
+      if(phantomRemoved.length || fieldsRefreshed){
+        var phSample = phantomRemoved.slice(0, 5).map(function(p){ return p.name+'('+p.region+','+p.id+')'; }).join(', ');
+        console.log('[bug-2-guard] 🧹 sync: phantom ' + phantomRemoved.length + '명 제거' + (phSample ? ' (' + phSample + ')' : '') + ', stale 필드 ' + fieldsRefreshed + '명 갱신 (region/team/zone/type 등).');
+        /* LS 갱신 (purge + sync 결과 보존) */
+        try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
+      }
+
+      /* 6. UI 재렌더 — 화면 즉시 갱신 */
       try{
         if(typeof window.renderOverview === 'function') window.renderOverview();
+        if(typeof window.renderRegionCards === 'function') window.renderRegionCards();
         var active = document.querySelector('.page.active');
         if(active && typeof window.renderPage === 'function'){
           window.renderPage(active.id.replace('page-',''));
@@ -20114,13 +20187,16 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       if(memAdded.length){
         console.log('[bug-2-guard] ✅ Firebase 복구: window.MEMBERS 에 ' + memAdded.length + '명 추가 (' + sample + extra + '). 화면 갱신 완료.');
         try{ if(typeof window.showToast === 'function') window.showToast('✅ ' + memAdded.length + '명 회원 자동 복구 (Firebase 동기)'); }catch(e){}
-      } else {
+      } else if(!phantomRemoved.length){
         console.log('[bug-2-guard] Firebase 와 MEMBERS 이미 동기 (' + fbCount + '명)');
       }
+      /* MEMBERS 가 FB 와 정확히 일치하도록 정렬 — 카운트 통일 보장 */
       return {
         restored: memAdded.length, finalAdded: finalAdded.length,
+        phantomRemoved: phantomRemoved.length,
         fbCount: fbCount, memCount: window.MEMBERS.length,
-        sample: memAdded.slice(0, 10)
+        sample: memAdded.slice(0, 10),
+        phantomSample: phantomRemoved.slice(0, 10)
       };
     });
   }
