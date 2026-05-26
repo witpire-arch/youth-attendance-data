@@ -20119,3 +20119,306 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- BUG_2_MEMBERS_DROP_GUARD_END -->
+
+<!-- MOBILE_AUTH_COMPAT_START -->
+<script id="mobile-auth-compat">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     모바일 로그인 호환성 개선
+       문제 1: 텔레그램/카카오 인앱 브라우저 — Google OAuth 차단
+               → auth/operation-not-supported-in-this-environment
+       문제 2: 모바일 일반 브라우저 — signInWithPopup 불안정
+               → '로그인 창이 닫혔습니다' (auth/popup-closed-by-user)
+
+     해결:
+       A. WebView 인앱 브라우저 감지 → 외부 브라우저 사용 안내 모달
+       B. 모바일 일반 브라우저 → signInWithRedirect 사용
+          - 데스크탑은 기존 signInWithPopup 유지 (안정적)
+       C. getRedirectResult — 페이지 복귀 시 자동 처리
+       D. 로그인 화면에 "📱 도움말" 토글 추가
+
+     영향 범위: window.signInWithGoogle wrap (원본은 보존).
+     ════════════════════════════════════════════════════════════════ */
+
+  function $(id){ return document.getElementById(id); }
+  function ua(){ return String(navigator.userAgent || navigator.vendor || '').trim(); }
+
+  /* ── 1. 환경 감지 ───────────────────────────────────────────────── */
+  function isMobileDevice(){
+    var u = ua();
+    if(/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(u)) return true;
+    /* iPad Pro: macintosh + touch support */
+    if(/Macintosh/.test(u) && navigator.maxTouchPoints && navigator.maxTouchPoints > 1) return true;
+    return false;
+  }
+
+  function detectInAppBrowser(){
+    var u = ua();
+    var lower = u.toLowerCase();
+    /* 텔레그램 */
+    if(/telegram/i.test(u))            return { type:'telegram',  label:'텔레그램',     guide:'우측 상단 ⋮ 메뉴 → "Open in Browser" (브라우저로 열기)' };
+    /* 카카오톡 */
+    if(/kakaotalk/i.test(u))           return { type:'kakaotalk', label:'카카오톡',     guide:'우측 상단 ⋮ 메뉴 → "다른 브라우저로 열기" (또는 Safari/Chrome)' };
+    /* 네이버 앱 */
+    if(/naver\(inapp/i.test(lower) || /naver/i.test(lower) && /inapp/i.test(lower))
+                                       return { type:'naver',     label:'네이버 앱',     guide:'우측 하단 점3개 메뉴 → "다른 브라우저로 열기"' };
+    /* 라인 */
+    if(/line\//i.test(u))              return { type:'line',      label:'라인',         guide:'우측 상단 ⋮ 메뉴 → "다른 브라우저에서 열기"' };
+    /* Instagram / Facebook */
+    if(/FBAN|FBAV|Instagram/i.test(u)) return { type:'meta',      label:'Instagram/Facebook', guide:'우측 상단 ⋮ 메뉴 → "외부 브라우저에서 열기" (Open in external browser)' };
+    /* 일반 WebView (Android) */
+    if(/; wv\)/i.test(u))              return { type:'webview',   label:'인앱 브라우저', guide:'기본 브라우저 (Chrome/Safari) 에서 직접 사이트 주소를 입력해주세요.' };
+    /* iOS WebView 의심 (Safari 미포함 + iPhone/iPad) */
+    if(/iPhone|iPad/i.test(u) && !/Safari/i.test(u) && !/CriOS/i.test(u))
+                                       return { type:'ios-webview', label:'iOS 인앱 브라우저', guide:'우측 상단 공유 버튼 → "Safari 에서 열기"' };
+    return null;
+  }
+
+  /* ── 2. WebView 안내 모달 ──────────────────────────────────────── */
+  function showWebViewWarning(inApp){
+    var existing = $('mobile-auth-webview-modal');
+    if(existing) return;  /* 이미 표시 중 */
+    var url = window.location.href;
+    var div = document.createElement('div');
+    div.id = 'mobile-auth-webview-modal';
+    div.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:999999;display:flex;align-items:center;justify-content:center;padding:20px';
+    div.innerHTML =
+      '<div style="background:#fff;border-radius:12px;max-width:420px;width:100%;padding:24px;box-shadow:0 12px 48px rgba(0,0,0,0.3);font-family:inherit">'
+      + '<div style="font-size:36px;text-align:center;margin-bottom:12px">⚠️</div>'
+      + '<h3 style="margin:0 0 12px;text-align:center;color:#c00;font-size:17px">'+inApp.label+' 인앱 브라우저는 지원되지 않습니다</h3>'
+      + '<p style="font-size:13px;line-height:1.6;color:#444;margin:0 0 16px">Google 로그인이 차단되어 있습니다. <b>외부 브라우저</b> (Chrome/Safari 등) 에서 열어주세요.</p>'
+      + '<div style="background:#f5f5f5;padding:12px;border-radius:6px;font-size:12.5px;line-height:1.6;color:#333;margin-bottom:16px"><b>방법:</b><br>' + inApp.guide + '</div>'
+      + '<div style="background:#e6f4ff;padding:12px;border-radius:6px;font-size:11.5px;line-height:1.5;color:#333;margin-bottom:16px;word-break:break-all"><b>주소:</b><br><span id="mobile-auth-url" style="font-family:monospace;font-size:11px">'+url+'</span></div>'
+      + '<button id="mobile-auth-copy-url" style="width:100%;padding:10px;border:none;background:#1550a0;color:#fff;border-radius:6px;cursor:pointer;font-weight:600;margin-bottom:8px">📋 주소 복사</button>'
+      + '<button id="mobile-auth-close" style="width:100%;padding:8px;border:1px solid #ccc;background:#fff;color:#666;border-radius:6px;cursor:pointer">닫기</button>'
+      + '</div>';
+    document.body.appendChild(div);
+    $('mobile-auth-copy-url').addEventListener('click', function(){
+      try{
+        navigator.clipboard.writeText(url).then(function(){
+          var btn = $('mobile-auth-copy-url');
+          if(btn){ btn.textContent = '✅ 복사됨 — 외부 브라우저에 붙여넣으세요'; btn.style.background = '#2a8c4a'; }
+        }).catch(function(){
+          /* clipboard 실패 — fallback: prompt */
+          window.prompt('주소를 복사해주세요:', url);
+        });
+      }catch(e){ window.prompt('주소를 복사해주세요:', url); }
+    });
+    $('mobile-auth-close').addEventListener('click', function(){ div.parentNode.removeChild(div); });
+  }
+
+  /* ── 3. 도움말 토글 (로그인 화면에 항상 표시) ──────────────────── */
+  function ensureHelpToggle(){
+    var box = document.querySelector('.login-box');
+    if(!box || $('mobile-auth-help')) return false;
+
+    var help = document.createElement('div');
+    help.id = 'mobile-auth-help';
+    help.style.cssText = 'margin-top:18px;text-align:center';
+    help.innerHTML =
+      '<a href="#" id="mobile-auth-help-link" style="color:#1550a0;text-decoration:none;font-size:12.5px;cursor:pointer;border-bottom:1px dashed #1550a0;padding-bottom:1px">📱 모바일 로그인이 안 되시나요?</a>'
+      + '<div id="mobile-auth-help-content" style="display:none;margin-top:14px;padding:14px;background:#f7f8fa;border-radius:8px;text-align:left;font-size:11.5px;line-height:1.7;color:#333"></div>';
+    box.appendChild(help);
+
+    var content = $('mobile-auth-help-content');
+    content.innerHTML =
+      '<div style="font-weight:600;margin-bottom:8px;color:#c00">⚠️ 인앱 브라우저 (텔레그램/카카오톡/네이버 등) 는 지원되지 않습니다</div>'
+      + '<div style="margin-bottom:12px">• 외부 브라우저 (Chrome / Safari) 에서 열어주세요</div>'
+      + '<div style="font-weight:600;margin-bottom:6px">📱 모바일 사용법</div>'
+      + '<div style="margin-bottom:6px"><b>iPhone (Safari):</b> 사이트 주소를 직접 입력 → Google 로그인</div>'
+      + '<div style="margin-bottom:6px"><b>Android (Chrome):</b> 사이트 주소를 직접 입력 → Google 로그인</div>'
+      + '<div style="margin-bottom:12px">로그인 화면이 안 뜨면 외부 브라우저를 다시 시도해주세요.</div>'
+      + '<div style="font-weight:600;margin-bottom:6px">🔗 인앱 브라우저에서 외부 브라우저 열기</div>'
+      + '<div style="margin-bottom:4px"><b>텔레그램:</b> ⋮ 메뉴 → "Open in Browser"</div>'
+      + '<div style="margin-bottom:4px"><b>카카오톡:</b> ⋮ 메뉴 → "다른 브라우저로 열기"</div>'
+      + '<div style="margin-bottom:4px"><b>네이버:</b> 우측 하단 ⋮ → "다른 브라우저로 열기"</div>'
+      + '<div style="margin-bottom:4px"><b>Instagram/Facebook:</b> ⋮ → "외부 브라우저"</div>'
+      + '<div style="margin-bottom:12px"><b>iOS 일반:</b> 우측 상단 공유 → "Safari 에서 열기"</div>'
+      + '<div style="font-weight:600;margin-bottom:6px">💡 그래도 안 될 때</div>'
+      + '<div>• Chrome/Safari 의 쿠키/팝업 차단 해제</div>'
+      + '<div>• 시크릿창 사용 시 동일 문제 발생 가능 → 일반 창으로 시도</div>'
+      + '<div style="margin-top:12px;padding-top:8px;border-top:1px dashed #ddd;color:#666">계속 문제 발생 시 관리자에게 문의해주세요.</div>';
+
+    $('mobile-auth-help-link').addEventListener('click', function(e){
+      e.preventDefault();
+      var c = $('mobile-auth-help-content');
+      c.style.display = c.style.display === 'none' ? 'block' : 'none';
+    });
+    return true;
+  }
+
+  /* ── 4. signInWithRedirect (모바일용) ─────────────────────────── */
+  function signInWithRedirectFlow(){
+    try{
+      if(typeof firebase === 'undefined' || !firebase.auth){
+        console.error('[mobile-auth] firebase.auth 미준비');
+        return false;
+      }
+      var provider = new firebase.auth.GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      console.log('[mobile-auth] signInWithRedirect 시도...');
+      firebase.auth().signInWithRedirect(provider);
+      return true;
+    }catch(e){
+      console.error('[mobile-auth] signInWithRedirect 실패:', e);
+      return false;
+    }
+  }
+
+  /* ── 5. signInWithGoogle wrap ──────────────────────────────────── */
+  function wrapSignIn(){
+    var orig = window.signInWithGoogle;
+    if(typeof orig !== 'function') return false;
+    if(orig.__mobileCompat) return true;
+
+    var wrapped = function(){
+      try{
+        /* (a) 인앱 브라우저 감지 → 안내 모달 (로그인 차단) */
+        var inApp = detectInAppBrowser();
+        if(inApp){
+          console.warn('[mobile-auth] 인앱 브라우저 감지:', inApp.type, '— 외부 브라우저 안내');
+          showWebViewWarning(inApp);
+          return;
+        }
+        /* (b) 모바일 → redirect */
+        if(isMobileDevice()){
+          console.log('[mobile-auth] 모바일 감지 — signInWithRedirect 사용');
+          var ok = signInWithRedirectFlow();
+          if(!ok){
+            console.log('[mobile-auth] redirect 실패 — popup fallback');
+            return orig.apply(this, arguments);
+          }
+          return;
+        }
+        /* (c) 데스크탑 → 기존 popup */
+        return orig.apply(this, arguments);
+      }catch(e){
+        console.error('[mobile-auth] wrap 오류:', e);
+        return orig.apply(this, arguments);
+      }
+    };
+    wrapped.__mobileCompat = true;
+    wrapped.__originalSignIn = orig;
+    window.signInWithGoogle = wrapped;
+
+    /* 버튼 핸들러 재바인딩 — 기존 핸들러는 orig 를 직접 호출하므로 교체 필요 */
+    var btn = $('google-signin-btn');
+    if(btn){
+      /* 기존 핸들러 제거 — addEventListener 로 등록됐으므로 removeEventListener 불가
+         (참조 없음). 대신 새 핸들러를 추가하고 기존 _authBound 우회 */
+      try{
+        var newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+        newBtn.addEventListener('click', function(){ window.signInWithGoogle(); });
+        newBtn._mobileBound = true;
+        console.log('[mobile-auth] 로그인 버튼 핸들러 교체 완료');
+      }catch(e){ console.warn('[mobile-auth] 버튼 교체 실패 — 기존 핸들러 유지:', e); }
+    }
+    return true;
+  }
+
+  /* ── 6. getRedirectResult — 페이지 복귀 시 처리 ─────────────────── */
+  function handleRedirectResult(){
+    if(typeof firebase === 'undefined' || !firebase.auth) return;
+    try{
+      firebase.auth().getRedirectResult()
+        .then(function(result){
+          if(result && result.user){
+            console.log('[mobile-auth] redirect 로그인 성공:', result.user.email);
+            /* onAuthStateChanged 가 후속 처리 (allowlist 조회 + 대시보드) */
+          }
+        })
+        .catch(function(err){
+          var code = err && err.code;
+          if(code === 'auth/operation-not-supported-in-this-environment'){
+            console.warn('[mobile-auth] redirect 환경 미지원 — WebView 의심');
+            var inApp = detectInAppBrowser() || { type:'unknown', label:'알 수 없는 인앱 브라우저', guide:'기본 브라우저 (Chrome/Safari) 로 열어주세요.' };
+            showWebViewWarning(inApp);
+          } else if(code === 'auth/web-storage-unsupported'){
+            console.warn('[mobile-auth] web-storage 미지원 (시크릿 모드 의심)');
+          } else if(code){
+            console.warn('[mobile-auth] getRedirectResult 오류:', code, err && err.message);
+          }
+        });
+    }catch(e){
+      console.warn('[mobile-auth] getRedirectResult 호출 실패:', e);
+    }
+  }
+
+  /* ── 7. 초기화 ──────────────────────────────────────────────────── */
+  function init(){
+    /* (1) redirect 복귀 처리 — Firebase Auth SDK 가 준비되면 즉시 */
+    function tryHandleRedirect(retries){
+      if(typeof firebase !== 'undefined' && firebase.auth){
+        handleRedirectResult();
+        return;
+      }
+      if(retries <= 0) return;
+      setTimeout(function(){ tryHandleRedirect(retries-1); }, 200);
+    }
+    tryHandleRedirect(30);  /* 30 * 200ms = 6초 */
+
+    /* (2) signInWithGoogle wrap — 원본 정의될 때까지 폴링 */
+    if(!wrapSignIn()){
+      var t = 0;
+      var iv = setInterval(function(){
+        if(wrapSignIn() || ++t > 200) clearInterval(iv);
+      }, 50);
+    }
+
+    /* (3) 도움말 토글 — 로그인 화면 DOM 준비 후 */
+    if(!ensureHelpToggle()){
+      var t2 = 0;
+      var iv2 = setInterval(function(){
+        if(ensureHelpToggle() || ++t2 > 200) clearInterval(iv2);
+      }, 50);
+    }
+
+    /* (4) 인앱 브라우저 즉시 감지 → 로그인 화면 상단에 영구 배너 표시 */
+    var inApp = detectInAppBrowser();
+    if(inApp){
+      console.warn('[mobile-auth] 인앱 브라우저 환경 감지 (페이지 로드 시):', inApp.type);
+      /* 로그인 화면 표시 시점에 배너 추가 */
+      function addBanner(){
+        var box = document.querySelector('.login-box');
+        if(!box || $('mobile-auth-inapp-banner')) return false;
+        var banner = document.createElement('div');
+        banner.id = 'mobile-auth-inapp-banner';
+        banner.style.cssText = 'background:#fee;border:1px solid #c00;color:#c00;padding:10px;border-radius:6px;margin-bottom:14px;font-size:11.5px;line-height:1.5;text-align:left';
+        banner.innerHTML = '⚠️ <b>'+inApp.label+'</b> 인앱 브라우저 감지<br><span style="font-weight:400">Google 로그인이 차단됩니다. 외부 브라우저로 열어주세요.</span>';
+        box.insertBefore(banner, box.firstChild);
+        return true;
+      }
+      if(!addBanner()){
+        var t3 = 0;
+        var iv3 = setInterval(function(){
+          if(addBanner() || ++t3 > 200) clearInterval(iv3);
+        }, 50);
+      }
+    }
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  /* ── 8. 디버그 API ──────────────────────────────────────────────── */
+  window.__mobileAuth = {
+    isMobile: isMobileDevice,
+    detectInApp: detectInAppBrowser,
+    showWarning: function(){
+      var inApp = detectInAppBrowser() || { type:'test', label:'테스트', guide:'테스트 안내' };
+      showWebViewWarning(inApp);
+    },
+    forceRedirect: signInWithRedirectFlow,
+    handleRedirectNow: handleRedirectResult,
+    ua: ua
+  };
+
+  console.log('[mobile-auth] 모바일 호환 활성. mobile=' + isMobileDevice() + ', inApp=' + (detectInAppBrowser() && detectInAppBrowser().type || 'none') + '. 디버그: window.__mobileAuth');
+})();
+</script>
+<!-- MOBILE_AUTH_COMPAT_END -->
