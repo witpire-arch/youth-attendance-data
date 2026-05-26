@@ -19055,6 +19055,11 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           _origSetItem(lsKey, JSON.stringify(fbDict));   /* 인터셉터 우회 */
           var lsN = dictSize(lsObj), fbN = dictSize(fbDict);
           console.log('[5bA-phaseD] remote change applied:', lsKey, 'LS=' + lsN + ' → FB=' + fbN);
+          /* Bug 3a 후속: Firebase 가 빈 plan.goals={} 를 prune 한 경우 LS 도 sync 됨 →
+             refreshUI 에서 plan.goals[id] throw. cleanup trigger 로 defensive init 보장. */
+          if(lsKey === 'att_habitual_plans_v1' && typeof window.__bug3OrphanTriggerCleanup === 'function'){
+            try{ window.__bug3OrphanTriggerCleanup(); }catch(_){}
+          }
           scheduleUIRefresh(lsKey);
         }catch(e){ console.warn('[5bA-phaseD] handler error', cfg.fbPath, e); }
       };
@@ -20594,6 +20599,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       console.log('[bug-2-rescue] _protectedMembers 등록 ' + Object.keys(_protectedMembers).length + '명');
       return Object.keys(_protectedMembers).length;
     },
+    /* Firebase /members 기반 protected id set 노출 — bug-3-orphan cleanup 의 ground truth */
+    getProtectedIds: function(){
+      return Object.keys(_protectedMembers);
+    },
+    hasId: function(id){
+      return !!_protectedMembers[clean(id)];
+    },
     findInRegistry: function(idOrName){
       var q = clean(idOrName).toLowerCase();
       var hits = [];
@@ -21497,17 +21509,41 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
   function clean(s){ return String(s==null?'':s).trim(); }
 
+  /* Ground truth: bug-2-rescue 의 _protectedMembers (Firebase) UNION window.MEMBERS.
+     bug-2 silent drop 으로 window.MEMBERS 가 누락된 ID 보존을 위함. */
   function memberIdSet(){
     var s = {};
     (window.MEMBERS||[]).forEach(function(m){ if(m && m.id) s[clean(m.id)] = true; });
+    /* bug-2-rescue 가 있으면 FB protected ID 도 union 에 추가 */
+    try{
+      if(window.__bug2Rescue && typeof window.__bug2Rescue.getProtectedIds === 'function'){
+        window.__bug2Rescue.getProtectedIds().forEach(function(id){ s[clean(id)] = true; });
+      }
+    }catch(e){}
     return s;
   }
 
+  /* 안전 게이트: bug-2-rescue 의 Firebase fetch 가 끝났는지 확인 */
+  function bug2RescueReady(){
+    try{
+      if(window.__bug2Rescue && typeof window.__bug2Rescue.getProtectedIds === 'function'){
+        var ids = window.__bug2Rescue.getProtectedIds();
+        return ids.length >= 100;
+      }
+    }catch(e){}
+    return false;
+  }
+
   var _firstCleanupLogged = false;
+  var _everCleanedOnce = false;
 
   function cleanupAllPlans(){
     if(!Array.isArray(window.MEMBERS) || window.MEMBERS.length < 100){
       return { error: 'MEMBERS 미로드 (' + (window.MEMBERS||[]).length + '명)' };
+    }
+    /* bug-2-rescue 의 FB fetch 가 안 끝났으면 1회 cleanup 도 skip (legit member 제거 위험) */
+    if(!_everCleanedOnce && !bug2RescueReady()){
+      return { error: 'bug-2-rescue Firebase fetch 미완료 — 대기 중 (legit member 보호)' };
     }
     try{
       var raw = localStorage.getItem('att_habitual_plans_v1');
@@ -21585,6 +21621,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         }
       });
 
+      _everCleanedOnce = true;
       if(totalCleaned > 0){
         /* LS 저장 → Phase B intercept 가 FB 자동 dual-write */
         localStorage.setItem('att_habitual_plans_v1', JSON.stringify(all));
@@ -21606,23 +21643,36 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   }
 
-  /* Boot: MEMBERS 가 준비될 때까지 폴링 */
-  function waitForMembersThen(retries, cb){
-    if(Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100){ cb(); return; }
-    if(retries <= 0){ console.warn('[bug-3-orphan] MEMBERS 대기 timeout'); return; }
-    setTimeout(function(){ waitForMembersThen(retries-1, cb); }, 500);
+  /* Boot: MEMBERS + bug-2-rescue Firebase fetch 둘 다 준비될 때까지 폴링 */
+  function waitForReadyThen(retries, cb){
+    var memReady = Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100;
+    var fbReady = bug2RescueReady();
+    if(memReady && fbReady){ cb(); return; }
+    if(retries <= 0){
+      console.warn('[bug-3-orphan] 대기 timeout — memReady=' + memReady + ' fbReady=' + fbReady);
+      /* fbReady 안 돼도 memReady 면 시도 (안전 게이트가 다시 막을 것) */
+      if(memReady) cb();
+      return;
+    }
+    setTimeout(function(){ waitForReadyThen(retries-1, cb); }, 500);
   }
-  waitForMembersThen(60, cleanupAllPlans);
+  waitForReadyThen(120, cleanupAllPlans);  /* 60초 대기 */
 
-  /* 주기적 재검사 — 처음 5분 간 30초마다 (task-3 적용 직후 등 새 orphan 유입 케이스 대비) */
-  var periodicN = 0;
-  var periodicIv = setInterval(function(){
-    periodicN++;
-    if(periodicN > 10){ clearInterval(periodicIv); return; }
+  /* 주기적 재검사 — 60초마다 무기한 (Phase D pull 로 plan.goals 가 다시 사라지는 경우 대비).
+     Firebase 가 빈 {} 객체를 prune 하기 때문에 plan.goals 가 사라질 수 있음. */
+  setInterval(function(){
     if(Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100){
       cleanupAllPlans();
     }
-  }, 30000);
+  }, 60000);
+
+  /* Phase D pull trigger — FB 에서 plan 데이터 갱신될 때마다 cleanup 즉시 재실행.
+     Phase D handler 가 _origSetItem 으로 LS write 한 직후 호출됨. */
+  window.__bug3OrphanTriggerCleanup = function(){
+    if(_everCleanedOnce && Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100){
+      setTimeout(cleanupAllPlans, 100);  /* 100ms 후 — LS write 완료 보장 */
+    }
+  };
 
   /* 디버그 API */
   window.__bug3Orphan = {
