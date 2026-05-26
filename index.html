@@ -19253,10 +19253,47 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   }
 
   /* ── 3. diff 계산 (6 카테고리) ─────────────────────────────────── */
-  function computeDiff(csvMap){
-    var current = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+  /* Bug 1 fix: Firebase /members 를 source of truth 로 사용. window.MEMBERS 는 fallback.
+     applyFinalData silent drop 으로 window.MEMBERS 가 1명 누락된 상태에서 dry-run 하면
+     실제로는 Firebase 에 있는 회원이 "신규 추가"로 잘못 분류됨 (김재남 케이스).
+
+     Firebase 가 ground truth — 매번 fresh fetch. fbDB 미연결 시에만 window.MEMBERS fallback. */
+  function getCurrentMembersFromTruth(){
+    return new Promise(function(resolve){
+      if(window.fbDB && typeof window.fbDB.ref === 'function'){
+        window.fbDB.ref('members').once('value').then(function(snap){
+          var arr = [];
+          if(snap.exists()){
+            var v = snap.val();
+            Object.keys(v).forEach(function(k){
+              var m = v[k];
+              if(m && m.id){
+                arr.push({
+                  id: String(m.id),
+                  region: m.region || '', team: m.team || '', zone: m.zone || '',
+                  name: m.name || '', type: m.type || '일반',
+                  regType: m.regType || '총회등록'
+                });
+              }
+            });
+          }
+          console.log('[task-8] diff source: Firebase /members (' + arr.length + '명)');
+          resolve({ source: 'Firebase', members: arr });
+        }).catch(function(err){
+          console.warn('[task-8] Firebase 읽기 실패 - window.MEMBERS fallback:', err && err.message);
+          resolve({ source: 'window.MEMBERS (Firebase 실패)', members: Array.isArray(window.MEMBERS) ? window.MEMBERS.slice() : [] });
+        });
+      } else {
+        console.log('[task-8] diff source: window.MEMBERS (' + (window.MEMBERS||[]).length + '명, fbDB 미연결)');
+        resolve({ source: 'window.MEMBERS', members: Array.isArray(window.MEMBERS) ? window.MEMBERS.slice() : [] });
+      }
+    });
+  }
+
+  function computeDiff(csvMap, currentMembers){
+    var current = Array.isArray(currentMembers) ? currentMembers : (Array.isArray(window.MEMBERS) ? window.MEMBERS : []);
     var byId = {};
-    current.forEach(function(m){ if(m && m.id) byId[m.id] = m; });
+    current.forEach(function(m){ if(m && m.id) byId[String(m.id)] = m; });
 
     var diff = {
       added: [], removed: [],
@@ -19295,20 +19332,35 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     return diff;
   }
 
-  /* ── 4. 백업 다운로드 ─────────────────────────────────────────── */
+  /* ── 4. 백업 다운로드 (Bug 3 fix: 메타데이터 강화) ───────────────
+     - Firebase /members 원본 (canonical) — restore 시 source of truth
+     - 동시점 window.MEMBERS in-memory 카운트 — mismatch 진단용
+     - schemaVersion 2 (정규화 필드 명시) — restore 시 자동 reformat 가능 */
   function backupMembers(){
     return new Promise(function(resolve, reject){
-      if(!window.fbDB){ reject(new Error('Firebase 미연결 — 백업 불가')); return; }
+      if(!window.fbDB){ reject(new Error('Firebase 미연결 — 백업 불가 (업로드 차단)')); return; }
       window.fbDB.ref('members').once('value').then(function(snap){
         var data = snap.val() || {};
+        var fbCount = Object.keys(data).length;
+        var memCount = Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0;
+        var finalCount = Array.isArray(window.FINAL_MEMBERS) ? window.FINAL_MEMBERS.length : 0;
+        var mismatch = (fbCount !== memCount);
         var fname = 'kmjj-members-before-upload-' + stamp() + '.json';
         var payload = {
           _backup_meta: {
             createdAt: new Date().toISOString(),
             createdBy: (window.currentUser && window.currentUser.email) || '',
-            purpose: 'CSV upload pre-backup (task 8)',
-            memberCount: Object.keys(data).length,
-            schemaVersion: 1
+            purpose: 'CSV upload pre-backup (task 8 / bug 3 fix)',
+            schemaVersion: 2,
+            schemaFields: ['id', 'region', 'team', 'zone', 'name', 'type', 'regType', '_retired'],
+            source: 'Firebase /members (canonical)',
+            counts: {
+              firebase: fbCount,
+              windowMEMBERS: memCount,
+              FINAL_MEMBERS: finalCount,
+              mismatch: mismatch
+            },
+            mismatchNote: mismatch ? '⚠️ Firebase 와 window.MEMBERS 개수 불일치 — Bug 2 (FINAL_MEMBERS silent drop) 의심. Firebase 데이터가 정본.' : ''
           },
           members: data
         };
@@ -19318,7 +19370,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         a.href = url; a.download = fname;
         document.body.appendChild(a); a.click();
         setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
-        resolve({ fname: fname, count: Object.keys(data).length });
+        if(mismatch) console.warn('[task-8] 백업 시점 mismatch — FB=' + fbCount + ', mem=' + memCount + ', FINAL=' + finalCount);
+        resolve({ fname: fname, count: fbCount, mismatch: mismatch, memCount: memCount });
       }).catch(reject);
     });
   }
@@ -19431,6 +19484,11 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       + '<div style="font-size:12px;color:var(--text2,#555);margin-bottom:16px">'
       + '파일: <b>'+esc(file.name)+'</b> · 행 수 '+csvStats.total+' · 유효 회원 '+(Object.keys(diff).reduce(function(s,k){return s + (Array.isArray(diff[k])?diff[k].length:0);},0)+diff.identical)+'명 · ID 중복 '+csvStats.dup+', ID 없음 '+csvStats.noId+', 이름 없음 '+csvStats.noName+''
       + '</div>'
+      /* Bug 1+2 진단: source + mismatch 경고 */
+      + '<div style="font-size:11px;color:var(--text2,#666);margin-bottom:8px;padding:8px;background:'+(diff._truthCount !== diff._memoryCount ? '#fff4e6' : 'var(--surface-2,#f5f5f5)')+';border-radius:4px;'+(diff._truthCount !== diff._memoryCount ? 'border:1px solid #f0a050' : '')+'">'
+      + '비교 source: <b>'+esc(diff._truthSource||'?')+'</b> ('+diff._truthCount+'명) · in-memory: '+diff._memoryCount+'명'
+      + (diff._truthCount !== diff._memoryCount ? ' <span style="color:#b35a14;font-weight:600">⚠️ 불일치 '+(diff._truthCount-diff._memoryCount)+'명 — Bug 2 영향 (bug-2-guard 가 다음 boot 에 자동 복구)</span>' : ' <span style="color:#2a8c4a">✅ 일치</span>')
+      + '</div>'
       + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px">'
       + '<div style="padding:12px;background:#e6f9ed;border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">신규 추가</div><div style="font-size:22px;font-weight:700;color:#2a8c4a">'+diff.added.length+'</div></div>'
       + '<div style="padding:12px;background:#fef0e6;border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">제거 예정</div><div style="font-size:22px;font-weight:700;color:#b35a14">'+diff.removed.length+'</div></div>'
@@ -19522,12 +19580,26 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     if(!rows.length){ alert('파일에 데이터가 없습니다.'); return; }
 
     var extracted = extractCsvMembers(rows);
-    var diff = computeDiff(extracted.map);
-    console.log('[task-8] diff 계산 완료:', {
+    /* Bug 1 fix: Firebase 를 source of truth 로 (window.MEMBERS 가 silent drop 됐을 수 있음) */
+    var truth;
+    try{
+      truth = await getCurrentMembersFromTruth();
+    }catch(err){
+      console.warn('[task-8] truth 소스 fetch 실패 - window.MEMBERS 사용:', err);
+      truth = { source: 'window.MEMBERS (예외)', members: Array.isArray(window.MEMBERS) ? window.MEMBERS.slice() : [] };
+    }
+    var diff = computeDiff(extracted.map, truth.members);
+    diff._truthSource = truth.source;
+    diff._truthCount = truth.members.length;
+    diff._memoryCount = (window.MEMBERS||[]).length;
+    console.log('[task-8] diff 계산 완료 (source=' + truth.source + ', truth=' + truth.members.length + '명, memory=' + (window.MEMBERS||[]).length + '명):', {
       added: diff.added.length, removed: diff.removed.length,
       regionChanged: diff.regionChanged.length, teamZoneChanged: diff.teamZoneChanged.length,
       typeChanged: diff.typeChanged.length, identical: diff.identical
     });
+    if(truth.members.length !== (window.MEMBERS||[]).length){
+      console.warn('[task-8] ⚠️ Firebase(' + truth.members.length + ') 와 window.MEMBERS(' + (window.MEMBERS||[]).length + ') 개수 불일치 — Bug 2 영향 가능 (bug-2-guard 가 처리)');
+    }
 
     showPreviewModal(file, extracted.stats, diff, {
       onCancel: function(){
@@ -19538,7 +19610,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           /* (1) 백업 — 실패 시 업로드 차단 */
           console.log('[task-8] 백업 다운로드 시작...');
           var backupResult = await backupMembers();
-          console.log('[task-8] 백업 완료:', backupResult.fname, '(' + backupResult.count + '명)');
+          console.log('[task-8] 백업 완료:', backupResult.fname, '(Firebase ' + backupResult.count + '명, in-memory ' + backupResult.memCount + '명' + (backupResult.mismatch ? ' ⚠️ mismatch' : '') + ')');
 
           /* (2) 유형 보호 (옵션) */
           if(opts.typeMode === 'keep' && diff.typeChanged.length > 0){
@@ -19603,10 +19675,15 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     computeDiffFromFile: function(file){
       if(!file){ console.warn('file 인자 필요'); return; }
       return parseFile(file).then(function(rows){
-        var extracted = extractCsvMembers(rows);
-        var diff = computeDiff(extracted.map);
-        console.log('[task-8] dry-run diff:', diff);
-        return diff;
+        return getCurrentMembersFromTruth().then(function(truth){
+          var extracted = extractCsvMembers(rows);
+          var diff = computeDiff(extracted.map, truth.members);
+          diff._truthSource = truth.source;
+          diff._truthCount = truth.members.length;
+          diff._memoryCount = (window.MEMBERS||[]).length;
+          console.log('[task-8] dry-run diff (source=' + truth.source + '):', diff);
+          return diff;
+        });
       });
     },
     rehook: setupInterceptor
@@ -19616,3 +19693,198 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- TASK_8_CSV_UPLOAD_GUARD_END -->
+
+<!-- BUG_2_MEMBERS_DROP_GUARD_START -->
+<script id="bug-2-members-drop-guard">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Bug 2 fix: FINAL_MEMBERS silent drop 방지
+
+     문제: applyFinalData() (line 8942) 가 MEMBERS = FINAL_MEMBERS.map(...) 로
+       window.MEMBERS 를 통째 교체. FINAL_MEMBERS 는 5/10 시점 1616명 하드코딩 스냅샷
+       (line 8896 FINAL_TOTALS 의 "2026-05-10":1616). 5/17 이후 추가된 김재남 등은
+       FINAL_MEMBERS 에 없음 → applyFinalData 호출될 때마다 silent drop.
+
+       기존 apply-guard (line 16278) 의 hasRicherData() 는 RECORDS 날짜만 체크 —
+       멤버 추가는 무시. 그래서 promoteFinalRecords 안 불려서 FINAL_MEMBERS 도 promote 안 됨.
+
+     해결: applyFinalData 를 한 번 더 wrap (apply-guard 위에) — orig 호출 BEFORE
+       FINAL_MEMBERS 에 누락된 ID 를 promote. 호출 AFTER drop 검출 시 console.error +
+       showToast 로 사용자 경고. 절대 silent 아님.
+
+     안전: Firebase 데이터 무수정. 읽기 전용 보호. orig 의 동작은 그대로 (다만
+       FINAL_MEMBERS 가 사전에 충분히 풍부해진 상태에서 호출됨).
+     ════════════════════════════════════════════════════════════════ */
+
+  function clean(s){ return String(s==null?'':s).trim(); }
+  function snapshotMemberIds(arr){
+    var s = {};
+    if(!Array.isArray(arr)) return s;
+    arr.forEach(function(m){
+      if(m && m.id != null){
+        var k = clean(m.id); if(k) s[k] = true;
+      }
+    });
+    return s;
+  }
+  function gatherCurrentMembers(){
+    /* 모든 소스에서 가장 풍부한 멤버 set 수집 (id → member obj) */
+    var bag = {};
+    function add(arr, src){
+      if(!Array.isArray(arr)) return;
+      arr.forEach(function(m){
+        if(m && m.id != null){
+          var k = clean(m.id); if(!k) return;
+          if(!bag[k]){ bag[k] = { _src: src, m: m }; }
+        }
+      });
+    }
+    add(window.MEMBERS, 'window.MEMBERS');
+    try{ if(typeof MEMBERS !== 'undefined') add(MEMBERS, 'lexical MEMBERS'); }catch(e){}
+    try{
+      var raw = localStorage.getItem('att_members_v1');
+      if(raw){ var arr = JSON.parse(raw); add(arr, 'LS att_members_v1'); }
+    }catch(e){}
+    return bag;
+  }
+
+  /* FINAL_MEMBERS 에 누락된 ID 들을 push (in-place mutation, const binding 유지).
+     반환: 추가된 멤버 list. */
+  function promoteFinalMembersIfNeeded(){
+    if(!Array.isArray(window.FINAL_MEMBERS)) return [];
+    var finalIds = snapshotMemberIds(window.FINAL_MEMBERS);
+    var currentBag = gatherCurrentMembers();
+    var missing = [];
+    Object.keys(currentBag).forEach(function(id){
+      if(!finalIds[id]) missing.push(currentBag[id]);
+    });
+    if(!missing.length) return [];
+    missing.forEach(function(entry){
+      var m = entry.m;
+      window.FINAL_MEMBERS.push({
+        id: m.id,
+        region: m.region || '',
+        team: m.team || '',
+        zone: m.zone || '',
+        name: m.name || '',
+        type: m.type || '일반',
+        regType: m.regType || '총회등록',
+        _retired: !!m._retired
+      });
+    });
+    var sample = missing.slice(0, 5).map(function(e){ return (e.m.name||'?')+'('+e.m.id+',src='+e._src+')'; }).join(', ');
+    var extra = missing.length > 5 ? ', +' + (missing.length-5) + '명 더' : '';
+    console.log('[bug-2-guard] FINAL_MEMBERS 보강: ' + missing.length + '명 추가 (' + sample + extra + ')');
+    return missing;
+  }
+
+  function wrap(){
+    var orig = window.applyFinalData;
+    if(typeof orig !== 'function') return false;
+    if(orig.__bug2Guarded) return true;
+    var wrapped = function(){
+      /* 1. Pre — FINAL_MEMBERS 에 누락 있으면 promote */
+      try{ promoteFinalMembersIfNeeded(); }catch(e){ console.warn('[bug-2-guard] promote 오류', e); }
+
+      /* 2. Snapshot before orig */
+      var beforeIds = snapshotMemberIds(window.MEMBERS);
+
+      /* 3. orig 호출 (apply-guard → applyFinalData) */
+      var ret = orig.apply(this, arguments);
+
+      /* 4. Post — drop 검출 */
+      try{
+        var afterIds = snapshotMemberIds(window.MEMBERS);
+        var dropped = [];
+        Object.keys(beforeIds).forEach(function(id){
+          if(!afterIds[id]) dropped.push(id);
+        });
+        if(dropped.length){
+          console.error('[bug-2-guard] ⚠️ applyFinalData 후 ' + dropped.length + '명 MEMBERS drop 감지:', dropped.slice(0, 10));
+          /* 사용자 경고 — showToast 있으면 사용, 없으면 alert */
+          try{
+            if(typeof window.showToast === 'function'){
+              window.showToast('⚠️ ' + dropped.length + '명 회원 누락 감지 (콘솔 확인)', 'error');
+            }
+          }catch(e){}
+        }
+      }catch(e){ console.warn('[bug-2-guard] post-check 오류', e); }
+
+      return ret;
+    };
+    wrapped.__bug2Guarded = true;
+    /* 다른 wrapper 의 marker 유지 */
+    wrapped.__loginGated = orig.__loginGated || true;
+    wrapped.__originalApply = orig.__originalApply || orig;
+    wrapped.__guardWrapped = orig.__guardWrapped || false;
+    window.applyFinalData = wrapped;
+    return true;
+  }
+
+  /* 초기 wrap + 다른 IIFE 가 다시 set 할 수 있으니 재시도 폴링 */
+  function attempt(){
+    if(wrap()) return;
+    var t = 0;
+    var iv = setInterval(function(){
+      if(wrap() || ++t > 600) clearInterval(iv);
+    }, 50);
+  }
+  attempt();
+  /* 다른 wrapper 가 나중에 덮어쓸 수 있으므로 주기적 재wrap (5초 간격, 60초간) */
+  var rewrapAttempts = 0;
+  var rewrapIv = setInterval(function(){
+    rewrapAttempts++;
+    if(rewrapAttempts > 12){ clearInterval(rewrapIv); return; }
+    try{
+      if(window.applyFinalData && !window.applyFinalData.__bug2Guarded){
+        console.log('[bug-2-guard] applyFinalData 가 다시 unwrapped 됨 — 재wrap');
+        wrap();
+      }
+    }catch(e){}
+  }, 5000);
+
+  /* 디버그 API */
+  window.__bug2Guard = {
+    promoteNow: promoteFinalMembersIfNeeded,
+    snapshotIds: function(){
+      var c = gatherCurrentMembers();
+      var f = snapshotMemberIds(window.FINAL_MEMBERS);
+      var missing = [];
+      Object.keys(c).forEach(function(id){ if(!f[id]) missing.push({ id: id, name: c[id].m.name, src: c[id]._src }); });
+      var orphan = [];
+      Object.keys(f).forEach(function(id){ if(!c[id]) orphan.push(id); });
+      console.group('[bug-2-guard] 멤버 비교');
+      console.log('현재 (모든 소스 union):', Object.keys(c).length);
+      console.log('FINAL_MEMBERS:', Object.keys(f).length);
+      console.log('FINAL 에서 누락:', missing.length, missing.slice(0, 10));
+      console.log('FINAL 에만 있음 (orphan):', orphan.length, orphan.slice(0, 10));
+      console.groupEnd();
+      return { current: Object.keys(c).length, final: Object.keys(f).length, missingFromFinal: missing, orphanInFinal: orphan };
+    },
+    findMember: function(idOrName){
+      var q = clean(idOrName).toLowerCase();
+      var c = gatherCurrentMembers();
+      var hits = [];
+      Object.keys(c).forEach(function(id){
+        var m = c[id].m;
+        if(id.toLowerCase().indexOf(q) >= 0 || (m.name||'').toLowerCase().indexOf(q) >= 0){
+          hits.push({ id: id, name: m.name, region: m.region, src: c[id]._src });
+        }
+      });
+      var f = window.FINAL_MEMBERS || [];
+      var finalHits = f.filter(function(m){
+        return m && ((String(m.id||'').toLowerCase().indexOf(q) >= 0) || ((m.name||'').toLowerCase().indexOf(q) >= 0));
+      });
+      console.log('[bug-2-guard] 검색 "' + idOrName + '":');
+      console.log('  현재 (union):', hits);
+      console.log('  FINAL_MEMBERS:', finalHits.length, finalHits.slice(0, 5));
+      return { current: hits, final: finalHits };
+    },
+    rewrap: wrap
+  };
+
+  console.log('[bug-2-guard] FINAL_MEMBERS drop 보호 활성. 디버그: window.__bug2Guard.snapshotIds() / findMember("김재남")');
+})();
+</script>
+<!-- BUG_2_MEMBERS_DROP_GUARD_END -->
