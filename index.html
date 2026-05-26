@@ -19157,3 +19157,462 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- PHASE_5B_A_FB_SYNC_PHASE_B_END -->
+
+<!-- TASK_8_CSV_UPLOAD_GUARD_START -->
+<script id="task-8-csv-upload-guard">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     작업 8 — CSV 업로드 사전 검증 + 백업 (4가지 보호장치)
+       A. 사전 백업 자동화 — Firebase members 노드 JSON 다운로드
+       B. 변경사항 dry-run 프리뷰 — 6 카테고리 diff 모달
+       C. 지역 변경 특별 경고 — 빨간 경고 + 체크박스 확인 후만 적용
+       D. 유형(가족/가족외) 변경 보호 — default "현재 유지", 옵션 "CSV 우선"
+
+     동작: ul-file (재적 업로드 input) 의 change 이벤트 가로채기.
+       1. 파일 파싱 (handleUpload 와 동일 로직)
+       2. CSV members 추출 → 현재 MEMBERS 와 6 카테고리 diff
+       3. 모달 표시 — admin only
+       4. confirm 시: 백업 다운로드 → (유형 보호 시 bulkSave wrap) → window.handleUpload 호출
+
+     영향 범위: ul-file (재적 업로드) 만.
+       habit-detail-file / cert-detail-file / target-file (handleTargetUpload) 는 별개.
+       estage-csv-file (handleEstageUpload) 도 별개.
+
+     안전: fbDB 없으면 백업 실패 → 업로드 차단. admin only.
+     ════════════════════════════════════════════════════════════════ */
+
+  function isAdmin(){
+    try{
+      var u = window.currentUser; if(!u) return false;
+      if(u.role === 'admin') return true;
+      return String(u.email||'').toLowerCase() === 'witpire@gmail.com';
+    }catch(e){ return false; }
+  }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function pad(n){ return String(n).padStart(2,'0'); }
+  function stamp(){ var d = new Date(); return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'_'+pad(d.getHours())+pad(d.getMinutes()); }
+
+  /* ── 1. 파일 파싱 (handleUpload 와 동일) ────────────────────────── */
+  function parseFile(file){
+    return new Promise(function(resolve, reject){
+      var reader = new FileReader();
+      reader.onload = function(evt){
+        try{
+          var data = new Uint8Array(evt.target.result);
+          var rows = [];
+          var fileName = file.name.toLowerCase();
+          if(fileName.endsWith('.csv')){
+            var text = new TextDecoder('utf-8').decode(data);
+            var csvLines = text.replace(/^﻿/, '').split('\n').filter(function(l){ return l.trim(); });
+            if(!csvLines.length){ resolve([]); return; }
+            var headers = csvLines[0].split(',').map(function(h){ return h.replace(/^"|"$/g,'').trim(); });
+            for(var i=1; i<csvLines.length; i++){
+              var vals = csvLines[i].match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || [];
+              var row = {};
+              headers.forEach(function(h, j){ row[h] = (vals[j]||'').replace(/^"|"$/g,'').trim(); });
+              rows.push(row);
+            }
+          } else {
+            if(typeof XLSX === 'undefined'){ reject(new Error('XLSX 라이브러리 미로드')); return; }
+            var wb = XLSX.read(data, {type:'array', cellDates:false, cellText:true, raw:false});
+            var ws = wb.Sheets[wb.SheetNames[0]];
+            rows = XLSX.utils.sheet_to_json(ws, {defval:'', raw:false, dateNF:'yyyy-mm-dd'});
+          }
+          resolve(rows);
+        }catch(e){ reject(e); }
+      };
+      reader.onerror = function(){ reject(new Error('파일 읽기 실패')); };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  /* ── 2. CSV rows → members map ─────────────────────────────────── */
+  function extractCsvMembers(rows){
+    var map = {};
+    var dup = 0, noId = 0, noName = 0;
+    rows.forEach(function(row){
+      var id = String(row['고유번호']||'').trim();
+      if(!id){ noId++; return; }
+      var name = String(row['이름']||'').trim();
+      if(!name){ noName++; return; }
+      var region = String(row['지역']||'').trim();
+      var teamZoneRaw = (typeof normalizeTeamZone === 'function')
+        ? normalizeTeamZone(row['팀-구역'] || row['팀구역'] || '')
+        : (row['팀-구역'] || row['팀구역'] || '');
+      var tz = (typeof parseTeamZone === 'function') ? parseTeamZone(teamZoneRaw) : { team:'', zone:'' };
+      var type = String(row['유형']||'').trim();
+      if(map[id]) dup++;
+      map[id] = {
+        id: id, name: name, region: region,
+        team: tz.team || '', zone: tz.zone || '',
+        type: (type && ['가족','가족외','일반'].indexOf(type) >= 0) ? type : ''
+      };
+    });
+    return { map: map, stats: { dup: dup, noId: noId, noName: noName, total: rows.length } };
+  }
+
+  /* ── 3. diff 계산 (6 카테고리) ─────────────────────────────────── */
+  function computeDiff(csvMap){
+    var current = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var byId = {};
+    current.forEach(function(m){ if(m && m.id) byId[m.id] = m; });
+
+    var diff = {
+      added: [], removed: [],
+      regionChanged: [], teamZoneChanged: [], typeChanged: [],
+      identical: 0
+    };
+
+    Object.keys(csvMap).forEach(function(id){
+      var c = csvMap[id];
+      var ex = byId[id];
+      if(!ex){ diff.added.push(c); return; }
+      var changed = false;
+      if(c.region && c.region !== String(ex.region||'').trim()){
+        diff.regionChanged.push({ id: id, name: ex.name, from: ex.region||'(없음)', to: c.region });
+        changed = true;
+      }
+      var curTZ = String(ex.team||'') + '-' + String(ex.zone||'');
+      var csvTZ = String(c.team||'') + '-' + String(c.zone||'');
+      if(csvTZ !== '-' && csvTZ !== curTZ && (c.team || c.zone)){
+        diff.teamZoneChanged.push({ id: id, name: ex.name, from: curTZ, to: csvTZ });
+        changed = true;
+      }
+      if(c.type && c.type !== String(ex.type||'').trim()){
+        diff.typeChanged.push({ id: id, name: ex.name, from: ex.type||'(없음)', to: c.type });
+        changed = true;
+      }
+      if(!changed) diff.identical++;
+    });
+
+    current.forEach(function(m){
+      if(m && m.id && !csvMap[m.id]){
+        diff.removed.push({ id: m.id, name: m.name||'(이름없음)', region: m.region||'' });
+      }
+    });
+
+    return diff;
+  }
+
+  /* ── 4. 백업 다운로드 ─────────────────────────────────────────── */
+  function backupMembers(){
+    return new Promise(function(resolve, reject){
+      if(!window.fbDB){ reject(new Error('Firebase 미연결 — 백업 불가')); return; }
+      window.fbDB.ref('members').once('value').then(function(snap){
+        var data = snap.val() || {};
+        var fname = 'kmjj-members-before-upload-' + stamp() + '.json';
+        var payload = {
+          _backup_meta: {
+            createdAt: new Date().toISOString(),
+            createdBy: (window.currentUser && window.currentUser.email) || '',
+            purpose: 'CSV upload pre-backup (task 8)',
+            memberCount: Object.keys(data).length,
+            schemaVersion: 1
+          },
+          members: data
+        };
+        var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click();
+        setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+        resolve({ fname: fname, count: Object.keys(data).length });
+      }).catch(reject);
+    });
+  }
+
+  /* ── 5. 유형 보호 wrap — bulkSave 1회용 wrap + 자동 해제 안전망 ─── */
+  function applyTypeProtection(typeSnapshot){
+    if(typeof window.bulkSave !== 'function'){ console.warn('[task-8] bulkSave 미정의 — type 보호 skip'); return; }
+    var origBulkSave = window.bulkSave;
+    var consumed = false;
+    window.bulkSave = async function(members, records){
+      consumed = true;
+      try{
+        if(Array.isArray(members)){
+          members.forEach(function(m){
+            if(m && m.id && typeSnapshot[m.id]) m.type = typeSnapshot[m.id];
+          });
+        }
+        if(Array.isArray(window.MEMBERS)){
+          window.MEMBERS.forEach(function(m){
+            if(m && m.id && typeSnapshot[m.id]) m.type = typeSnapshot[m.id];
+          });
+        }
+        var restoredCount = Object.keys(typeSnapshot).length;
+        console.log('[task-8] type 보호 적용 — ' + restoredCount + '명 유형 복원 (bulkSave 직전)');
+      }catch(e){ console.warn('[task-8] type 보호 적용 중 오류:', e); }
+      try{
+        var ret = await origBulkSave.call(this, members, records);
+        return ret;
+      } finally {
+        /* 1회용: 호출 후 원본 복원 */
+        if(window.bulkSave !== origBulkSave){
+          window.bulkSave = origBulkSave;
+          console.log('[task-8] bulkSave wrap 해제');
+        }
+      }
+    };
+    /* 자동 해제 안전망: handleUpload 가 bulkSave 도달 못 하고 throw 한 경우 (60초 timeout) */
+    setTimeout(function(){
+      if(!consumed && window.bulkSave !== origBulkSave){
+        window.bulkSave = origBulkSave;
+        console.warn('[task-8] bulkSave wrap 자동 해제 — handleUpload 가 60초 내 bulkSave 도달 못함 (에러 또는 취소)');
+      }
+    }, 60000);
+  }
+
+  /* ── 6. 모달 UI ────────────────────────────────────────────────── */
+  function renderSampleList(items, formatter, maxShow){
+    maxShow = maxShow || 10;
+    if(!items.length) return '<div style="color:var(--text3);font-size:11px;padding:4px 8px">(없음)</div>';
+    var shown = items.slice(0, maxShow).map(formatter).join('');
+    var extra = items.length > maxShow
+      ? '<div style="color:var(--text3);font-size:11px;padding:4px 8px;font-style:italic">... +' + (items.length - maxShow) + '명 더</div>'
+      : '';
+    return shown + extra;
+  }
+
+  function showPreviewModal(file, csvStats, diff, callbacks){
+    /* 기존 모달 제거 */
+    var existing = document.getElementById('task8-preview-modal');
+    if(existing) existing.parentNode.removeChild(existing);
+
+    var hasRegion = diff.regionChanged.length > 0;
+    var hasType = diff.typeChanged.length > 0;
+
+    var addedSamples = renderSampleList(diff.added, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px">'+esc(m.name)+' <span style="color:var(--text3)">('+esc(m.region||'')+' '+esc(m.team||'')+' '+esc(m.zone||'')+' · '+esc(m.id)+')</span></div>';
+    });
+    var removedSamples = renderSampleList(diff.removed, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px">'+esc(m.name)+' <span style="color:var(--text3)">('+esc(m.region||'')+' · '+esc(m.id)+')</span></div>';
+    });
+    var regionSamples = renderSampleList(diff.regionChanged, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px"><b>'+esc(m.name)+'</b>: <span style="color:#c00">'+esc(m.from)+' → '+esc(m.to)+'</span></div>';
+    });
+    var teamZoneSamples = renderSampleList(diff.teamZoneChanged, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px">'+esc(m.name)+': '+esc(m.from)+' → '+esc(m.to)+'</div>';
+    });
+    var typeSamples = renderSampleList(diff.typeChanged, function(m){
+      return '<div style="padding:3px 8px;font-size:11.5px">'+esc(m.name)+': '+esc(m.from)+' → '+esc(m.to)+'</div>';
+    });
+
+    var regionWarning = hasRegion
+      ? '<div style="margin:12px 0;padding:12px;background:#fee;border:2px solid #c00;border-radius:8px">'
+      + '<div style="font-weight:700;color:#c00;font-size:14px;margin-bottom:6px">⚠️ 지역 변경 '+diff.regionChanged.length+'명 — 진짜 적용하시겠습니까?</div>'
+      + '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px">'
+      + '<input type="checkbox" id="task8-region-confirm" style="width:16px;height:16px">'
+      + '<span>확인했습니다. 지역 변경을 진행합니다.</span>'
+      + '</label>'
+      + '</div>'
+      : '';
+
+    var typeRadios = hasType
+      ? '<div style="margin:12px 0;padding:10px;background:var(--surface-2,#f8f8f8);border-radius:6px">'
+      + '<div style="font-weight:600;margin-bottom:6px;font-size:12.5px">유형 변경 ' + diff.typeChanged.length + '명 — 처리 방식:</div>'
+      + '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;padding:3px 0">'
+      + '<input type="radio" name="task8-type-mode" value="keep" checked> 현재 유형 유지 (어제 작업 4 결과 보호) — 추천'
+      + '</label>'
+      + '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;padding:3px 0">'
+      + '<input type="radio" name="task8-type-mode" value="csv"> CSV 의 유형 우선'
+      + '</label>'
+      + '</div>'
+      : '';
+
+    var html =
+      '<div id="task8-preview-modal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px">'
+      + '<div style="background:var(--surface,#fff);color:var(--text,#222);border-radius:12px;max-width:760px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 12px 48px rgba(0,0,0,0.3);padding:24px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border-md,#ddd)">'
+      + '<h2 style="margin:0;font-size:18px;font-weight:700">📋 CSV 업로드 사전 검증</h2>'
+      + '<button id="task8-close-x" style="border:none;background:transparent;font-size:24px;cursor:pointer;color:var(--text3,#666)">×</button>'
+      + '</div>'
+      + '<div style="font-size:12px;color:var(--text2,#555);margin-bottom:16px">'
+      + '파일: <b>'+esc(file.name)+'</b> · 행 수 '+csvStats.total+' · 유효 회원 '+(Object.keys(diff).reduce(function(s,k){return s + (Array.isArray(diff[k])?diff[k].length:0);},0)+diff.identical)+'명 · ID 중복 '+csvStats.dup+', ID 없음 '+csvStats.noId+', 이름 없음 '+csvStats.noName+''
+      + '</div>'
+      + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px">'
+      + '<div style="padding:12px;background:#e6f9ed;border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">신규 추가</div><div style="font-size:22px;font-weight:700;color:#2a8c4a">'+diff.added.length+'</div></div>'
+      + '<div style="padding:12px;background:#fef0e6;border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">제거 예정</div><div style="font-size:22px;font-weight:700;color:#b35a14">'+diff.removed.length+'</div></div>'
+      + '<div style="padding:12px;background:'+(hasRegion?'#fee':'var(--surface-2,#f8f8f8)')+';border-radius:6px;text-align:center;'+(hasRegion?'border:2px solid #c00':'')+'"><div style="font-size:11px;color:var(--text2)">지역 변경</div><div style="font-size:22px;font-weight:700;color:'+(hasRegion?'#c00':'var(--text)')+'">'+diff.regionChanged.length+'</div></div>'
+      + '<div style="padding:12px;background:var(--surface-2,#f8f8f8);border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">팀/구역 변경</div><div style="font-size:22px;font-weight:700">'+diff.teamZoneChanged.length+'</div></div>'
+      + '<div style="padding:12px;background:'+(hasType?'#fff4e6':'var(--surface-2,#f8f8f8)')+';border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">유형 변경</div><div style="font-size:22px;font-weight:700;color:'+(hasType?'#b35a14':'var(--text)')+'">'+diff.typeChanged.length+'</div></div>'
+      + '<div style="padding:12px;background:var(--surface-2,#f8f8f8);border-radius:6px;text-align:center"><div style="font-size:11px;color:var(--text2)">변경 없음</div><div style="font-size:22px;font-weight:700;color:var(--text2)">'+diff.identical+'</div></div>'
+      + '</div>'
+      + regionWarning
+      + typeRadios
+      + '<details style="margin:8px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:var(--surface-2,#f8f8f8);border-radius:4px">신규 추가 ('+diff.added.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid var(--border-md,#eee);border-radius:4px;margin-top:4px">'+addedSamples+'</div></details>'
+      + '<details style="margin:8px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:var(--surface-2,#f8f8f8);border-radius:4px">제거 예정 ('+diff.removed.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid var(--border-md,#eee);border-radius:4px;margin-top:4px">'+removedSamples+'</div></details>'
+      + (hasRegion ? '<details style="margin:8px 0" open><summary style="cursor:pointer;font-weight:600;padding:6px;background:#fee;border-radius:4px;color:#c00">지역 변경 ('+diff.regionChanged.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid #fcc;border-radius:4px;margin-top:4px">'+regionSamples+'</div></details>' : '')
+      + (diff.teamZoneChanged.length ? '<details style="margin:8px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:var(--surface-2,#f8f8f8);border-radius:4px">팀/구역 변경 ('+diff.teamZoneChanged.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid var(--border-md,#eee);border-radius:4px;margin-top:4px">'+teamZoneSamples+'</div></details>' : '')
+      + (hasType ? '<details style="margin:8px 0"><summary style="cursor:pointer;font-weight:600;padding:6px;background:#fff4e6;border-radius:4px;color:#b35a14">유형 변경 ('+diff.typeChanged.length+'명)</summary><div style="max-height:200px;overflow-y:auto;border:1px solid #fde0bc;border-radius:4px;margin-top:4px">'+typeSamples+'</div></details>' : '')
+      + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border-md,#ddd)">'
+      + '<button id="task8-cancel" style="padding:10px 20px;border:1px solid var(--border-md,#ccc);background:var(--surface,#fff);color:var(--text,#222);border-radius:6px;cursor:pointer;font-weight:600">취소</button>'
+      + '<button id="task8-apply" style="padding:10px 24px;border:none;background:'+(hasRegion?'#999':'#1550a0')+';color:#fff;border-radius:6px;cursor:'+(hasRegion?'not-allowed':'pointer')+';font-weight:600" '+(hasRegion?'disabled':'')+'>💾 백업 + 적용</button>'
+      + '</div>'
+      + '</div></div>';
+
+    var div = document.createElement('div');
+    div.innerHTML = html;
+    document.body.appendChild(div.firstChild);
+
+    /* 핸들러 부착 */
+    var modal = document.getElementById('task8-preview-modal');
+    var closeBtn = document.getElementById('task8-close-x');
+    var cancelBtn = document.getElementById('task8-cancel');
+    var applyBtn = document.getElementById('task8-apply');
+    var regionChk = document.getElementById('task8-region-confirm');
+
+    function close(){ if(modal && modal.parentNode) modal.parentNode.removeChild(modal); }
+    function onCancel(){ close(); if(callbacks && callbacks.onCancel) callbacks.onCancel(); }
+    function onApply(){
+      if(hasRegion && regionChk && !regionChk.checked){
+        alert('지역 변경 확인 체크박스를 먼저 체크해주세요.');
+        return;
+      }
+      var typeMode = 'keep';
+      var rs = document.querySelectorAll('input[name="task8-type-mode"]');
+      for(var i=0;i<rs.length;i++){ if(rs[i].checked){ typeMode = rs[i].value; break; } }
+      close();
+      if(callbacks && callbacks.onApply) callbacks.onApply({ typeMode: typeMode });
+    }
+
+    closeBtn.addEventListener('click', onCancel);
+    cancelBtn.addEventListener('click', onCancel);
+    applyBtn.addEventListener('click', onApply);
+
+    if(hasRegion && regionChk){
+      regionChk.addEventListener('change', function(){
+        if(regionChk.checked){
+          applyBtn.disabled = false;
+          applyBtn.style.background = '#1550a0';
+          applyBtn.style.cursor = 'pointer';
+        } else {
+          applyBtn.disabled = true;
+          applyBtn.style.background = '#999';
+          applyBtn.style.cursor = 'not-allowed';
+        }
+      });
+    }
+  }
+
+  /* ── 7. 메인 인터셉터 ──────────────────────────────────────────── */
+  var _savedHandleUpload = null;  /* 원본 handleUpload 캐시 — 모든 wrapper 포함된 최종 버전 */
+
+  async function interceptHandler(e){
+    var file = e.target.files && e.target.files[0];
+    if(!file){ return; }
+    e.target.value = '';   /* file input clear — 같은 파일 재선택 가능하게 */
+
+    if(!isAdmin()){
+      alert('재적 업로드는 관리자만 가능합니다.');
+      return;
+    }
+
+    console.log('[task-8] 사전 검증 시작 —', file.name);
+
+    var rows;
+    try{
+      rows = await parseFile(file);
+    }catch(err){
+      alert('파일 파싱 실패: ' + err.message);
+      console.error('[task-8] parse error', err);
+      return;
+    }
+    if(!rows.length){ alert('파일에 데이터가 없습니다.'); return; }
+
+    var extracted = extractCsvMembers(rows);
+    var diff = computeDiff(extracted.map);
+    console.log('[task-8] diff 계산 완료:', {
+      added: diff.added.length, removed: diff.removed.length,
+      regionChanged: diff.regionChanged.length, teamZoneChanged: diff.teamZoneChanged.length,
+      typeChanged: diff.typeChanged.length, identical: diff.identical
+    });
+
+    showPreviewModal(file, extracted.stats, diff, {
+      onCancel: function(){
+        console.log('[task-8] 사용자 취소 — 업로드 중단');
+      },
+      onApply: async function(opts){
+        try{
+          /* (1) 백업 — 실패 시 업로드 차단 */
+          console.log('[task-8] 백업 다운로드 시작...');
+          var backupResult = await backupMembers();
+          console.log('[task-8] 백업 완료:', backupResult.fname, '(' + backupResult.count + '명)');
+
+          /* (2) 유형 보호 (옵션) */
+          if(opts.typeMode === 'keep' && diff.typeChanged.length > 0){
+            var typeSnapshot = {};
+            (window.MEMBERS||[]).forEach(function(m){
+              if(m && m.id && m.type) typeSnapshot[m.id] = m.type;
+            });
+            applyTypeProtection(typeSnapshot);
+            console.log('[task-8] 유형 보호 활성 — ' + Object.keys(typeSnapshot).length + '명 type snapshot');
+          }
+
+          /* (3) 원본 handleUpload 호출 — 모든 wrapper 정상 실행 */
+          if(typeof window.handleUpload !== 'function'){
+            alert('handleUpload 함수 미정의 — 업로드 불가');
+            return;
+          }
+          var syntheticEvent = {
+            target: { files: [file], value: '' }
+          };
+          console.log('[task-8] window.handleUpload 호출...');
+          window.handleUpload(syntheticEvent);
+        }catch(err){
+          alert('업로드 처리 실패: ' + err.message + '\n\n백업이 실패한 경우 파일이 다운로드되지 않았으므로 업로드를 중단했습니다.');
+          console.error('[task-8] apply error', err);
+        }
+      }
+    });
+  }
+
+  /* ── 8. boot — ul-file change 이벤트 가로채기 ──────────────────── */
+  function setupInterceptor(){
+    var ulFile = document.getElementById('ul-file');
+    if(!ulFile){ setTimeout(setupInterceptor, 1000); return; }
+    if(ulFile.__task8Hooked){ return; }
+    /* inline onchange 제거 + 우리 핸들러 부착 */
+    ulFile.removeAttribute('onchange');
+    ulFile.addEventListener('change', interceptHandler);
+    ulFile.__task8Hooked = true;
+    console.log('[task-8] CSV 업로드 보호장치 활성 — ul-file change 가로채기 완료');
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(setupInterceptor, 500); });
+  } else {
+    setTimeout(setupInterceptor, 500);
+  }
+
+  /* ── 9. 디버그 도구 ────────────────────────────────────────────── */
+  window.__task8 = {
+    /* 모달 강제 표시 (디버깅) — 더미 파일로 dry-run 시뮬레이션 */
+    dryRunFile: function(file){
+      if(!file){ console.warn('file 인자 필요'); return; }
+      var fakeEvent = { target: { files: [file], value: '' } };
+      interceptHandler(fakeEvent);
+    },
+    backupNow: function(){
+      console.log('[task-8] 수동 백업 시작...');
+      return backupMembers().then(function(r){
+        console.log('[task-8] 수동 백업 완료:', r.fname);
+        return r;
+      });
+    },
+    computeDiffFromFile: function(file){
+      if(!file){ console.warn('file 인자 필요'); return; }
+      return parseFile(file).then(function(rows){
+        var extracted = extractCsvMembers(rows);
+        var diff = computeDiff(extracted.map);
+        console.log('[task-8] dry-run diff:', diff);
+        return diff;
+      });
+    },
+    rehook: setupInterceptor
+  };
+
+  console.log('[task-8] CSV 업로드 보호장치 IIFE 로드 완료. 디버그: window.__task8');
+})();
+</script>
+<!-- TASK_8_CSV_UPLOAD_GUARD_END -->
