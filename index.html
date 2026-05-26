@@ -18799,6 +18799,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     return;
   }
 
+  /* Phase D 보강 (Bug 3b): 자신의 LS→FB write 시점 기록 → onValue 핸들러에서
+     "최근 X초 내 own write" 인 경우 echo 로 간주하고 skip (stableJson 비교 실패 시 안전망). */
+  var _phaseD_lastOwnWriteAt = {};
+
   function syncKeyToFB(lsKey, valueStr, source){
     if(!isAdmin()) return;
     if(!hasFB()) return;
@@ -18806,6 +18810,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var obj; try{ obj = JSON.parse(valueStr); }catch(e){ console.warn('[5bA-phaseB] JSON parse fail:', lsKey); return; }
     if(!obj || typeof obj !== 'object') obj = {};
     var payload = withMeta(obj, source || 'intercept');
+    /* Bug 3b: own write 시점 marker — Phase D handler 가 echo 판정 시 사용 */
+    _phaseD_lastOwnWriteAt[cfg.fbPath] = Date.now();
     window.fbDB.ref(cfg.fbPath).set(payload).catch(function(err){
       console.warn('[5bA-phaseB] FB write failed:', cfg.fbPath, err && err.message);
     });
@@ -19015,15 +19021,33 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
             return;
           }
 
+          /* (1.5) Bug 3b: time-based echo — 최근 5초 내 own write 였으면 skip
+             stableJson 비교가 Firebase 의 null pruning / type coercion 으로 인해
+             miss 할 수 있어 안전망으로 추가. ping-pong 방지의 1차 방어선. */
+          var lastOwn = _phaseD_lastOwnWriteAt[cfg.fbPath] || 0;
+          var age = Date.now() - lastOwn;
+          if(lastOwn > 0 && age < 5000){
+            /* 로그 throttle: 30초에 1번만 */
+            if(!handler.__lastTimeEchoLogAt || Date.now() - handler.__lastTimeEchoLogAt > 30000){
+              console.log('[5bA-phaseD] echo skipped (own write age=' + age + 'ms < 5000):', cfg.fbPath);
+              handler.__lastTimeEchoLogAt = Date.now();
+            }
+            return;
+          }
+
           var fbDict = stripMeta(snap.val());
           var lsRaw = localStorage.getItem(lsKey);
           var lsObj = (function(){ try{ return lsRaw ? JSON.parse(lsRaw) : {}; }catch(e){ return {}; } })();
 
-          /* (2) Echo 감지 — stable JSON 비교. 자신의 write 가 돌아온 경우 skip. */
+          /* (2) Echo 감지 — stable JSON 비교 (2차 방어선). */
           var fbJson = stableJson(fbDict);
           var lsJson = stableJson(lsObj);
           if(fbJson === lsJson){
-            console.log('[5bA-phaseD] echo skipped (LS===FB):', cfg.fbPath);
+            /* 로그 throttle */
+            if(!handler.__lastJsonEchoLogAt || Date.now() - handler.__lastJsonEchoLogAt > 30000){
+              console.log('[5bA-phaseD] echo skipped (LS===FB):', cfg.fbPath);
+              handler.__lastJsonEchoLogAt = Date.now();
+            }
             return;
           }
 
@@ -21165,12 +21189,21 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }catch(e){ return Promise.reject(e); }
   }
 
-  /* ── 9. plan 갱신 적용 ──────────────────────────────────────────── */
+  /* ── 9. plan 갱신 적용 (Bug 3c: orphan 검증 추가) ───────────────── */
   function applyNewCycle(cycleId, diff){
     var plan = diff.currentPlan;
     if(!plan) return false;
-    var newSnapshotIds = diff.kept.concat(diff.added).map(function(m){ return String(m.id); });
-    /* 기존 goals 중 새 명단에 포함된 id 만 유지 */
+
+    /* MEMBERS id set — orphan 검증용 */
+    var memSet = {};
+    (window.MEMBERS||[]).forEach(function(m){ if(m && m.id) memSet[clean(m.id)] = true; });
+
+    /* snapshotMembers — 새 정책 결과 + orphan 제거 (안전망, 이미 MEMBERS 기반이지만 한번 더) */
+    var newSnapshotIds = diff.kept.concat(diff.added)
+      .map(function(m){ return String(m.id); })
+      .filter(function(id){ return memSet[clean(id)]; });
+
+    /* 기존 goals 중 새 명단에 포함된 id 만 유지 (+ orphan goals 도 archive) */
     var keptIdSet = {}; newSnapshotIds.forEach(function(id){ keptIdSet[id] = true; });
     var newGoals = {};
     var archived = {};
@@ -21188,7 +21221,18 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     plan.snapshotAt = nowIso();
     plan.goals = newGoals;
     plan.archivedGoals = prevArchived;
-    /* addedMembers 는 유지 — 사용자가 수동으로 추가한 멤버는 새 정책과 별개 */
+    /* Bug 3c: addedMembers 도 orphan 제거 — 사용자가 추가한 멤버라도 MEMBERS 에서 사라졌으면 archive */
+    var origAdded = Array.isArray(plan.addedMembers) ? plan.addedMembers.slice() : [];
+    var validAdded = origAdded.filter(function(am){
+      return am && am.personId && memSet[clean(am.personId)];
+    });
+    var orphanAdded = origAdded.filter(function(am){
+      return !am || !am.personId || !memSet[clean(am.personId)];
+    });
+    plan.addedMembers = validAdded;
+    if(orphanAdded.length){
+      console.log('[task-3] addedMembers orphan ' + orphanAdded.length + '명 제거:', orphanAdded.slice(0, 5));
+    }
     /* 정책 변경 메타데이터 */
     plan._task3 = {
       regeneratedAt: nowIso(),
@@ -21196,7 +21240,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       policy: 'new-EXCLUDED_RSN-v1',
       counts: {
         kept: diff.kept.length, added: diff.added.length, removed: diff.removed.length,
-        total: newSnapshotIds.length
+        total: newSnapshotIds.length,
+        orphanRemoved: orphanAdded.length
       }
     };
 
@@ -21418,3 +21463,193 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- TASK_3_CYCLE_REGEN_END -->
+
+<!-- BUG_3_ORPHAN_CLEANUP_START -->
+<script id="bug-3-orphan-cleanup">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Bug 3a: refreshUI orphan TypeError + 보고 페이지 명단 정체 fix
+
+     문제:
+       - applyPlanSnapshotToBody (line 15869) 의 `plan.goals[m.id]` 에서
+         plan.goals 가 undefined 면 TypeError 'Cannot read properties of
+         undefined (reading "<id>")' throw → refreshUI 무한 발생
+       - 결과: 사이클 명단 UI 갱신 실패 → V112 의 OLD 정책 명단 (매주
+         사유출석/온라인예배 포함) 이 화면에 남음
+
+     원인:
+       1) STAGE2 getPlan migration 이 plan.goals 미초기화 (line 15091+)
+       2) addedMembers 에 orphan personId 존재 — 사용자가 추가했다가
+          MEMBERS 에서 제거된 멤버, 또는 데이터 손상
+       3) goals[id] 에 orphan id 잔존 (작업 4 type 복원 후 일부 id 변동)
+
+     해결 (데이터 레벨 cleanup):
+       - 모든 plan 에 대해:
+         * plan.goals = {} 보장 (undefined 면 초기화)
+         * plan.archivedGoals = {} 보장
+         * snapshotMembers 에서 orphan 제거
+         * addedMembers 에서 orphan personId 제거
+         * goals 에서 orphan id 는 archivedGoals 로 이동
+       - LS 저장 → 5b-A Phase B intercept 가 FB 로 dual-write
+       - renderHabit 재호출 → applyPlanSnapshotToBody 정상 작동
+     ════════════════════════════════════════════════════════════════ */
+
+  function clean(s){ return String(s==null?'':s).trim(); }
+
+  function memberIdSet(){
+    var s = {};
+    (window.MEMBERS||[]).forEach(function(m){ if(m && m.id) s[clean(m.id)] = true; });
+    return s;
+  }
+
+  var _firstCleanupLogged = false;
+
+  function cleanupAllPlans(){
+    if(!Array.isArray(window.MEMBERS) || window.MEMBERS.length < 100){
+      return { error: 'MEMBERS 미로드 (' + (window.MEMBERS||[]).length + '명)' };
+    }
+    try{
+      var raw = localStorage.getItem('att_habitual_plans_v1');
+      if(!raw) return { totalCleaned: 0, plans: 0 };
+      var all = JSON.parse(raw);
+      if(!all || typeof all !== 'object') return { totalCleaned: 0, plans: 0 };
+
+      var memSet = memberIdSet();
+      var totalCleaned = 0;
+      var byPlan = {};
+      var planKeys = Object.keys(all);
+
+      planKeys.forEach(function(cycleId){
+        var p = all[cycleId];
+        if(!p) return;
+        var changed = false;
+        var planStats = { snapshotOrphans: 0, addedOrphans: 0, goalOrphans: 0, defensiveInit: 0 };
+
+        /* 1. plan.goals = {} 보장 */
+        if(!p.goals || typeof p.goals !== 'object'){
+          p.goals = {};
+          changed = true;
+          planStats.defensiveInit++;
+        }
+        if(!p.archivedGoals || typeof p.archivedGoals !== 'object'){
+          p.archivedGoals = {};
+          changed = true;
+          planStats.defensiveInit++;
+        }
+
+        /* 2. snapshotMembers orphan 제거 */
+        if(Array.isArray(p.snapshotMembers)){
+          var beforeS = p.snapshotMembers.length;
+          var newSnapshot = [];
+          p.snapshotMembers.forEach(function(id){
+            if(id && memSet[clean(id)]) newSnapshot.push(id);
+            else planStats.snapshotOrphans++;
+          });
+          if(planStats.snapshotOrphans > 0){
+            p.snapshotMembers = newSnapshot;
+            changed = true;
+          }
+        }
+
+        /* 3. addedMembers orphan 제거 */
+        if(Array.isArray(p.addedMembers)){
+          var newAdded = [];
+          p.addedMembers.forEach(function(am){
+            if(am && am.personId && memSet[clean(am.personId)]) newAdded.push(am);
+            else planStats.addedOrphans++;
+          });
+          if(planStats.addedOrphans > 0){
+            p.addedMembers = newAdded;
+            changed = true;
+          }
+        }
+
+        /* 4. goals 에서 orphan id 는 archivedGoals 로 이동 */
+        Object.keys(p.goals).forEach(function(id){
+          if(!memSet[clean(id)]){
+            if(!p.archivedGoals[id]) p.archivedGoals[id] = p.goals[id];
+            delete p.goals[id];
+            changed = true;
+            planStats.goalOrphans++;
+          }
+        });
+
+        var sumThisPlan = planStats.snapshotOrphans + planStats.addedOrphans + planStats.goalOrphans + planStats.defensiveInit;
+        if(changed){
+          totalCleaned += sumThisPlan;
+          byPlan[cycleId] = planStats;
+          if(!_firstCleanupLogged){
+            console.log('[bug-3-orphan] cycle "' + cycleId + '" cleanup:', planStats);
+          }
+        }
+      });
+
+      if(totalCleaned > 0){
+        /* LS 저장 → Phase B intercept 가 FB 자동 dual-write */
+        localStorage.setItem('att_habitual_plans_v1', JSON.stringify(all));
+        if(!_firstCleanupLogged){
+          console.log('[bug-3-orphan] ✅ 총 ' + totalCleaned + ' orphan 정리 완료, LS 저장 (FB dual-write 자동).');
+          _firstCleanupLogged = true;
+        }
+        /* renderHabit 재호출 — refreshUI 정상 작동 확인 */
+        try{ if(typeof window.renderHabit === 'function') window.renderHabit(); }catch(e){}
+      } else if(!_firstCleanupLogged){
+        console.log('[bug-3-orphan] cleanup 완료 — orphan 없음 (' + planKeys.length + '개 plan)');
+        _firstCleanupLogged = true;
+      }
+
+      return { totalCleaned: totalCleaned, plans: planKeys.length, byPlan: byPlan };
+    }catch(e){
+      console.warn('[bug-3-orphan] cleanup error', e);
+      return { error: String(e) };
+    }
+  }
+
+  /* Boot: MEMBERS 가 준비될 때까지 폴링 */
+  function waitForMembersThen(retries, cb){
+    if(Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100){ cb(); return; }
+    if(retries <= 0){ console.warn('[bug-3-orphan] MEMBERS 대기 timeout'); return; }
+    setTimeout(function(){ waitForMembersThen(retries-1, cb); }, 500);
+  }
+  waitForMembersThen(60, cleanupAllPlans);
+
+  /* 주기적 재검사 — 처음 5분 간 30초마다 (task-3 적용 직후 등 새 orphan 유입 케이스 대비) */
+  var periodicN = 0;
+  var periodicIv = setInterval(function(){
+    periodicN++;
+    if(periodicN > 10){ clearInterval(periodicIv); return; }
+    if(Array.isArray(window.MEMBERS) && window.MEMBERS.length >= 100){
+      cleanupAllPlans();
+    }
+  }, 30000);
+
+  /* 디버그 API */
+  window.__bug3Orphan = {
+    cleanupNow: cleanupAllPlans,
+    findOrphans: function(){
+      try{
+        var raw = localStorage.getItem('att_habitual_plans_v1');
+        if(!raw){ console.log('[bug-3-orphan] plans 없음'); return null; }
+        var all = JSON.parse(raw);
+        var memSet = memberIdSet();
+        var results = {};
+        Object.keys(all).forEach(function(cycleId){
+          var p = all[cycleId]; if(!p) return;
+          var orphans = { snapshot: [], added: [], goals: [] };
+          (p.snapshotMembers||[]).forEach(function(id){ if(!memSet[clean(id)]) orphans.snapshot.push(id); });
+          (p.addedMembers||[]).forEach(function(am){ if(am && am.personId && !memSet[clean(am.personId)]) orphans.added.push(am.personId); });
+          Object.keys(p.goals||{}).forEach(function(id){ if(!memSet[clean(id)]) orphans.goals.push(id); });
+          var total = orphans.snapshot.length + orphans.added.length + orphans.goals.length;
+          if(total > 0) results[cycleId] = orphans;
+        });
+        console.log('[bug-3-orphan] 현재 orphan 상태:', results);
+        return results;
+      }catch(e){ console.warn(e); return null; }
+    }
+  };
+
+  console.log('[bug-3-orphan] orphan cleanup 활성. 디버그: window.__bug3Orphan.cleanupNow() / findOrphans()');
+})();
+</script>
+<!-- BUG_3_ORPHAN_CLEANUP_END -->
