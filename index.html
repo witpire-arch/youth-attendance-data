@@ -5,8 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>출결 관리 시스템 v115</title>
 <!-- v40: daily family worship statuses visible (online/substitute/no-cert/error/absence reason) -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<!-- 성능 quick win: 폰트 preload + Firebase preconnect — 1차 페이지 로드 시간 단축
+     Google Fonts 231ms / Firebase 980ms 가 측정됐음. preconnect 로 TCP+TLS 핸드셰이크 미리 시작. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://www.gstatic.com">
+<link rel="preconnect" href="https://kmjj-attendance-default-rtdb.firebaseio.com">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="preconnect" href="https://cdnjs.cloudflare.com">
+
+<!-- 폰트 preload — 렌더 차단 안 함, 백그라운드 fetch -->
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap">
+
+<!-- async 로 Chart.js / XLSX 로드 — 메인 스레드 차단 안 함 (DOM 준비 후 사용) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
@@ -114,8 +128,13 @@
 </script>
 <!-- LOGIN_GATE_DEFER_HEAVY_LOAD_END -->
 
+<!-- 폰트 stylesheet — async load (rel=preload + onload swap). render-blocking 제거. -->
+<link rel="preload" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap"></noscript>
+
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap');
+/* @import 제거됨 — 위 <link rel=preload onload="rel=stylesheet"> 가 비차단으로 처리.
+   @import 가 CSS 파싱 차단 (font 다운로드 완료까지 모든 다음 rule 대기) 했던 문제 해결. */
 :root{
   --bg:#f5f4f0;--surface:#fff;--surface2:#efede7;--border:rgba(0,0,0,.08);--border-md:rgba(0,0,0,.14);
   --text:#1c1b18;--text2:#6a6a62;--text3:#a2a099;
