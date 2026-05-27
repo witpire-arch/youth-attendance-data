@@ -2936,7 +2936,7 @@ function renderStatSum() {
     <div class="mc"><div class="lbl">전체 출석률</div><div class="val" style="color:${rcColor(attPct)}">${fmtPct(attPct)}%</div><div class="sub">${attN}/${tot}회 ${_sdv?_sdSpan(_sdv.rateDelta):''}</div></div>
     <div class="mc"><div class="lbl">QR인증</div><div class="val" style="color:var(--green)">${qrN}<span style="font-size:13px;font-weight:400;color:var(--text3)">회</span></div><div class="sub">${fmtPct(pct1(qrN,tot))}% ${_sdv&&_sdv.qrRateDelta!==undefined?_sdSpan(_sdv.qrRateDelta):(_sdv&&_sdv.qrDelta!==undefined?_sdSpan(_sdv.qrDelta):'')}</div></div>
     <div class="mc"><div class="lbl">사유출석</div><div class="val" style="color:var(--blue)">${saN}<span style="font-size:13px;font-weight:400;color:var(--text3)">회</span></div><div class="sub">${fmtPct(pct1(saN,tot))}% ${_sdv&&_sdv.saRateDelta!==undefined?_sdSpan(_sdv.saRateDelta):(_sdv&&_sdv.saDelta!==undefined?_sdSpan(_sdv.saDelta):'')}</div></div>
-    <div class="mc"><div class="lbl">사유결석 / 주의</div><div class="val"><span style="color:var(--red)">${abN}</span> <span style="font-size:13px;color:var(--text3)">/</span> <span style="color:var(--amber)">${warn}명</span></div></div>
+    <div class="mc"><div class="lbl">사유결석</div><div class="val" style="color:var(--red)">${abN}<span style="font-size:13px;font-weight:400;color:var(--text3)">회</span></div><div class="sub">${fmtPct(pct1(abN,tot))}%</div></div>
   `;
 
   const regions=getRegions();
@@ -9233,6 +9233,10 @@ body.v97-data-loading #login-screen{z-index:9999;}
   };
 
   function patchWarningCards(){
+    /* 사용자 요청: '주의' 표시 완전 제거. 이 함수가 사유결석 카드의 라벨/값을 다시 '/주의'
+       로 복원하던 패치였음. 이제 no-op. */
+    return;
+    /* eslint-disable no-unreachable */
     var c=finalCounts();
     ['st-metrics','ov-metrics'].forEach(function(id){
       var root=document.getElementById(id); if(!root) return;
@@ -9422,6 +9426,9 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     }catch(e){ console.error('overview reason chart error', e); }
   }
   function patchWarningCard(total){
+    /* 사용자 요청: '주의' 표시 완전 제거. no-op. */
+    return;
+    /* eslint-disable no-unreachable */
     var root=document.getElementById('ov-metrics'); if(!root) return;
     Array.prototype.forEach.call(root.querySelectorAll('.mc'),function(card){
       var lbl=card.querySelector('.lbl'); if(!lbl || !/사유출석\s*\/\s*사유결석|사유결석\s*\/\s*주의/.test(lbl.textContent||'')) return;
@@ -10999,7 +11006,9 @@ window.wkRate=function(ids,wk){
 };
 window.statWkRate=window.wkRate;
 
-/* ══ 3. 전주대비 증감률 헬퍼 ══ */
+/* ══ 3. 전주대비 증감률 헬퍼 ══
+   Partial data guard: prev/cur 의 record count 가 멤버 70% 미만이면 null 반환.
+   사용자 보고: 성북 -22.6% (5/17 partial → 100% 오인식) 대응. */
 function getDeltaInfo(){
   var recs=getRecs();
   var dates=Array.from(new Set(recs.filter(function(r){return r.date;}).map(function(r){return String(r.date).slice(0,10);})))
@@ -11008,12 +11017,25 @@ function getDeltaInfo(){
   var cur=dates[0],prev=dates[1];
   var members=getMembers();
   var ids=new Set(members.map(function(m){return m.id;}));
+  var totalMembers=ids.size;
   function st(d,s){return recs.filter(function(r){return String(r.date).slice(0,10)===d&&ids.has(r.id)&&r.st===s;}).length;}
   function total(d){return recs.filter(function(r){return String(r.date).slice(0,10)===d&&ids.has(r.id);}).length;}
+  var ct=total(cur),pt=total(prev);
+  /* Partial data guard: 양쪽 모두 ≥ 70% coverage 필요 */
+  if(totalMembers > 0){
+    var curCoverage = ct / totalMembers;
+    var prevCoverage = pt / totalMembers;
+    if(curCoverage < 0.7 || prevCoverage < 0.7){
+      if(!getDeltaInfo.__warnLogged){
+        getDeltaInfo.__warnLogged = true;
+        console.warn('[delta-info] 전주대비 생략: cur(' + cur + ')=' + Math.round(curCoverage*100) + '%, prev(' + prev + ')=' + Math.round(prevCoverage*100) + '% (≥70% 필요)');
+      }
+      return null;
+    }
+  }
   var cq=st(cur,'QR인증'),pq=st(prev,'QR인증');
   var cs=st(cur,'사유출석'),ps=st(prev,'사유출석');
   var ca=st(cur,'사유결석'),pa=st(prev,'사유결석');
-  var ct=total(cur),pt=total(prev);
   var catt=cq+cs,patt=pq+ps;
   var crate=ct?+(catt/ct*100).toFixed(1):0;
   var prate=pt?+(patt/pt*100).toFixed(1):0;
@@ -11053,7 +11075,10 @@ function patchOverviewDelta(){
   }
 }
 
-/* ══ 5. 지역별 카드에 전주대비 출석률% 패치 ══ */
+/* ══ 5. 지역별 카드에 전주대비 출석률% 패치 ══
+   사용자 보고: 성북 -22.6% 등 비정상 — prev date (5/17) 가 partial 데이터일 때
+   분모가 작아서 100% 로 오인식. fix: prev 와 cur 의 record count 가 ≥70% 가
+   되어야 delta 계산. 그렇지 않으면 null 반환 (delta 표시 안 함). */
 function getDeltaByRegion(){
   var recs=getRecs();
   var dates=Array.from(new Set(recs.filter(function(r){return r.date;}).map(function(r){return String(r.date).slice(0,10);})))
@@ -11065,13 +11090,33 @@ function getDeltaByRegion(){
   var map={__cur:cur,__prev:prev};
   regions.forEach(function(reg){
     var ids=new Set(members.filter(function(m){return m.region===reg;}).map(function(m){return m.id;}));
-    function rate(d){
+    var totalInRegion = ids.size;
+    if(!totalInRegion) return;
+    function rateInfo(d){
       var dr=recs.filter(function(r){return String(r.date).slice(0,10)===d&&ids.has(r.id);});
       if(!dr.length)return null;
-      return +(dr.filter(function(r){return r.st!=='사유결석';}).length/dr.length*100).toFixed(1);
+      return {
+        count: dr.length,
+        coverage: dr.length / totalInRegion,
+        rate: +(dr.filter(function(r){return r.st!=='사유결석';}).length/dr.length*100).toFixed(1)
+      };
     }
-    var rc=rate(cur),rp=rate(prev);
-    if(rc!==null&&rp!==null)map[reg]=+(rc-rp).toFixed(1);
+    var c=rateInfo(cur),p=rateInfo(prev);
+    if(!c||!p) return;
+    /* Partial data guard: 양쪽 모두 ≥ 70% coverage 필요. 5/17 의 성북 partial 케이스 차단. */
+    if(c.coverage < 0.7 || p.coverage < 0.7){
+      /* 진단 로그 — 첫 1회만 */
+      if(!getDeltaByRegion.__warnLogged){
+        getDeltaByRegion.__warnLogged = {};
+      }
+      var wk = reg + '_' + cur + '_' + prev;
+      if(!getDeltaByRegion.__warnLogged[wk]){
+        getDeltaByRegion.__warnLogged[wk] = true;
+        console.warn('[delta-by-region] ' + reg + ' delta 생략: cur(' + cur + ')=' + Math.round(c.coverage*100) + '%, prev(' + prev + ')=' + Math.round(p.coverage*100) + '% (≥70% 필요)');
+      }
+      return;
+    }
+    map[reg]=+(c.rate-p.rate).toFixed(1);
   });
   return map;
 }
