@@ -22388,20 +22388,35 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   window.addEventListener('popstate', function(e){
     var s = e.state;
     if(s && s[STATE_MARKER]){
-      /* In-app navigation — original nav 호출 (push 없이) */
       var page = s[STATE_MARKER];
+      var subTab = s.subTab;
       _silentNav = true;
       try{
         var origNav = (window.nav && window.nav.__originalNav) || window.nav;
         if(typeof origNav === 'function'){
           var btn = findNavBtn(page);
           origNav(page, btn);
+        }
+        /* v2: sub-tab state 처리 — habit-detail / cert-detail 등 */
+        if(subTab && typeof window.reportTab === 'function'){
+          /* 'habitDetail' state 면 → 명단 (habit) 으로 복귀 */
+          var targetTab = subTab === 'habitDetail' ? 'habit'
+                       : subTab === 'certDetail' ? 'cert'
+                       : subTab;
+          var origReportTab = (window.reportTab.__originalReportTab) || window.reportTab;
+          var tabBtn = document.querySelector('button[onclick*="reportTab(\'' + targetTab + '\'"]') ||
+                       document.getElementById(targetTab + '-tab');
+          setTimeout(function(){
+            try{ origReportTab(targetTab, tabBtn); }catch(_){}
+          }, 50);
+          console.log('[back-button-guard] popstate → ' + page + '/' + subTab + ' → ' + targetTab + ' (in-app)');
+        } else {
           console.log('[back-button-guard] popstate → in-app nav:', page);
         }
       }catch(err){
         console.warn('[back-button-guard] popstate nav 오류:', err);
       } finally {
-        setTimeout(function(){ _silentNav = false; }, 50);
+        setTimeout(function(){ _silentNav = false; }, 100);
       }
     } else {
       /* state 없음 — 사이트 외부로 가는 의도. push 다시 해서 한 단계만 잡고 다음번에 허용.
@@ -22409,6 +22424,51 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       console.log('[back-button-guard] popstate → state 없음 (외부로 이동 시도)');
     }
   });
+
+  /* v2: openHabitDetail wrap — 명단 → 계획 입력 페이지 진입 시 pushState.
+     사용자 보고: 통계분석 → 보고주제 → 명단 → 이름 클릭 → 뒤로가기 → 통계분석 (X)
+     기대: 명단으로 복귀. 이름 클릭 시점에 history entry 추가가 누락됐기 때문. */
+  function wrapOpenHabitDetail(){
+    var orig = window.openHabitDetail;
+    if(typeof orig !== 'function') return false;
+    if(orig.__backGuardWrapped) return true;
+    var wrapped = function(id, mo, alreadyOnTab){
+      try{
+        if(!_silentNav){
+          history.pushState({ [STATE_MARKER]: 'report', subTab: 'habitDetail', memberId: id, mo: mo, ts: Date.now() }, '', window.location.href);
+        }
+      }catch(e){}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__backGuardWrapped = true;
+    wrapped.__originalOpenHabitDetail = orig;
+    window.openHabitDetail = wrapped;
+    return true;
+  }
+
+  /* v2: reportTab wrap — 보고주제 페이지의 sub-tab 전환 시 pushState
+     (habit ↔ habitDetail, cert ↔ certDetail 등) */
+  function wrapReportTab(){
+    var orig = window.reportTab;
+    if(typeof orig !== 'function') return false;
+    if(orig.__backGuardWrapped) return true;
+    var wrapped = function(tab, btn){
+      try{
+        if(!_silentNav){
+          var cur = history.state;
+          /* 같은 sub-tab 이면 push 안 함 (중복 방지) */
+          if(!cur || cur.subTab !== tab){
+            history.pushState({ [STATE_MARKER]: 'report', subTab: tab, ts: Date.now() }, '', window.location.href);
+          }
+        }
+      }catch(e){}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__backGuardWrapped = true;
+    wrapped.__originalReportTab = orig;
+    window.reportTab = wrapped;
+    return true;
+  }
 
   /* 초기 state 설치 — 부팅 직후 현재 페이지를 history 에 한 단계 추가 */
   function installInitialState(){
@@ -22427,12 +22487,19 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   }
 
-  /* 부팅 — nav 정의될 때까지 폴링 후 wrap + 초기 state */
+  /* 부팅 — nav / openHabitDetail / reportTab 정의될 때까지 폴링 후 wrap + 초기 state */
   function boot(){
-    if(!wrapNav()){
+    /* nav, openHabitDetail, reportTab 각각 폴링 wrap */
+    function tryAll(){
+      var n = wrapNav();
+      var h = wrapOpenHabitDetail();
+      var r = wrapReportTab();
+      return n && h && r;
+    }
+    if(!tryAll()){
       var t = 0;
       var iv = setInterval(function(){
-        if(wrapNav() || ++t > 200) clearInterval(iv);
+        if(tryAll() || ++t > 200) clearInterval(iv);
       }, 100);
     }
     installInitialState();
@@ -22457,7 +22524,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[back-button-guard] 활성 — 뒤로가기 = 이전 앱 페이지 이동');
+  console.log('[back-button-guard] v2 활성 — 뒤로가기 = 이전 앱 페이지 + sub-tab (명단/상세) 이동');
 })();
 </script>
 <!-- BACK_BUTTON_GUARD_END -->
