@@ -20694,6 +20694,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   setTimeout(brutalSyncFromRegistry, 30000);
   setInterval(brutalSyncFromRegistry, 300000);
 
+  /* v7-B: brutalSync 와 함께 records 도 sync — single source of truth */
+  setTimeout(function(){ fetchAndSyncRecords({ force: true }); }, 35000);
+  setInterval(function(){ fetchAndSyncRecords({ force: true }); }, 300000);
+
   /* ── 4. window.MEMBERS setter trap — 재할당 감지 ───────────────── */
   function installMemberTrap(){
     try{
@@ -20742,6 +20746,82 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
      applyActiveFilter (line 16935) 가 actives = activeIdSet(window.RECORDS) 로 멤버를 필터 →
      window.RECORDS 에 record 없는 protected 멤버는 매 render 마다 drop 됨.
      근본 fix: Firebase /records 에서 해당 멤버의 record 를 fetch 해서 window.RECORDS 에 inject. */
+  /* v7-B: window.RECORDS 가 partial (9679 vs FB 12915) — Step2 의 'RECORDS = fbRecs'
+     가 lexical RECORDS 만 갱신하고 window.RECORDS sync 안 함. promoteFinalRecords 도
+     FINAL_RECORDS 만 갱신. 결과: window.RECORDS = cache stale (9679).
+     Fix: Firebase /records 를 canonical 로 fetch + window.RECORDS in-place 교체.
+     사용자 보고: '12915 로드됨' 표시되지만 window.RECORDS=9679 → 카운트 변동의 원인. */
+  var _recordsSyncedAt = 0;
+  function fetchAndSyncRecords(opts){
+    opts = opts || {};
+    if(!window.fbDB || typeof window.fbDB.ref !== 'function') return Promise.resolve(null);
+    /* 5분 이내 sync 했으면 skip (force 면 무시) */
+    if(!opts.force && _recordsSyncedAt && (Date.now() - _recordsSyncedAt) < 300000){
+      return Promise.resolve(null);
+    }
+    return window.fbDB.ref('records').once('value').then(function(snap){
+      if(!snap.exists()) return null;
+      var v = snap.val();
+      /* fbRecordsFromVal 헬퍼 (key suffix 로 date 복구) 가 있으면 사용 */
+      var rawArr;
+      try{ rawArr = (typeof fbRecordsFromVal === 'function') ? fbRecordsFromVal(v) : Object.values(v); }
+      catch(e){ rawArr = Object.values(v); }
+      var fbRecs = rawArr.map(function(rr){
+        return {
+          id: (rr && rr.id) || '',
+          date: (rr && rr.date) || '',
+          wk: (rr && rr.wk) || 1,
+          day: (rr && rr.day) || '일',
+          st: (rr && rr.st) || '',
+          rsn: (rr && rr.rsn) || '',
+          streak: (rr && rr.streak) || 0
+        };
+      }).filter(function(r){ return r && r.id && r.date; });
+
+      var beforeLen = (window.RECORDS||[]).length;
+      /* In-place 교체 — array reference 유지 (다른 코드가 reference 갖고 있을 수 있음) */
+      if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
+      window.RECORDS.length = 0;
+      fbRecs.forEach(function(r){ window.RECORDS.push(r); });
+
+      /* lexical RECORDS sync (Step2 가 사용하는 reference) */
+      try{
+        if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+          /* 같은 reference 면 skip */
+          if(RECORDS !== window.RECORDS){
+            RECORDS.length = 0;
+            fbRecs.forEach(function(r){ RECORDS.push(r); });
+          }
+        }
+      }catch(e){}
+
+      /* LS sync (다음 boot 보존) */
+      try{ localStorage.setItem('att_records_v1', JSON.stringify(window.RECORDS)); }catch(e){}
+
+      _recordsSyncedAt = Date.now();
+
+      var added = window.RECORDS.length - beforeLen;
+      if(added !== 0 || !fetchAndSyncRecords.__firstLogged){
+        console.log('[bug-2-rescue] 📦 records sync: window.RECORDS ' + beforeLen + ' → ' + window.RECORDS.length + ' (' + (added>=0?'+':'') + added + ', FB 정본).');
+        fetchAndSyncRecords.__firstLogged = true;
+      }
+
+      /* invalidate record index (v112) — render 가 fresh data 사용 */
+      try{ if(typeof window.invalidateRecordIndex === 'function') window.invalidateRecordIndex(); }catch(e){}
+
+      /* UI 갱신 */
+      try{
+        if(typeof window.renderOverview === 'function') window.renderOverview();
+        if(typeof window.renderRegionCards === 'function') window.renderRegionCards();
+      }catch(e){}
+
+      return { before: beforeLen, after: window.RECORDS.length, added: added };
+    }).catch(function(err){
+      console.warn('[bug-2-rescue] records sync error:', err && err.message);
+      return null;
+    });
+  }
+
   function ensureRecordsForProtected(){
     if(!window.fbDB || typeof window.fbDB.ref !== 'function') return Promise.resolve(0);
     if(!Array.isArray(window.RECORDS)) window.RECORDS = [];
@@ -20839,10 +20919,15 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   waitForFbDB(function(){
     /* setter trap 먼저 설치 (Firebase fetch 전에) */
     installMemberTrap();
-    /* 1차 fetch */
+    /* 1차 fetch (members) */
     fetchAndProtect();
+    /* v7-B: 1차 records sync — window.RECORDS 가 Step2 의 stale cache (9679) 일 수 있음 */
+    setTimeout(function(){ fetchAndSyncRecords({ force: true }); }, 5000);
     /* v7: refresh 주기 30s → 5분 (트래픽 6배 감소). 보통 운영 중 멤버 변경 드물어서 충분. */
-    setInterval(function(){ fetchAndProtect(); }, 300000);
+    setInterval(function(){
+      fetchAndProtect();
+      fetchAndSyncRecords({ force: true });
+    }, 300000);
   });
 
   /* ── 6. 디버그 API ─────────────────────────────────────────────── */
@@ -20883,6 +20968,15 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       try{ if(typeof window.renderRegionCards === 'function') window.renderRegionCards(); }catch(e){}
       return window.MEMBERS.length;
     },
+    /* v7-B: 수동 records sync — window.RECORDS = FB /records */
+    syncRecordsNow: function(){
+      console.log('[bug-2-rescue] 수동 records sync 시작...');
+      fetchAndSyncRecords.__firstLogged = false;
+      return fetchAndSyncRecords({ force: true }).then(function(res){
+        console.log('[bug-2-rescue] 수동 records sync 완료:', res);
+        return res;
+      });
+    },
     stats: function(){
       console.log('[bug-2-rescue] stats:', _stats);
       return _stats;
@@ -20903,7 +20997,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[bug-2-rescue] v7 활성 (5s rescue + 5분 brutal sync + circuit breaker). 디버그: window.__bug2Rescue.brutalSyncNow() / stats()');
+  console.log('[bug-2-rescue] v7-B 활성 (5s rescue + 5분 brutal sync + records sync + circuit breaker). 디버그: window.__bug2Rescue.brutalSyncNow() / syncRecordsNow() / stats()');
 })();
 </script>
 <!-- BUG_2_BRUTE_FORCE_RESCUE_END -->
