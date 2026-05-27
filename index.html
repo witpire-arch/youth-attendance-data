@@ -9445,12 +9445,15 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     if(!sunday) sunday=dateStr;
     var cnt={};
     var total=0;
-    records().forEach(function(r){
-      if(!r || r.st!=='사유결석') return;
-      if(String(r.date||'').slice(0,10)!==sunday) return;
+    /* v3: records() lexical 우회 — window.RECORDS 직접 사용 (lexical 이 stale 일 수 있음) */
+    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
+    for(var __i=0; __i<allRecs.length; __i++){
+      var r=allRecs[__i];
+      if(!r || r.st!=='사유결석') continue;
+      if(String(r.date||'').slice(0,10)!==sunday) continue;
       var k=reasonLabel(r.rsn, r.st); cnt[k]=(cnt[k]||0)+1;
       total++;
-    });
+    }
     var keys=Object.keys(cnt).filter(function(k){return cnt[k]>0;}).sort(function(a,b){return cnt[b]-cnt[a];});
 
     /* 라벨/타이틀 동적 갱신 — '선택주 일요일(YYYY-MM-DD) 사유결석 분포' */
@@ -10976,7 +10979,50 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
   window.getHabitData=function(){ensureHabitSelect(); var mo=selectedHabitMonth(); var targets=typeof window.getTargets==='function'?window.getTargets():{}; var only=!!(document.getElementById('habit-only')&&document.getElementById('habit-only').checked); var stf=clean(document.getElementById('habit-st')&&document.getElementById('habit-st').value); var date=curDate(); var data=members().filter(isHabitCandidate).filter(function(m){return !prevEveryWeekExcluded(m.id,mo);}).filter(function(m){return !only||targets[m.id+'_habit'];}).filter(function(m){return !stf||detail(recAt(m.id,date))===stf;}); return {data:data,mo:mo,targets:targets};};
   window.renderHabit=function(){var got=window.getHabitData(), data=got.data, targets=got.targets; var sum=document.getElementById('habit-count-summary'); if(sum){var target=data.filter(function(m){return targets[m.id+'_habit'];}).length; sum.innerHTML='<div class="mc"><div class="lbl">습관성 결석자 총 명수</div><div class="val">'+data.length+'<span style="font-size:12px">명</span></div><div class="sub">전월 매주 QR인증·인증안함·인증오류·대체예배자 제외</div></div><div class="mc"><div class="lbl">타겟 설정</div><div class="val">'+target+'</div></div><div class="mc"><div class="lbl">타겟 미설정</div><div class="val">'+(data.length-target)+'</div></div>';}
     var body=document.getElementById('habit-body'), list=document.getElementById('habit-list'); if(list)list.style.display=''; if(!body)return; var date=curDate(); body.innerHTML=data.length?data.map(function(m){var mid=esc(m.id); return '<tr><td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td><td>'+esc(m.region)+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td><td style="font-weight:700">'+esc(m.name)+'</td><td>'+badgeType(m.type)+'</td><td>'+detailBadge(recAt(m.id,date))+'</td><td>'+latestStreak(m.id)+'회</td><td>'+esc(nd((latestRec(m.id)||{}).date)||'')+'</td></tr>';}).join(''):'<tr><td colspan="8" class="empty">해당 인원 없음</td></tr>';};
-  function renderOverviewReason(){var anchor=document.getElementById('type-cards')||document.getElementById('ov-sections')||document.getElementById('ov-metrics'); if(!anchor)return; var root=document.getElementById('overview-extra-analysis'); if(!root){root=document.createElement('div');root.id='overview-extra-analysis';anchor.insertAdjacentElement('afterend',root);} var mo=(clean(document.getElementById('globalMonth')&&document.getElementById('globalMonth').value)||curDate().slice(0,7)).slice(0,7); var cnt={}; recs().forEach(function(r){if(nd(r.date).slice(0,7)!==mo||clean(r.st)!=='사유결석')return; var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'사유없음'; cnt[k]=(cnt[k]||0)+1;}); var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];}); root.innerHTML='<div class="v78-section-title">결석사유 분석 <span class="v78-note">선택월 사유결석 기준</span></div><div class="card"><div class="ct">사유결석 분포</div><div style="position:relative;height:210px"><canvas id="c-ov-reason">사유결석 분포</canvas></div><div id="ov-reason-list" class="v78-reason-list">'+(keys.length?keys.slice(0,10).map(function(k){return '<span class="v78-reason-chip">'+esc(k)+' '+cnt[k]+'</span>';}).join(''):'<span style="font-size:12px;color:var(--text3)">사유결석 데이터가 없습니다.</span>')+'</div></div>'; safe(function(){ if(window.__v107ReasonChart)window.__v107ReasonChart.destroy(); var ctx=document.getElementById('c-ov-reason'); if(ctx&&window.Chart) window.__v107ReasonChart=new Chart(ctx,{type:'bar',data:{labels:keys,datasets:[{data:keys.map(function(k){return cnt[k];}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});},null); }
+  function renderOverviewReason(){
+    /* 사유결석 차트 fix v3 — V107 의 이 함수가 boot 시 setTimeout(...,1000) 으로 자동 실행되어
+       내 v2 의 결과를 덮어쓰던 문제 직접 수정. 데이터 소스: window.RECORDS (lexical 우회) +
+       getSundayOfWeek(gb-date) 기준. */
+    var anchor=document.getElementById('type-cards')||document.getElementById('ov-sections')||document.getElementById('ov-metrics');
+    if(!anchor)return;
+    var root=document.getElementById('overview-extra-analysis');
+    if(!root){root=document.createElement('div');root.id='overview-extra-analysis';anchor.insertAdjacentElement('afterend',root);}
+    /* selectedDate 의 주 일요일 계산 */
+    var gd=document.getElementById('gb-date');
+    var dateStr=(gd&&gd.value)||curDate();
+    var sunday='';
+    try{
+      var _d=new Date(String(dateStr).slice(0,10)+'T00:00:00');
+      if(!isNaN(_d.getTime())){
+        _d.setDate(_d.getDate()-_d.getDay());
+        sunday=_d.getFullYear()+'-'+String(_d.getMonth()+1).padStart(2,'0')+'-'+String(_d.getDate()).padStart(2,'0');
+      }
+    }catch(e){}
+    if(!sunday) sunday=String(dateStr).slice(0,10);
+    /* 데이터 source: window.RECORDS 직접 (lexical recs() 우회 — stale 캐시 회피) */
+    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
+    var cnt={}, total=0;
+    for(var i=0;i<allRecs.length;i++){
+      var r=allRecs[i];
+      if(!r) continue;
+      if(clean(r.st)!=='사유결석') continue;
+      if(String(r.date||'').slice(0,10)!==sunday) continue;
+      var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'(미입력)';
+      cnt[k]=(cnt[k]||0)+1; total++;
+    }
+    var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];});
+    root.innerHTML='<div class="v78-section-title">결석사유 분석 <span class="v78-note">선택주 일요일 ('+esc(sunday)+') 사유결석 분포</span></div><div class="card"><div class="ct">사유결석 분포 — '+esc(sunday)+' (총 '+total+'건)</div><div style="position:relative;height:210px"><canvas id="c-ov-reason">사유결석 분포</canvas></div><div id="ov-reason-list" class="v78-reason-list">'+(keys.length?keys.slice(0,10).map(function(k){return '<span class="v78-reason-chip">'+esc(k)+' '+cnt[k]+'</span>';}).join(''):'<span style="font-size:12px;color:var(--text3)">선택주 ('+esc(sunday)+') 사유결석 데이터 없음</span>')+'</div></div>';
+    safe(function(){
+      /* Chart 인스턴스 leak 방지 — 모든 ref destroy */
+      var ctx=document.getElementById('c-ov-reason'); if(!ctx||!window.Chart) return;
+      try{ var existing=Chart.getChart(ctx); if(existing) existing.destroy(); }catch(_){}
+      if(window.__v107ReasonChart){ try{window.__v107ReasonChart.destroy();}catch(_){} window.__v107ReasonChart=null; }
+      if(window.__v109ReasonChart){ try{window.__v109ReasonChart.destroy();}catch(_){} window.__v109ReasonChart=null; }
+      try{ if(typeof CI!=='undefined' && CI && CI['c-ov-reason']){ CI['c-ov-reason'].destroy(); CI['c-ov-reason']=null; } }catch(_){}
+      if(!keys.length) return;
+      window.__v107ReasonChart=new Chart(ctx,{type:'bar',data:{labels:keys,datasets:[{data:keys.map(function(k){return cnt[k];}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});
+    },null);
+  }
   /* V107 renderOverview override disabled - causes flicker */
   function boot(){ensureHabitSelect(); if(document.getElementById('page-overview')&&document.getElementById('page-overview').classList.contains('active'))setTimeout(function(){ if(typeof window.renderOverview==='function')window.renderOverview(); else renderOverviewReason();},0); if(document.getElementById('page-report')&&document.getElementById('page-report').classList.contains('active'))setTimeout(window.renderHabit,0);}
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot); else setTimeout(boot,0); window.addEventListener('load',function(){setTimeout(boot,300);setTimeout(renderOverviewReason,1000);});
@@ -11700,13 +11746,16 @@ window.addEventListener('load',function(){
     if(!sunday) sunday=String(dateStr).slice(0,10);
 
     var cnt={}, total=0;
-    recs().forEach(function(r){
-      if(!r) return;
-      if(clean(r.st)!=='사유결석') return;
-      if(nd(r.date).slice(0,10)!==sunday) return;
+    /* v3: recs() lexical 우회 — window.RECORDS 직접 사용 */
+    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
+    for(var __i=0; __i<allRecs.length; __i++){
+      var r=allRecs[__i];
+      if(!r) continue;
+      if(clean(r.st)!=='사유결석') continue;
+      if(nd(r.date).slice(0,10)!==sunday) continue;
       var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'사유없음';
       cnt[k]=(cnt[k]||0)+1; total++;
-    });
+    }
     var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];});
 
     /* 라벨/타이틀 동적 */
