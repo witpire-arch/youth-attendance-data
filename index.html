@@ -1165,7 +1165,7 @@ body.llf-pin-loading::before{
 
 <!-- ====== REPORT (보고 주제) ====== -->
 <div id="page-report" class="page">
-  <div class="ph"><h2>보고 주제</h2><p>습관성 결석자 및 E단계 사유출석자 타겟 관리</p></div>
+  <div class="ph"><h2>보고 주제</h2><p>습관성 결석자 및 인증출석 목표 인원 관리</p></div>
   <div class="tabs" id="report-tabs">
     <button class="tb on" onclick="reportTab('habit',this)">습관성 결석자</button>
     <button class="tb" id="habit-status-tab" onclick="reportTab('habitStatus',this)">타겟 현황</button>
@@ -8768,7 +8768,7 @@ body.v97-data-loading #login-screen{z-index:9999;}
   function ensureHabitUI(){
     // habit-st 제거됨 (사용자 요청)
     var note=document.querySelector('#rt-habit .ct span');
-    if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·사유결석자 자동 제외';
+    if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·온라인예배·사유결석자 자동 제외';
     var ths=document.querySelectorAll('#rt-habit table thead th');
     // 7컬럼: 타겟/지역/팀-구역/이름/유형/세부유형/월목표
     if(ths&&ths[5]) { ths[5].textContent='출석 유형 (세부 유형)'; ths[5].style.display=''; }
@@ -11642,7 +11642,7 @@ window.addEventListener('load',function(){
       {v:'전월 기록 없음', l:'전월 기록 없음'}
     ].map(function(o){return '<option value="'+esc(o.v)+'">'+esc(o.l)+'</option>';}).join('');
     var note=document.querySelector('#rt-habit .ct span');
-    if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·사유결석자 자동 제외';
+    if(note) note.textContent='선택한 달의 전월 기준 · 매주 QR인증·인증안함·인증오류·대체예배·온라인예배·사유결석자 자동 제외';
     var ths=document.querySelectorAll('#rt-habit table thead th');
     if(ths&&ths[5]) ths[5].textContent='출석 유형 (세부 유형)';
     if(ths&&ths[6]) ths[6].textContent='월 목표';
@@ -11652,7 +11652,10 @@ window.addEventListener('load',function(){
   // V112 완전 독립 함수들 (외부 클로저 의존 없음)
   window.v112detail=function(r){if(!r)return '';var st=String(r.st||'').trim(),rsn=String(r.rsn||'').trim();if(st==='사유출석'){var rv=rsn||'인증안함';return(rv===''||rv==='미입력')?'인증안함':rv;}if(st==='QR인증')return 'QR인증';if(st==='사유결석'||st==='결석')return '사유결석';return st;}
   window.v112wk=function(r){var d=String(r.date||'');return Math.ceil(+d.slice(8,10)/7)||1;}
-  var V112_EXCL={'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1,'사유결석':1};
+  /* '온라인예배' 추가 — 라벨 일치 + task-3 cycle policy (EXCLUDED_RSN) 와 동일.
+     기존 cycle (snapshotMembers) 는 task-3 가 이미 저장 → 영향 없음.
+     향후 detect/createPlan 함수가 이 set 사용 시 일관된 결과. */
+  var V112_EXCL={'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1,'온라인예배':1,'사유결석':1};
   // 캐시: 같은 월에 대해 반복 계산 방지
   var _v112cache={key:'',result:{}};
   window.v112excluded=function(id,mo){
@@ -15463,9 +15466,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     if(st==='결석' || st==='미출석') return '결석';
     return st || rsn;
   }
-  /* attend = QR인증/인증안함/인증오류/대체예배. 사유결석 도 포함되면 안 됨.
-     순수결석 = 출석계열도 사유결석도 아닌 모든 것 (기록 없음, 결석/미출석 등). */
-  var ATTEND_OR_EXCUSED = {'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1,'사유결석':1};
+  /* attend = QR인증/인증안함/인증오류/대체예배/온라인예배. 사유결석 도 포함되면 안 됨.
+     순수결석 = 출석계열도 사유결석도 아닌 모든 것 (기록 없음, 결석/미출석 등).
+     '온라인예배' 추가 (사용자 라벨 변경 + task-3 EXCLUDED_RSN 동일 policy). */
+  var ATTEND_OR_EXCUSED = {'QR인증':1,'인증안함':1,'인증오류':1,'대체예배':1,'온라인예배':1,'사유결석':1};
 
   /* baseMonth 의 모든 일요일 (records 에 등장한 날짜만) */
   function sundaysOf(baseMo){
