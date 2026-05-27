@@ -22059,3 +22059,222 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- BUG_3_ORPHAN_CLEANUP_END -->
+
+<!-- REGION_INPUT_FIX_START -->
+<script id="region-input-fix">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     지역 사용자 입력 버그 fix (critical — region 사용자 못 씀)
+
+     증상:
+       - 팀/지역 필터 적용 → 1번째 입력 OK
+       - 2번째 입력 시도 → 필터가 안 먹거나 입력 안 됨
+       - 매번 새로고침 + 재로그인 강제
+
+     3개 원인 동시 처리:
+
+     1) applyPlanSnapshotToBody 의 plan.goals[id] throw
+        - Firebase 가 빈 {} 객체 prune → Phase D pull 후 plan.goals undefined
+        - render 도중 throw → body innerHTML 부분 mutation 상태 → 입력 안 됨
+        - Fix: localStorage.getItem wrap — att_habitual_plans_v1 읽을 때 항상 plan.goals = {} 보장
+
+     2) habit-team filter 가 cycle 모드 (applyPlanSnapshotToBody) 에서 무시됨
+        - V112 normal 모드 (allMembers) 는 team filter 처리하지만 cycle 모드는 안 함
+        - Fix: DOM-level post-render hook — habit-body 의 tr 을 team 필터로 hide/show
+
+     3) Phase D 재렌더링이 active input 의 focus 파괴
+        - 사용자가 typing 중인데 admin 의 FB write → Phase D pull → re-render → input 사라짐
+        - Fix: scheduleUIRefresh 가 active .s2-goal-inp / .habit-goal-inp 감지 시 5초 defer
+
+     영향: 모든 사용자 (admin + region) 의 사이클 입력 UX 개선
+     ════════════════════════════════════════════════════════════════ */
+
+  function clean(s){ return String(s==null?'':s).trim(); }
+  function normTeamLabel(t){
+    var s = clean(t); if(!s) return '';
+    if(s.indexOf('팀') >= 0) return s;
+    return s + '팀';
+  }
+
+  /* ── 1. localStorage.getItem wrap — plan.goals 항상 보장 ─────── */
+  function wrapGetItem(){
+    if(localStorage.getItem.__regionInputWrapped) return false;
+    var origGet = localStorage.getItem.bind(localStorage);
+    var newGet = function(key){
+      var val = origGet(key);
+      if(key === 'att_habitual_plans_v1' && val){
+        try{
+          var obj = JSON.parse(val);
+          if(obj && typeof obj === 'object'){
+            var changed = false;
+            Object.keys(obj).forEach(function(cycleId){
+              var p = obj[cycleId];
+              if(!p || typeof p !== 'object') return;
+              if(!p.goals || typeof p.goals !== 'object'){
+                p.goals = {};
+                changed = true;
+              }
+              if(!p.archivedGoals || typeof p.archivedGoals !== 'object'){
+                p.archivedGoals = {};
+                changed = true;
+              }
+              if(!Array.isArray(p.snapshotMembers)) p.snapshotMembers = [];
+              if(!Array.isArray(p.addedMembers)) p.addedMembers = [];
+            });
+            if(changed){
+              return JSON.stringify(obj);
+            }
+          }
+        }catch(e){}
+      }
+      return val;
+    };
+    newGet.__regionInputWrapped = true;
+    try{
+      Object.defineProperty(localStorage, 'getItem', { value: newGet, writable: true, configurable: true });
+      console.log('[region-input-fix] localStorage.getItem wrap 활성 — plan.goals 항상 보장');
+      return true;
+    }catch(e){
+      console.warn('[region-input-fix] getItem wrap 실패:', e);
+      return false;
+    }
+  }
+  wrapGetItem();
+
+  /* ── 2. DOM-level team filter for habit-body (cycle mode 보강) ─── */
+  var _teamFilterTimer = null;
+  function applyTeamFilterToBody(){
+    var teamEl = document.getElementById('habit-team');
+    var team = teamEl ? clean(teamEl.value) : '';
+    var body = document.getElementById('habit-body');
+    if(!body) return;
+    var rows = body.querySelectorAll('tr[data-pid]');
+    if(!rows.length) return;
+    if(!team){
+      /* 필터 해제 — 모두 표시 */
+      for(var i = 0; i < rows.length; i++){
+        rows[i].style.display = '';
+      }
+      return;
+    }
+    var teamN = normTeamLabel(team);
+    var membersById = {};
+    (window.MEMBERS||[]).forEach(function(m){ if(m && m.id) membersById[clean(m.id)] = m; });
+    var shown = 0;
+    for(var j = 0; j < rows.length; j++){
+      var pid = rows[j].getAttribute('data-pid');
+      var m = membersById[clean(pid)];
+      var rowTeam = m ? normTeamLabel(m.team) : '';
+      if(m && rowTeam === teamN){
+        rows[j].style.display = '';
+        shown++;
+      } else {
+        rows[j].style.display = 'none';
+      }
+    }
+    if(!applyTeamFilterToBody.__loggedOnce){
+      console.log('[region-input-fix] team filter applied: ' + team + ' → ' + shown + '/' + rows.length + ' rows shown');
+      applyTeamFilterToBody.__loggedOnce = true;
+    }
+  }
+  /* habit-team 변경 시 즉시 필터 (debounce 100ms — 빠른 selection 흡수) */
+  function scheduleTeamFilter(){
+    if(_teamFilterTimer) clearTimeout(_teamFilterTimer);
+    _teamFilterTimer = setTimeout(applyTeamFilterToBody, 100);
+  }
+  document.addEventListener('change', function(ev){
+    var t = ev.target;
+    if(t && t.id === 'habit-team'){
+      scheduleTeamFilter();
+    }
+  }, true);
+
+  /* MutationObserver — habit-body 가 재렌더 될 때마다 team filter 재적용 */
+  function startBodyObserver(){
+    var body = document.getElementById('habit-body');
+    if(!body){
+      setTimeout(startBodyObserver, 500);
+      return;
+    }
+    var observer = new MutationObserver(function(){
+      /* render 가 끝난 후 team filter 재적용 */
+      scheduleTeamFilter();
+    });
+    observer.observe(body, { childList: true });
+    console.log('[region-input-fix] habit-body MutationObserver 활성 — team filter 자동 재적용');
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(startBodyObserver, 1000); });
+  } else {
+    setTimeout(startBodyObserver, 1000);
+  }
+
+  /* ── 3. Active input 보호 — typing 중 재렌더 defer ──────────── */
+  /* Phase D 의 scheduleUIRefresh 가 active input 감지 시 5초 defer.
+     기존 scheduleUIRefresh 가 closure-locked 라 외부에서 wrap 불가.
+     대신 setTimeout 을 monkey-patch 해서 .s2-goal-inp 또는 .habit-goal-inp 가
+     active 인 동안에는 render 콜백 defer. */
+  function isUserTyping(){
+    try{
+      var a = document.activeElement;
+      if(!a || a.tagName !== 'INPUT') return false;
+      if(!a.classList) return false;
+      return a.classList.contains('s2-goal-inp') || a.classList.contains('habit-goal-inp');
+    }catch(e){ return false; }
+  }
+  /* renderHabit 직접 wrap — 사용자 typing 중이면 skip */
+  function wrapRenderHabit(){
+    var orig = window.renderHabit;
+    if(typeof orig !== 'function') return false;
+    if(orig.__regionInputGuarded) return true;
+    var wrapped = function(){
+      if(isUserTyping()){
+        if(!wrapped.__deferLogged){
+          console.log('[region-input-fix] renderHabit defer — 사용자 typing 중 (input focus 보호)');
+          wrapped.__deferLogged = true;
+        }
+        /* 1초 후 다시 시도 (반복 typing 흡수) */
+        setTimeout(function(){
+          if(isUserTyping()){
+            setTimeout(arguments.callee, 1000);
+            return;
+          }
+          orig.apply(this, arguments);
+        }, 1000);
+        return;
+      }
+      return orig.apply(this, arguments);
+    };
+    wrapped.__regionInputGuarded = true;
+    /* 다른 wrapper marker 보존 */
+    Object.keys(orig).forEach(function(k){
+      if(k.indexOf('__') === 0) wrapped[k] = orig[k];
+    });
+    window.renderHabit = wrapped;
+    console.log('[region-input-fix] renderHabit wrap 활성 — typing 중 재렌더 defer');
+    return true;
+  }
+  if(!wrapRenderHabit()){
+    var t = 0;
+    var iv = setInterval(function(){
+      if(wrapRenderHabit() || ++t > 300) clearInterval(iv);
+    }, 100);
+  }
+
+  /* ── 디버그 API ──────────────────────────────────────────────── */
+  window.__regionInputFix = {
+    applyTeamFilter: applyTeamFilterToBody,
+    isTyping: isUserTyping,
+    rewrap: function(){
+      delete localStorage.getItem.__regionInputWrapped;
+      wrapGetItem();
+      if(window.renderHabit) delete window.renderHabit.__regionInputGuarded;
+      wrapRenderHabit();
+    }
+  };
+
+  console.log('[region-input-fix] 지역 사용자 입력 버그 fix 활성 (plan.goals defensive + team filter + input focus 보호)');
+})();
+</script>
+<!-- REGION_INPUT_FIX_END -->
