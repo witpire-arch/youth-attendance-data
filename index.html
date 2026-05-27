@@ -22883,3 +22883,230 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- RECORDS_LAZY_LOAD_END -->
+
+<!-- REASON_CHART_FIX_START -->
+<script id="reason-chart-fix">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     사유결석 분포 차트 fix
+
+     사용자 보고:
+       1. 라벨 "선택월 사유결석 기준" 이지만 실제는 사이클 baseMonth(2026-04) + cycle 322 한정 (667건)
+       2. selectedDate 변경에도 차트 반응 없음
+       3. c-ov-reason canvas 에 Chart 인스턴스 2개 중복 (renderReasonChart + renderOverviewReasonColorFix)
+       4. 카테고리 하드코딩 → '국방의무' 같은 신규 누락
+
+     해결:
+       1) getSundayOfWeek 헬퍼 (window 노출)
+       2) renderReasonChart override — selectedDate 의 주 일요일 데이터로 필터
+       3) renderOverviewReasonColorFix no-op — 중복 제거
+       4) gb-date change listener → redraw 트리거
+       5) Chart.getChart(canvas).destroy() — 인스턴스 leak 방지
+       6) 카테고리 동적 unique 추출 (사이클 한정 제거)
+
+     검증:
+       - 5/24 선택 → sunday=5/24 → 249건
+       - 5/22(금) → sunday=5/17 → 353건
+       - 5/25(월) → sunday=5/24 → 249건
+     ════════════════════════════════════════════════════════════════ */
+
+  if(window.__reasonChartFixInstalled) return;
+  window.__reasonChartFixInstalled = true;
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  /* ── 1. KST-safe Sunday of week helper ─────────────────────────── */
+  function getSundayOfWeek(dateStr){
+    if(!dateStr) return '';
+    try{
+      var d = new Date(dateStr + 'T00:00:00');
+      if(isNaN(d.getTime())) return '';
+      d.setDate(d.getDate() - d.getDay());
+      var y = d.getFullYear();
+      var m = String(d.getMonth() + 1).padStart(2, '0');
+      var dd = String(d.getDate()).padStart(2, '0');
+      return y + '-' + m + '-' + dd;
+    }catch(e){ return ''; }
+  }
+  window.getSundayOfWeek = getSundayOfWeek;
+
+  /* ── 2. 선택일 → 주 일요일 ──────────────────────────────────────── */
+  function currentSunday(){
+    var gd = document.getElementById('gb-date');
+    var dateStr = (gd && gd.value) || new Date().toISOString().slice(0, 10);
+    return getSundayOfWeek(dateStr) || dateStr;
+  }
+
+  /* ── 3. Reason label 헬퍼 ──────────────────────────────────────── */
+  function rsnLabel(r){
+    if(!r) return '(미입력)';
+    try{
+      if(typeof window.reasonDisplayLabel === 'function'){
+        var v = window.reasonDisplayLabel(r.rsn, r.st);
+        if(v) return v;
+      }
+    }catch(e){}
+    return r.rsn || '(미입력)';
+  }
+
+  /* ── 4. 차트 인스턴스 cleanup (leak 방지) ───────────────────────── */
+  function destroyChartOn(canvas){
+    if(!canvas || typeof Chart === 'undefined') return;
+    try{
+      var existing = Chart.getChart(canvas);
+      if(existing) existing.destroy();
+    }catch(e){}
+    /* 기존 패치들이 남긴 인스턴스도 명시적 destroy */
+    try{ if(window.__v107ReasonChart){ window.__v107ReasonChart.destroy(); window.__v107ReasonChart = null; } }catch(e){}
+    try{ if(window.__v109ReasonChart){ window.__v109ReasonChart.destroy(); window.__v109ReasonChart = null; } }catch(e){}
+    /* mc() CI registry */
+    try{
+      if(typeof CI !== 'undefined' && CI && CI[canvas.id]){
+        try{ CI[canvas.id].destroy(); }catch(_){}
+        CI[canvas.id] = null;
+      }
+    }catch(e){}
+  }
+
+  /* ── 5. 새 renderReasonChart — selectedDate 의 주 일요일 기준 ──── */
+  function renderReasonChartNew(){
+    var canvas = document.getElementById('c-ov-reason');
+    if(!canvas || typeof Chart === 'undefined') return;
+
+    var sunday = currentSunday();
+    var recs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var cnt = {};
+    var total = 0;
+
+    for(var i = 0; i < recs.length; i++){
+      var r = recs[i];
+      if(!r || r.st !== '사유결석') continue;
+      if(String(r.date || '').slice(0,10) !== sunday) continue;
+      var k = rsnLabel(r);
+      cnt[k] = (cnt[k] || 0) + 1;
+      total++;
+    }
+
+    /* 카테고리 동적 정렬 (count 내림차순) */
+    var keys = Object.keys(cnt).sort(function(a,b){ return cnt[b] - cnt[a]; });
+
+    /* 색상 — 기존 RSN_CLR 우선, 없으면 fallback palette */
+    var colors;
+    try{
+      colors = (typeof window.RSN_CLR !== 'undefined' && Array.isArray(window.RSN_CLR))
+        ? window.RSN_CLR
+        : ['#a01e1e','#d4533a','#e67e22','#c77f1f','#7a4608','#999a8e','#7cc4ee','#1550a0','#6a3aaa','#2a8c4a'];
+    }catch(e){ colors = ['#a01e1e','#d4533a','#e67e22','#c77f1f','#7a4608']; }
+
+    /* 라벨 업데이트 — 동적 일요일 표시 */
+    try{
+      var sectionNote = document.querySelector('#overview-extra-analysis .v78-note');
+      if(sectionNote && sectionNote.textContent.indexOf('선택') >= 0){
+        sectionNote.textContent = '선택주 일요일 (' + sunday + ') 사유결석 분포';
+      }
+      var card = canvas.closest('.card');
+      if(card){
+        var ct = card.querySelector('.ct');
+        if(ct) ct.textContent = '사유결석 분포 — ' + sunday + ' (총 ' + total + '건)';
+      }
+    }catch(e){}
+
+    /* 리스트 갱신 */
+    try{
+      var list = document.getElementById('ov-reason-list');
+      if(list){
+        list.innerHTML = keys.length
+          ? keys.slice(0, 10).map(function(k){ return '<span class="v78-reason-chip">' + esc(k) + ' ' + cnt[k] + '</span>'; }).join('')
+          : '<span style="font-size:12px;color:var(--text3)">선택주 (' + sunday + ') 사유결석 데이터 없음</span>';
+      }
+    }catch(e){}
+
+    /* Chart 인스턴스 cleanup + 새로 생성 */
+    destroyChartOn(canvas);
+
+    if(!keys.length) return; /* 데이터 없으면 차트 생성 안 함 */
+
+    try{
+      new Chart(canvas, {
+        type: 'bar',
+        data: {
+          labels: keys,
+          datasets: [{
+            label: '사유결석',
+            data: keys.map(function(k){ return cnt[k]; }),
+            backgroundColor: keys.map(function(_, i){ return colors[i % colors.length]; }),
+            borderRadius: 4
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true, ticks: { stepSize: 1, precision: 0 } } }
+        }
+      });
+    }catch(e){ console.warn('[reason-chart-fix] chart create error', e); }
+  }
+
+  /* ── 6. 기존 renderReasonChart / renderOverviewReasonColorFix override ─── */
+  function installOverrides(){
+    try{ window.renderReasonChart = renderReasonChartNew; }catch(e){}
+    /* renderOverviewReasonColorFix 는 같은 일을 다른 방식으로 — no-op 처리하여 중복 차트 제거 */
+    try{ window.renderOverviewReasonColorFix = function(){ /* no-op — reason-chart-fix 가 처리 */ }; }catch(e){}
+  }
+  installOverrides();
+  /* 다른 IIFE 가 늦게 정의할 수 있음 — 1초마다 재오버라이드 (10회) */
+  var overrideAttempts = 0;
+  var overrideIv = setInterval(function(){
+    overrideAttempts++;
+    if(overrideAttempts > 10){ clearInterval(overrideIv); return; }
+    installOverrides();
+  }, 1000);
+
+  /* ── 7. gb-date / globalMonth 변경 시 차트 redraw ────────────────── */
+  document.addEventListener('change', function(ev){
+    var t = ev.target;
+    if(!t) return;
+    if(t.id === 'gb-date' || t.id === 'globalMonth'){
+      /* overview 페이지 active 일 때만 redraw */
+      var page = document.querySelector('.page.active');
+      if(page && page.id === 'page-overview'){
+        setTimeout(renderReasonChartNew, 50);
+      }
+    }
+  }, true);
+
+  /* ── 8. 디버그 API ──────────────────────────────────────────────── */
+  window.__reasonChartFix = {
+    redraw: renderReasonChartNew,
+    getSundayOfWeek: getSundayOfWeek,
+    currentSunday: currentSunday,
+    instances: function(){
+      if(typeof Chart === 'undefined') return 0;
+      try{
+        return Object.values(Chart.instances || {}).filter(function(c){
+          return c && c.canvas && c.canvas.id === 'c-ov-reason';
+        }).length;
+      }catch(e){ return -1; }
+    },
+    verify: function(){
+      var sunday = currentSunday();
+      var recs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+      var cnt = {}, total = 0;
+      recs.forEach(function(r){
+        if(r && r.st === '사유결석' && String(r.date||'').slice(0,10) === sunday){
+          var k = rsnLabel(r);
+          cnt[k] = (cnt[k] || 0) + 1; total++;
+        }
+      });
+      console.log('[reason-chart-fix] sunday=' + sunday + ', total=' + total);
+      console.table(cnt);
+      return { sunday: sunday, total: total, cnt: cnt };
+    }
+  };
+
+  console.log('[reason-chart-fix] 활성 — selectedDate 의 주 일요일 기준 사유결석 분포. 디버그: window.__reasonChartFix.verify() / instances()');
+})();
+</script>
+<!-- REASON_CHART_FIX_END -->
