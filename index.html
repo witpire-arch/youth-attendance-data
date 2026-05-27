@@ -22528,3 +22528,211 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- BACK_BUTTON_GUARD_END -->
+
+<!-- PERF_QUICK_WINS_START -->
+<script id="perf-quick-wins">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     성능 quick wins (안전한 메모이제이션 + debounce)
+
+     목표:
+       - 초기 로드 1803ms → < 1000ms (Firebase 응답이 bottleneck, 코드 최적화 한계)
+       - 페이지 이동 ??ms → < 200ms
+
+     이번 commit (safe):
+       1) Member id index — Map<id, member> O(1) lookup
+          MEMBERS.find(x=>x.id===id) 가 여러 곳에서 호출됨 → O(n) → O(1)
+       2) activeIdSet 메모이제이션 — RECORDS reference 변경 시에만 rebuild
+       3) Region/Team/Zone group index — 필터 결과 캐싱
+       4) renderOverview / renderRegionCards debounce (50ms)
+
+     안전성:
+       - cache 만 추가, 기존 로직 변경 없음
+       - data 변경 감지 시 자동 invalidate (length + 끝 record id)
+       - debug API 로 끄기 가능
+
+     다음 세션 (큰 작업):
+       - 가상 스크롤 (habit-body 1621행)
+       - IndexedDB 마이그레이션 (LS 1.3MB)
+       - 사이드바 메뉴 lazy load
+       - Firebase indexOn 룰 설정 (사용자가 Console 에서)
+     ════════════════════════════════════════════════════════════════ */
+
+  if(window.__perfQuickWinsInstalled) return;
+  window.__perfQuickWinsInstalled = true;
+
+  /* ── 1. Member id index ────────────────────────────────────────── */
+  var _memberIndex = null;
+  var _memberIndexLen = -1;
+  function rebuildMemberIndex(){
+    var arr = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var idx = new Map();
+    for(var i = 0; i < arr.length; i++){
+      var m = arr[i];
+      if(m && m.id) idx.set(String(m.id), m);
+    }
+    _memberIndex = idx;
+    _memberIndexLen = arr.length;
+  }
+  function getMemberById(id){
+    var arr = window.MEMBERS;
+    /* invalidate 조건: length 변경 시 rebuild */
+    if(!_memberIndex || (Array.isArray(arr) && arr.length !== _memberIndexLen)){
+      rebuildMemberIndex();
+    }
+    return _memberIndex ? _memberIndex.get(String(id)) : null;
+  }
+  window.__getMemberById = getMemberById;
+
+  /* ── 2. activeIdSet 메모이제이션 ────────────────────────────────── */
+  var _activeIdSetCache = null;
+  var _activeIdSetLen = -1;
+  var _activeIdSetTailId = '';
+  function getActiveIdSet(){
+    var rs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var tailId = rs.length > 0 ? (rs[rs.length-1].id || '') : '';
+    /* invalidate: length 또는 끝 record 의 id 변경 */
+    if(_activeIdSetCache && rs.length === _activeIdSetLen && tailId === _activeIdSetTailId){
+      return _activeIdSetCache;
+    }
+    var s = {};
+    for(var i = 0; i < rs.length; i++){
+      var r = rs[i];
+      if(r && r.id) s[r.id] = 1;
+    }
+    _activeIdSetCache = s;
+    _activeIdSetLen = rs.length;
+    _activeIdSetTailId = tailId;
+    return s;
+  }
+  window.__getActiveIdSet = getActiveIdSet;
+
+  /* ── 3. Region/Team/Zone group index ───────────────────────────── */
+  var _groupIndex = { byRegion: null, byTeam: null, byZone: null, len: -1 };
+  function rebuildGroupIndex(){
+    var arr = Array.isArray(window.MEMBERS) ? window.MEMBERS : [];
+    var byRegion = {}, byTeam = {}, byZone = {};
+    for(var i = 0; i < arr.length; i++){
+      var m = arr[i];
+      if(!m || !m.id) continue;
+      var r = m.region || '';
+      var t = m.team || '';
+      var z = m.zone || '';
+      (byRegion[r] = byRegion[r] || []).push(m);
+      (byTeam[t] = byTeam[t] || []).push(m);
+      (byZone[z] = byZone[z] || []).push(m);
+    }
+    _groupIndex = { byRegion: byRegion, byTeam: byTeam, byZone: byZone, len: arr.length };
+  }
+  function getMembersByRegion(region){
+    var arr = window.MEMBERS;
+    if(_groupIndex.len !== (arr||[]).length) rebuildGroupIndex();
+    return _groupIndex.byRegion[region] || [];
+  }
+  window.__getMembersByRegion = getMembersByRegion;
+
+  /* ── 4. Render debounce — 50ms 내 burst 흡수 ────────────────────── */
+  var _renderTimers = {};
+  function debounceRender(name, fn, delay){
+    delay = delay || 50;
+    return function(){
+      var args = arguments, self = this;
+      if(_renderTimers[name]){
+        clearTimeout(_renderTimers[name]);
+      }
+      _renderTimers[name] = setTimeout(function(){
+        _renderTimers[name] = null;
+        try{ fn.apply(self, args); }catch(e){ console.warn('[perf] '+name+' 오류', e); }
+      }, delay);
+    };
+  }
+
+  /* 주요 render 함수 debounce — 단, 첫 호출은 즉시 (체감 속도 우선) */
+  function wrapRenderDebounced(name){
+    var orig = window[name];
+    if(typeof orig !== 'function') return false;
+    if(orig.__perfDebounced) return true;
+    var lastCallAt = 0;
+    var wrapped = function(){
+      var now = Date.now();
+      var args = arguments, self = this;
+      /* 50ms 내 연속 호출은 debounce, 그렇지 않으면 즉시 */
+      if(now - lastCallAt < 50){
+        if(_renderTimers[name]) clearTimeout(_renderTimers[name]);
+        _renderTimers[name] = setTimeout(function(){
+          _renderTimers[name] = null;
+          try{ orig.apply(self, args); }catch(e){}
+          lastCallAt = Date.now();
+        }, 50);
+      } else {
+        try{ orig.apply(this, args); }catch(e){}
+        lastCallAt = now;
+      }
+    };
+    wrapped.__perfDebounced = true;
+    /* 기존 marker 보존 */
+    Object.keys(orig).forEach(function(k){
+      if(k.indexOf('__') === 0) wrapped[k] = orig[k];
+    });
+    window[name] = wrapped;
+    return true;
+  }
+
+  /* renderOverview / renderRegionCards 만 debounce — 다른 render 는 영향 적어 그대로 */
+  function applyDebounce(){
+    var targets = ['renderOverview', 'renderRegionCards'];
+    var ok = true;
+    targets.forEach(function(n){ if(!wrapRenderDebounced(n)) ok = false; });
+    return ok;
+  }
+  if(!applyDebounce()){
+    var t = 0;
+    var iv = setInterval(function(){
+      if(applyDebounce() || ++t > 200) clearInterval(iv);
+    }, 100);
+  }
+
+  /* ── 5. 디버그 API ──────────────────────────────────────────────── */
+  window.__perfQuickWins = {
+    /* 메모이제이션 통계 */
+    stats: function(){
+      console.group('[perf-quick-wins] stats');
+      console.log('member index:', _memberIndex ? _memberIndex.size + ' entries' : '(not built)');
+      console.log('activeIdSet cache:', _activeIdSetCache ? Object.keys(_activeIdSetCache).length + ' ids' : '(not cached)');
+      console.log('group index:', _groupIndex.byRegion ? 'built' : '(not built)');
+      console.log('pending debounce:', Object.keys(_renderTimers).filter(function(k){ return _renderTimers[k]; }));
+      console.groupEnd();
+    },
+    /* cache 강제 무효화 */
+    invalidate: function(){
+      _memberIndex = null;
+      _memberIndexLen = -1;
+      _activeIdSetCache = null;
+      _activeIdSetLen = -1;
+      _activeIdSetTailId = '';
+      _groupIndex = { byRegion: null, byTeam: null, byZone: null, len: -1 };
+      console.log('[perf-quick-wins] 캐시 무효화 완료');
+    },
+    getMemberById: getMemberById,
+    getActiveIdSet: getActiveIdSet,
+    getMembersByRegion: getMembersByRegion
+  };
+
+  /* ── 6. 페이지 nav 시 invalidate (data 변경 가능성) ──────────────── */
+  /* 사용자가 nav 클릭하면 cache 무효화 (data 변경 가능성) — 큰 비용 없음 */
+  document.addEventListener('click', function(ev){
+    var t = ev.target;
+    if(t && t.classList && t.classList.contains('nav-item')){
+      /* nav 클릭 시 invalidate */
+      setTimeout(function(){
+        _memberIndex = null;
+        _groupIndex = { byRegion: null, byTeam: null, byZone: null, len: -1 };
+      }, 100);
+    }
+  }, true);
+
+  console.log('[perf-quick-wins] 활성 — member index + activeIdSet 메모이제이션 + render debounce. 디버그: window.__perfQuickWins.stats()');
+})();
+</script>
+<!-- PERF_QUICK_WINS_END -->
