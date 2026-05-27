@@ -20695,9 +20695,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   setTimeout(brutalSyncFromRegistry, 30000);
   setInterval(brutalSyncFromRegistry, 300000);
 
-  /* v7-B: brutalSync 와 함께 records 도 sync — single source of truth */
-  setTimeout(function(){ fetchAndSyncRecords({ force: true }); }, 35000);
-  setInterval(function(){ fetchAndSyncRecords({ force: true }); }, 300000);
+  /* v7-D: 별도 records sync 제거 — fetchAndSyncRecords 가 boot chain + 5분 chain 에 포함됨.
+     중복 호출 방지 (ping-pong 가능성 ↓). brutalSyncFromRegistry 는 members 만 처리. */
 
   /* ── 4. window.MEMBERS setter trap — 재할당 감지 ───────────────── */
   function installMemberTrap(){
@@ -20807,16 +20806,21 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         fetchAndSyncRecords.__firstLogged = true;
       }
 
-      /* invalidate record index (v112) — render 가 fresh data 사용 */
-      try{ if(typeof window.invalidateRecordIndex === 'function') window.invalidateRecordIndex(); }catch(e){}
+      /* v7-D: records sync 가 window.RECORDS.length=0 으로 wipe 했으므로 placeholders 도 삭제됨.
+         즉시 ensureRecordsForProtected 재실행 → 신규 가입자 placeholder 재주입.
+         이 chain 없으면 sync 후 5명 drop 즉시 재발 (사용자 보고). */
+      return ensureRecordsForProtected().then(function(reinjected){
+        /* invalidate record index (v112) — render 가 fresh data 사용 */
+        try{ if(typeof window.invalidateRecordIndex === 'function') window.invalidateRecordIndex(); }catch(e){}
 
-      /* UI 갱신 */
-      try{
-        if(typeof window.renderOverview === 'function') window.renderOverview();
-        if(typeof window.renderRegionCards === 'function') window.renderRegionCards();
-      }catch(e){}
+        /* UI 갱신 — placeholders 까지 주입 완료된 시점에 */
+        try{
+          if(typeof window.renderOverview === 'function') window.renderOverview();
+          if(typeof window.renderRegionCards === 'function') window.renderRegionCards();
+        }catch(e){}
 
-      return { before: beforeLen, after: window.RECORDS.length, added: added };
+        return { before: beforeLen, after: window.RECORDS.length, added: added, reinjected: reinjected||0 };
+      });
     }).catch(function(err){
       console.warn('[bug-2-rescue] records sync error:', err && err.message);
       return null;
@@ -20946,14 +20950,15 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   waitForFbDB(function(){
     /* setter trap 먼저 설치 (Firebase fetch 전에) */
     installMemberTrap();
-    /* 1차 fetch (members) */
-    fetchAndProtect();
-    /* v7-B: 1차 records sync — window.RECORDS 가 Step2 의 stale cache (9679) 일 수 있음 */
-    setTimeout(function(){ fetchAndSyncRecords({ force: true }); }, 5000);
-    /* v7: refresh 주기 30s → 5분 (트래픽 6배 감소). 보통 운영 중 멤버 변경 드물어서 충분. */
+    /* v7-D: 1차 fetch chain — members fetch 완료 후 records sync (placeholder 재주입 포함) */
+    fetchAndProtect().then(function(){
+      setTimeout(function(){ fetchAndSyncRecords({ force: true }); }, 3000);
+    });
+    /* v7-D: 5분 주기 chain — members → records → placeholder (순차) */
     setInterval(function(){
-      fetchAndProtect();
-      fetchAndSyncRecords({ force: true });
+      fetchAndProtect().then(function(){
+        return fetchAndSyncRecords({ force: true });
+      });
     }, 300000);
   });
 
@@ -21024,7 +21029,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[bug-2-rescue] v7-B 활성 (5s rescue + 5분 brutal sync + records sync + circuit breaker). 디버그: window.__bug2Rescue.brutalSyncNow() / syncRecordsNow() / stats()');
+  console.log('[bug-2-rescue] v7-D 활성 (records sync chain + placeholder 재주입 + circuit breaker). 디버그: window.__bug2Rescue.brutalSyncNow() / syncRecordsNow() / stats()');
 })();
 </script>
 <!-- BUG_2_BRUTE_FORCE_RESCUE_END -->
