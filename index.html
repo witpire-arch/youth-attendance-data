@@ -11730,10 +11730,21 @@ window.addEventListener('load',function(){
         var d=v112detail(last);
         return d===stf;
       }).sort(function(a,b){
-        var ca=allRecs.filter(function(r){return String(r.id||'').trim()===String(a.id).trim()&&String(r.date||'').slice(0,7)===pm;}).length;
-        var cb=allRecs.filter(function(r){return String(r.id||'').trim()===String(b.id).trim()&&String(r.date||'').slice(0,7)===pm;}).length;
-        if(cb!==ca)return cb-ca;
-        return String(a.region+a.team+a.zone+a.name).localeCompare(String(b.region+b.team+b.zone+b.name),'ko');
+        /* Part 5: 지역 → 팀-구역 오름차순 (1-1, 1-2, ..., 사랑-N) → 이름 */
+        var rA=String(a.region||''), rB=String(b.region||'');
+        var rc=rA.localeCompare(rB, 'ko');
+        if(rc !== 0) return rc;
+        function _tzKey(m){
+          var t=String(m.team||'').replace(/팀$/, '');
+          var z=String(m.zone||'').replace(/구역$/, '');
+          var tNum=parseInt(t,10), zNum=parseInt(z,10);
+          var tKey=isFinite(tNum)?String(tNum).padStart(4,'0'):('z_'+t);
+          var zKey=isFinite(zNum)?String(zNum).padStart(4,'0'):('z_'+z);
+          return tKey+'-'+zKey;
+        }
+        var tzA=_tzKey(a), tzB=_tzKey(b);
+        if(tzA !== tzB) return tzA < tzB ? -1 : 1;
+        return String(a.name||'').localeCompare(String(b.name||''),'ko');
       });
     return {data:data,mo:mo,prevMonth:pm,targets:targets};
   };
@@ -16149,7 +16160,45 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
     if(onlyTarget) list = list.filter(function(m){ return !!targets[m.id+'_habit']; });
 
-    /* count summary 갱신 — cycle 명단 기준 (snapshot + added) */
+    /* Part 5 — 정렬: 지역 → 팀-구역 (1-1, 1-2, ..., 사랑-N) → 이름 */
+    function _tzSortKey(m){
+      var t = String(m.team||'').replace(/팀$/, '');  /* '1팀' → '1', '사랑' 그대로 */
+      var z = String(m.zone||'').replace(/구역$/, ''); /* '1구역' → '1' */
+      var tNum = parseInt(t, 10);
+      var zNum = parseInt(z, 10);
+      /* 숫자 팀 우선 (000-prefix), 텍스트 팀 (사랑 등) 은 1000+ prefix */
+      var tKey = isFinite(tNum) ? String(tNum).padStart(4, '0') : ('z_' + t);
+      var zKey = isFinite(zNum) ? String(zNum).padStart(4, '0') : ('z_' + z);
+      return tKey + '-' + zKey;
+    }
+    list.sort(function(a, b){
+      var rA = String(a.region||''), rB = String(b.region||'');
+      var rc = rA.localeCompare(rB, 'ko');
+      if(rc !== 0) return rc;
+      var tzA = _tzSortKey(a), tzB = _tzSortKey(b);
+      if(tzA !== tzB) return tzA < tzB ? -1 : 1;
+      return String(a.name||'').localeCompare(String(b.name||''), 'ko');
+    });
+
+    /* Part 3 — 회복 분류 (B 방식: 시각적 표시, 명단에서 제외 안 함)
+       회복: 사이클 시작 후 모든 주일에 사유결석/결석 0 (사유출석/QR 인증 = attended) */
+    var _recoverIdSet = {};
+    var _recoveredCount = 0;
+    try{
+      var _isMemRec = (typeof window.isMemberRecovered === 'function') ? window.isMemberRecovered : null;
+      if(_isMemRec){
+        var cycleStartMo = plan.cycleStart || '';
+        var checkMo = cycleStartMo || plan.baseMonth || '';
+        list.forEach(function(m){
+          if(_isMemRec(m.id, checkMo)){
+            _recoverIdSet[m.id] = true;
+            _recoveredCount++;
+          }
+        });
+      }
+    }catch(e){}
+
+    /* count summary 갱신 — cycle 명단 기준 (snapshot + added) + 회복 카운트 */
     var sum = $('habit-count-summary');
     if(sum){
       var snapN = (plan.snapshotMembers||[]).length;
@@ -16160,11 +16209,12 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         return plan.goals && plan.goals[id] && String(plan.goals[id].monthlyGoal||'').trim();
       }).length;
       var rng = cycleRangeLabel(plan);
-      sum.style.gridTemplateColumns='repeat(3,1fr)';
+      sum.style.gridTemplateColumns='repeat(4,1fr)';
       sum.innerHTML =
-        '<div class="mc"><div class="lbl">'+rng+' 사이클 명단</div><div class="val">'+totalN+'<span style="font-size:12px">명</span></div><div class="sub">스냅샷 '+snapN+' + 추가 '+addN+' · 기준월 '+esc(plan.baseMonth)+' · 잠금 ('+fmtDate(plan.snapshotAt)+')</div></div>'+
+        '<div class="mc"><div class="lbl">'+rng+' 사이클 명단</div><div class="val">'+totalN+'<span style="font-size:12px">명</span></div><div class="sub">스냅샷 '+snapN+' + 추가 '+addN+' · 기준월 '+esc(plan.baseMonth)+'</div></div>'+
         '<div class="mc"><div class="lbl">타겟 설정</div><div class="val">'+targetCnt+'</div></div>'+
-        '<div class="mc"><div class="lbl">월목표 입력</div><div class="val">'+withGoal+'<span style="font-size:12px">/'+totalN+'</span></div></div>';
+        '<div class="mc"><div class="lbl">월목표 입력</div><div class="val">'+withGoal+'<span style="font-size:12px">/'+totalN+'</span></div></div>'+
+        '<div class="mc"><div class="lbl">회복</div><div class="val" style="color:var(--green,#2d8b3d)">'+_recoveredCount+'<span style="font-size:12px">/'+totalN+'</span></div><div class="sub">모든 주일 출석 (사유결석/결석 0)</div></div>';
     }
 
     if(!list.length){
@@ -16216,11 +16266,17 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       var srcChip = (src === 'added')
         ? ' <span style="display:inline-block;font-size:9.5px;font-weight:600;padding:1px 6px;border-radius:10px;background:var(--blue-bg,#e6eefe);color:var(--blue,#1550a0);margin-left:4px;vertical-align:middle">추가</span>'
         : '';
-      return '<tr data-pid="'+mid+'" data-src="'+src+'">'+
+      /* Part 3 — 회복 시각화: 초록 배경 row + '회복' 태그 */
+      var _isRecovered = !!_recoverIdSet[m.id];
+      var rowStyle = _isRecovered ? ' style="background:rgba(45,139,61,0.08)"' : '';
+      var recoveryChip = _isRecovered
+        ? ' <span style="display:inline-block;font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:10px;background:var(--green-bg,#e6f9ed);color:var(--green,#2d8b3d);margin-left:4px;vertical-align:middle">회복</span>'
+        : '';
+      return '<tr data-pid="'+mid+'" data-src="'+src+'"'+(_isRecovered?' data-recovered="1"':'')+rowStyle+'>'+
         '<td><input type="checkbox" '+(targets[m.id+'_habit']?'checked':'')+' onchange="toggleTarget(\''+mid+'\',\'habit\',this.checked)"></td>'+
         '<td>'+esc(m.region||'')+'</td>'+
         '<td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td>'+
-        '<td style="font-weight:700"><span style="cursor:pointer;color:var(--blue)" onclick="openHabitDetail&&openHabitDetail(\''+mid+'\',\''+esc(plan.baseMonth)+'\')">'+esc(m.name||'')+'</span>'+srcChip+'</td>'+
+        '<td style="font-weight:700"><span style="cursor:pointer;color:var(--blue)" onclick="openHabitDetail&&openHabitDetail(\''+mid+'\',\''+esc(plan.baseMonth)+'\')">'+esc(m.name||'')+'</span>'+srcChip+recoveryChip+'</td>'+
         '<td>'+badgeT+'</td>'+
         '<td>'+rsnLabel+'</td>'+
         '<td><input class="s2-goal-inp" data-pid="'+mid+'" value="'+esc(goal)+'" placeholder="월 목표" style="width:100%;padding:3px 6px;font-size:11.5px;border:1px solid var(--border-md);border-radius:var(--rsm);background:var(--surface);font-family:inherit"></td>'+
