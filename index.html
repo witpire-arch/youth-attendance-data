@@ -22278,3 +22278,154 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 })();
 </script>
 <!-- REGION_INPUT_FIX_END -->
+
+<!-- BACK_BUTTON_GUARD_START -->
+<script id="back-button-guard">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     브라우저 뒤로가기 → 앱 내 이전 페이지 이동 (사용자 요청)
+
+     문제: 월목표 입력 중 뒤로가기 누르면 외부 페이지로 나감 → 재진입 필요.
+
+     해결:
+       1) 페이지 로드 시 pushState({appPage:current}) — history 에 한 단계 추가
+       2) nav() 호출마다 pushState — 페이지 이동을 history 에 기록
+       3) popstate 이벤트 listener:
+          - state 에 appPage 가 있으면 → 그 페이지로 in-app 이동 (no push)
+          - state 가 null/no appPage 면 → 원래 동작 (사이트 외부 이동 허용)
+
+     UX:
+       - 1번 뒤로가기 → 이전 앱 페이지 (예: 보고 → 전체현황)
+       - 여러 번 뒤로가기 → 결국 외부 이동 (사용자 의도 시)
+       - 입력 중 실수로 뒤로가기 → 앱 내 안전한 페이지로 이동, 데이터 손실 없음
+     ════════════════════════════════════════════════════════════════ */
+
+  if(window.__backButtonGuardInstalled) return;
+  window.__backButtonGuardInstalled = true;
+
+  var STATE_MARKER = '_bgApp';  /* state 식별자 */
+  var _silentNav = false;       /* popstate 처리 중 nav wrap 의 pushState 방지 */
+
+  function currentActivePage(){
+    try{
+      var active = document.querySelector('.page.active');
+      if(!active) return 'overview';
+      return active.id.replace('page-', '');
+    }catch(e){ return 'overview'; }
+  }
+
+  function findNavBtn(page){
+    try{
+      var btns = document.querySelectorAll('.nav-item');
+      for(var i = 0; i < btns.length; i++){
+        var oc = btns[i].getAttribute('onclick') || '';
+        if(oc.indexOf("'" + page + "'") >= 0 || oc.indexOf('"' + page + '"') >= 0){
+          return btns[i];
+        }
+      }
+    }catch(e){}
+    return null;
+  }
+
+  /* nav() wrap — page 이동마다 pushState */
+  function wrapNav(){
+    var origNav = window.nav;
+    if(typeof origNav !== 'function') return false;
+    if(origNav.__backGuardWrapped) return true;
+
+    var wrapped = function(page, btn){
+      try{
+        if(!_silentNav){
+          var cur = history.state;
+          /* 이미 같은 페이지의 state 면 push 안 함 (중복 방지) */
+          if(!cur || cur[STATE_MARKER] !== page){
+            history.pushState({ [STATE_MARKER]: page, ts: Date.now() }, '', window.location.href);
+          }
+        }
+      }catch(e){}
+      return origNav.apply(this, arguments);
+    };
+    wrapped.__backGuardWrapped = true;
+    wrapped.__originalNav = origNav;
+    window.nav = wrapped;
+    return true;
+  }
+
+  /* popstate 핸들러 — state 가 있으면 in-app 이동, 없으면 외부 허용 */
+  window.addEventListener('popstate', function(e){
+    var s = e.state;
+    if(s && s[STATE_MARKER]){
+      /* In-app navigation — original nav 호출 (push 없이) */
+      var page = s[STATE_MARKER];
+      _silentNav = true;
+      try{
+        var origNav = (window.nav && window.nav.__originalNav) || window.nav;
+        if(typeof origNav === 'function'){
+          var btn = findNavBtn(page);
+          origNav(page, btn);
+          console.log('[back-button-guard] popstate → in-app nav:', page);
+        }
+      }catch(err){
+        console.warn('[back-button-guard] popstate nav 오류:', err);
+      } finally {
+        setTimeout(function(){ _silentNav = false; }, 50);
+      }
+    } else {
+      /* state 없음 — 사이트 외부로 가는 의도. push 다시 해서 한 단계만 잡고 다음번에 허용.
+         또는 원래 동작 유지 (이미 history 가 비었으면 어차피 외부). */
+      console.log('[back-button-guard] popstate → state 없음 (외부로 이동 시도)');
+    }
+  });
+
+  /* 초기 state 설치 — 부팅 직후 현재 페이지를 history 에 한 단계 추가 */
+  function installInitialState(){
+    try{
+      var cur = history.state;
+      if(!cur || !cur[STATE_MARKER]){
+        var page = currentActivePage();
+        /* replaceState — 현재 entry 에 state 만 추가 (URL/history 변경 없음) */
+        history.replaceState({ [STATE_MARKER]: page, ts: Date.now(), _initial: true }, '', window.location.href);
+        /* pushState 한 번 더 — 뒤로가기 시 popstate 가 위 replaceState 된 entry 로 가도록 */
+        history.pushState({ [STATE_MARKER]: page, ts: Date.now() }, '', window.location.href);
+        console.log('[back-button-guard] 초기 state 설치 — 페이지:', page);
+      }
+    }catch(e){
+      console.warn('[back-button-guard] 초기 state 설치 실패:', e);
+    }
+  }
+
+  /* 부팅 — nav 정의될 때까지 폴링 후 wrap + 초기 state */
+  function boot(){
+    if(!wrapNav()){
+      var t = 0;
+      var iv = setInterval(function(){
+        if(wrapNav() || ++t > 200) clearInterval(iv);
+      }, 100);
+    }
+    installInitialState();
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+
+  /* 디버그 API */
+  window.__backGuard = {
+    state: function(){ return history.state; },
+    rewrap: wrapNav,
+    /* 강제 in-app nav (popstate 시뮬레이션) */
+    simulate: function(page){
+      _silentNav = true;
+      try{
+        var origNav = (window.nav && window.nav.__originalNav) || window.nav;
+        if(typeof origNav === 'function') origNav(page, findNavBtn(page));
+      }finally{ setTimeout(function(){ _silentNav = false; }, 50); }
+    }
+  };
+
+  console.log('[back-button-guard] 활성 — 뒤로가기 = 이전 앱 페이지 이동');
+})();
+</script>
+<!-- BACK_BUTTON_GUARD_END -->
