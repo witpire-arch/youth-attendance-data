@@ -9428,19 +9428,65 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     patchWarningCard(c.total);
   }
   function renderReasonChart(){
-    var mo=monthValue();
+    /* 사유결석 분포 차트 fix (직접 inline 수정):
+       - 데이터 소스: monthValue()[baseMonth] + 사이클 한정 → getSundayOfWeek(selectedDate) 전체
+       - 카테고리: 하드코딩 7개 → records.rsn 동적 unique (국방의무 등 신규 포함)
+       - Chart 인스턴스 leak: mc() 외에 Chart.getChart(canvas)?.destroy() 명시 호출 */
+    var gd=document.getElementById('gb-date');
+    var dateStr=(gd&&gd.value)||new Date().toISOString().slice(0,10);
+    var sunday='';
+    try{
+      var _d=new Date(dateStr+'T00:00:00');
+      if(!isNaN(_d.getTime())){
+        _d.setDate(_d.getDate()-_d.getDay());
+        sunday=_d.getFullYear()+'-'+String(_d.getMonth()+1).padStart(2,'0')+'-'+String(_d.getDate()).padStart(2,'0');
+      }
+    }catch(e){}
+    if(!sunday) sunday=dateStr;
     var cnt={};
+    var total=0;
     records().forEach(function(r){
-      if(!r || r.st!=='사유결석' || !String(r.date||'').startsWith(mo)) return;
+      if(!r || r.st!=='사유결석') return;
+      if(String(r.date||'').slice(0,10)!==sunday) return;
       var k=reasonLabel(r.rsn, r.st); cnt[k]=(cnt[k]||0)+1;
+      total++;
     });
     var keys=Object.keys(cnt).filter(function(k){return cnt[k]>0;}).sort(function(a,b){return cnt[b]-cnt[a];});
+
+    /* 라벨/타이틀 동적 갱신 — '선택주 일요일(YYYY-MM-DD) 사유결석 분포' */
+    try{
+      var sectionNote=document.querySelector('#overview-extra-analysis .v78-note');
+      if(sectionNote && /선택/.test(sectionNote.textContent||'')){
+        sectionNote.textContent='선택주 일요일 ('+sunday+') 사유결석 분포';
+      }
+      var card=document.getElementById('c-ov-reason'); card=card&&card.closest&&card.closest('.card');
+      if(card){
+        var ct=card.querySelector('.ct');
+        if(ct) ct.textContent='사유결석 분포 — '+sunday+' (총 '+total+'건)';
+      }
+    }catch(e){}
+
     var list=document.getElementById('ov-reason-list');
-    if(list) list.innerHTML=keys.slice(0,10).map(function(k){return '<span class="v78-reason-chip">'+k+' '+cnt[k]+'</span>';}).join('') || '<span style="font-size:12px;color:var(--text3)">사유결석 데이터가 없습니다.</span>';
+    if(list) list.innerHTML=keys.length?
+      keys.slice(0,10).map(function(k){return '<span class="v78-reason-chip">'+k+' '+cnt[k]+'</span>';}).join('')
+      : '<span style="font-size:12px;color:var(--text3)">선택주 ('+sunday+') 사유결석 데이터 없음</span>';
+
+    /* Chart 인스턴스 leak 방지 — mc() 의 dc() 외에 Chart.getChart() 명시 destroy */
+    var canvas=document.getElementById('c-ov-reason');
+    try{
+      if(canvas && typeof Chart!=='undefined'){
+        var existing=Chart.getChart(canvas);
+        if(existing) existing.destroy();
+      }
+      /* 기존 패치들이 남긴 인스턴스도 정리 */
+      if(window.__v107ReasonChart){ try{window.__v107ReasonChart.destroy();}catch(_){} window.__v107ReasonChart=null; }
+      if(window.__v109ReasonChart){ try{window.__v109ReasonChart.destroy();}catch(_){} window.__v109ReasonChart=null; }
+    }catch(e){}
+
     try{
       if(typeof mc==='function'){
-        var colors=(typeof RSN_CLR!=='undefined'&&Array.isArray(RSN_CLR))?RSN_CLR:['#a01e1e','#d45','#e67','#c77','#999'];
-        mc('c-ov-reason',{type:'bar',data:{labels:keys,datasets:[{data:keys.map(function(k){return cnt[k];}),backgroundColor:colors.slice(0,keys.length),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{stepSize:1}}}}});
+        var colors=(typeof RSN_CLR!=='undefined'&&Array.isArray(RSN_CLR))?RSN_CLR:['#a01e1e','#d4533a','#e67e22','#c77f1f','#7a4608','#999a8e','#7cc4ee','#1550a0','#6a3aaa','#2a8c4a'];
+        mc('c-ov-reason',{type:'bar',data:{labels:keys,datasets:[{data:keys.map(function(k){return cnt[k];}),backgroundColor:keys.map(function(_,i){return colors[i%colors.length];}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{stepSize:1,precision:0}}}}});
       }
     }catch(e){ console.error('overview reason chart error', e); }
   }
@@ -11636,13 +11682,57 @@ window.addEventListener('load',function(){
     if(hg && window.currentHabitDetail && window.currentHabitDetail.id===id) hg.value=plans[id].goal;
   };
   function renderOverviewReasonColorFix(){
+    /* 사유결석 분포 차트 — selectedDate 의 주 일요일 기준 데이터로 그리는 V112 패치.
+       이전: globalMonth 한정 (월 단위) + 별도 __v109ReasonChart 인스턴스 → c-ov-reason 에
+             다른 함수와 중복 인스턴스 생성. 라벨도 'baseMonth 사이클 한정' 의미와 일치 안 함.
+       지금: getSundayOfWeek(gb-date) 기준 + Chart.getChart() 명시 destroy. */
     var root=document.getElementById('overview-extra-analysis'); if(!root) return;
-    var mo=(clean(document.getElementById('globalMonth')&&document.getElementById('globalMonth').value)||curDate().slice(0,7)).slice(0,7), cnt={};
-    recs().forEach(function(r){ if(nd(r.date).slice(0,7)!==mo||clean(r.st)!=='사유결석')return; var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'사유없음'; cnt[k]=(cnt[k]||0)+1; });
+    var gd=document.getElementById('gb-date');
+    var dateStr=(gd&&gd.value)||curDate();
+    var sunday='';
+    try{
+      var _d=new Date(String(dateStr).slice(0,10)+'T00:00:00');
+      if(!isNaN(_d.getTime())){
+        _d.setDate(_d.getDate()-_d.getDay());
+        sunday=_d.getFullYear()+'-'+String(_d.getMonth()+1).padStart(2,'0')+'-'+String(_d.getDate()).padStart(2,'0');
+      }
+    }catch(e){}
+    if(!sunday) sunday=String(dateStr).slice(0,10);
+
+    var cnt={}, total=0;
+    recs().forEach(function(r){
+      if(!r) return;
+      if(clean(r.st)!=='사유결석') return;
+      if(nd(r.date).slice(0,10)!==sunday) return;
+      var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'사유없음';
+      cnt[k]=(cnt[k]||0)+1; total++;
+    });
     var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];});
+
+    /* 라벨/타이틀 동적 */
+    try{
+      var sectionNote=document.querySelector('#overview-extra-analysis .v78-note');
+      if(sectionNote && /선택/.test(sectionNote.textContent||'')){
+        sectionNote.textContent='선택주 일요일 ('+sunday+') 사유결석 분포';
+      }
+      var card=document.getElementById('c-ov-reason'); card=card&&card.closest&&card.closest('.card');
+      if(card){
+        var ct=card.querySelector('.ct');
+        if(ct) ct.textContent='사유결석 분포 — '+sunday+' (총 '+total+'건)';
+      }
+    }catch(e){}
+
     var canvas=document.getElementById('c-ov-reason'); if(!canvas||!window.Chart) return;
     var colors=['#7cc4ee','#f3a35c','#79c36a','#b89be8','#f0788f','#f2cf5b','#6fc7c5','#c9a27e','#9fb7f1','#d78ad7'];
-    safe(function(){ if(window.__v107ReasonChart)window.__v107ReasonChart.destroy(); if(window.__v109ReasonChart)window.__v109ReasonChart.destroy(); window.__v109ReasonChart=new Chart(canvas,{type:'bar',data:{labels:keys,datasets:[{label:'사유결석',data:keys.map(function(k){return cnt[k];}),backgroundColor:keys.map(function(_,i){return colors[i%colors.length];}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}}); },null);
+    safe(function(){
+      /* Chart 인스턴스 leak 방지 — 모든 가능한 ref 정리 */
+      try{ var existing=Chart.getChart(canvas); if(existing) existing.destroy(); }catch(_){}
+      if(window.__v107ReasonChart){ try{window.__v107ReasonChart.destroy();}catch(_){} window.__v107ReasonChart=null; }
+      if(window.__v109ReasonChart){ try{window.__v109ReasonChart.destroy();}catch(_){} window.__v109ReasonChart=null; }
+      try{ if(typeof CI!=='undefined' && CI && CI['c-ov-reason']){ CI['c-ov-reason'].destroy(); CI['c-ov-reason']=null; } }catch(_){}
+      if(!keys.length) return; /* 데이터 없으면 빈 chart 생성 안 함 */
+      window.__v109ReasonChart=new Chart(canvas,{type:'bar',data:{labels:keys,datasets:[{label:'사유결석',data:keys.map(function(k){return cnt[k];}),backgroundColor:keys.map(function(_,i){return colors[i%colors.length];}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});
+    },null);
   }
   /* V112 renderOverview override disabled */
   function boot(){ 
