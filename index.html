@@ -9445,12 +9445,23 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
     if(!sunday) sunday=dateStr;
     var cnt={};
     var total=0;
-    /* v3: records() lexical 우회 — window.RECORDS 직접 사용 (lexical 이 stale 일 수 있음) */
-    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
-    for(var __i=0; __i<allRecs.length; __i++){
-      var r=allRecs[__i];
-      if(!r || r.st!=='사유결석') continue;
-      if(String(r.date||'').slice(0,10)!==sunday) continue;
+    /* v4: union of all sources dedupe by id (한지은 등 bug-2 drop5 멤버 포함 보장) */
+    var _seen={}, _unionForDate=[];
+    function _addSrc(arr){
+      if(!Array.isArray(arr)) return;
+      for(var __j=0; __j<arr.length; __j++){
+        var __r=arr[__j]; if(!__r) continue;
+        if(String(__r.date||'').slice(0,10)!==sunday) continue;
+        var __id=String(__r.id||'').trim();
+        if(__id && !_seen[__id]){ _seen[__id]=1; _unionForDate.push(__r); }
+      }
+    }
+    try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) _addSrc(RECORDS); }catch(e){}
+    _addSrc(window.RECORDS);
+    _addSrc(window.FINAL_RECORDS);
+    for(var __i=0; __i<_unionForDate.length; __i++){
+      var r=_unionForDate[__i];
+      if(r.st!=='사유결석') continue;
       var k=reasonLabel(r.rsn, r.st); cnt[k]=(cnt[k]||0)+1;
       total++;
     }
@@ -11001,21 +11012,38 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
       }
     }catch(e){}
     if(!sunday) sunday=String(dateStr).slice(0,10);
-    /* 데이터 source: window.RECORDS 직접 (lexical recs() 우회 — stale 캐시 회피) */
-    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
+    /* v4: union of (lexical RECORDS, window.RECORDS, window.FINAL_RECORDS) dedupe by id.
+       이전 (v3): window.RECORDS 만 사용 → bug-2 drop5 멤버 (한지은 등) 누락 → 248 표시.
+       이제: ov-rebuild 와 동일한 pickRichest 패턴 — 가장 풍부한 source 자동 선택.
+       카드 (lexical RECORDS, 249) 와 차트 (이전 window.RECORDS, 248) 의 1명 차이 해소. */
+    var _seen={}, _unionForDate=[];
+    function _addSource(arr){
+      if(!Array.isArray(arr)) return;
+      for(var __i=0; __i<arr.length; __i++){
+        var __r=arr[__i];
+        if(!__r) continue;
+        if(String(__r.date||'').slice(0,10)!==sunday) continue;
+        var __id=String(__r.id||'').trim();
+        if(__id && !_seen[__id]){ _seen[__id]=1; _unionForDate.push(__r); }
+      }
+    }
+    /* lexical RECORDS 우선 (ov-rebuild 와 동일) */
+    try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) _addSource(RECORDS); }catch(e){}
+    _addSource(window.RECORDS);
+    _addSource(window.FINAL_RECORDS);
+
     var cnt={}, total=0;
-    for(var i=0;i<allRecs.length;i++){
-      var r=allRecs[i];
-      if(!r) continue;
+    for(var i=0; i<_unionForDate.length; i++){
+      var r=_unionForDate[i];
       if(clean(r.st)!=='사유결석') continue;
-      if(String(r.date||'').slice(0,10)!==sunday) continue;
       var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'(미입력)';
       cnt[k]=(cnt[k]||0)+1; total++;
     }
     var keys=Object.keys(cnt).sort(function(a,b){return cnt[b]-cnt[a];});
 
     if(_diagLog){
-      console.log('[reason-chart-diag] V107 call #' + renderOverviewReason.__diagCount + ': sunday=' + sunday + ', window.RECORDS.length=' + allRecs.length + ', filtered=' + total + ', keys=' + keys.length);
+      var _lexLen = 0; try{ _lexLen = (typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) ? RECORDS.length : 0; }catch(e){}
+      console.log('[reason-chart-diag] V107 call #' + renderOverviewReason.__diagCount + ': sunday=' + sunday + ', union=' + _unionForDate.length + ' (lex=' + _lexLen + ', win=' + (window.RECORDS||[]).length + ', final=' + (window.FINAL_RECORDS||[]).length + '), 사유결석=' + total + ', keys=' + keys.length);
     }
     root.innerHTML='<div class="v78-section-title">결석사유 분석 <span class="v78-note">선택주 일요일 ('+esc(sunday)+') 사유결석 분포</span></div><div class="card"><div class="ct">사유결석 분포 — '+esc(sunday)+' (총 '+total+'건)</div><div style="position:relative;height:210px"><canvas id="c-ov-reason">사유결석 분포</canvas></div><div id="ov-reason-list" class="v78-reason-list">'+(keys.length?keys.slice(0,10).map(function(k){return '<span class="v78-reason-chip">'+esc(k)+' '+cnt[k]+'</span>';}).join(''):'<span style="font-size:12px;color:var(--text3)">선택주 ('+esc(sunday)+') 사유결석 데이터 없음</span>')+'</div></div>';
     safe(function(){
@@ -11761,13 +11789,23 @@ window.addEventListener('load',function(){
     if(!sunday) sunday=String(dateStr).slice(0,10);
 
     var cnt={}, total=0;
-    /* v3: recs() lexical 우회 — window.RECORDS 직접 사용 */
-    var allRecs=Array.isArray(window.RECORDS)?window.RECORDS:[];
-    for(var __i=0; __i<allRecs.length; __i++){
-      var r=allRecs[__i];
-      if(!r) continue;
+    /* v4: union of all sources dedupe by id (bug-2 drop5 멤버 포함) */
+    var _seen={}, _unionForDate=[];
+    function _addSrc(arr){
+      if(!Array.isArray(arr)) return;
+      for(var __j=0; __j<arr.length; __j++){
+        var __r=arr[__j]; if(!__r) continue;
+        if(nd(__r.date).slice(0,10)!==sunday) continue;
+        var __id=String(__r.id||'').trim();
+        if(__id && !_seen[__id]){ _seen[__id]=1; _unionForDate.push(__r); }
+      }
+    }
+    try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) _addSrc(RECORDS); }catch(e){}
+    _addSrc(window.RECORDS);
+    _addSrc(window.FINAL_RECORDS);
+    for(var __i=0; __i<_unionForDate.length; __i++){
+      var r=_unionForDate[__i];
       if(clean(r.st)!=='사유결석') continue;
-      if(nd(r.date).slice(0,10)!==sunday) continue;
       var k=clean((typeof reasonDisplayLabel==='function'?reasonDisplayLabel(r.rsn,r.st):r.rsn))||'사유없음';
       cnt[k]=(cnt[k]||0)+1; total++;
     }
@@ -23129,14 +23167,29 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     if(!canvas || typeof Chart === 'undefined') return;
 
     var sunday = currentSunday();
-    var recs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
     var cnt = {};
     var total = 0;
 
-    for(var i = 0; i < recs.length; i++){
-      var r = recs[i];
-      if(!r || r.st !== '사유결석') continue;
-      if(String(r.date || '').slice(0,10) !== sunday) continue;
+    /* v4: union of (lexical RECORDS, window.RECORDS, window.FINAL_RECORDS) dedupe by id.
+       bug-2 drop5 멤버 (한지은 등) 가 window.RECORDS 에서만 누락된 케이스 보완.
+       카드의 ov-rebuild 와 동일한 union 패턴으로 mismatch 해소. */
+    var _seen = {}, _union = [];
+    function _addSrc(arr){
+      if(!Array.isArray(arr)) return;
+      for(var __j = 0; __j < arr.length; __j++){
+        var __r = arr[__j]; if(!__r) continue;
+        if(String(__r.date||'').slice(0,10) !== sunday) continue;
+        var __id = String(__r.id||'').trim();
+        if(__id && !_seen[__id]){ _seen[__id] = 1; _union.push(__r); }
+      }
+    }
+    try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) _addSrc(RECORDS); }catch(e){}
+    _addSrc(window.RECORDS);
+    _addSrc(window.FINAL_RECORDS);
+
+    for(var i = 0; i < _union.length; i++){
+      var r = _union[i];
+      if(r.st !== '사유결석') continue;
       var k = rsnLabel(r);
       cnt[k] = (cnt[k] || 0) + 1;
       total++;
