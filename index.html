@@ -20606,9 +20606,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     _lastMembersSnapshot = current;
     _lastMembersLength = currentLen;
   }
-  setInterval(detectChanges, 100);
+  /* v7: detectChanges 주기 100ms → 10s (정상 운영에선 stats 만 필요, 진단 시 verbose() 토글) */
+  setInterval(detectChanges, 10000);
 
-  /* 30초마다 누적 stats 요약 1줄 */
+  /* 30초마다 누적 stats 요약 1줄 (변경 있을 때만) */
   setInterval(function(){
     if(_stats.dropCount > 0 || _stats.rescueCount > 0){
       console.log('[bug-2-stats] 누적 drop ' + _stats.dropCount + '회 / rescue ' + _stats.rescueCount + '회 (지난 30초). 현재 MEMBERS=' + (window.MEMBERS||[]).length);
@@ -20617,12 +20618,22 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   }, 30000);
 
-  /* ── 3. Brute force rescue — protected 멤버가 없으면 push (v5: render 미트리거) ── */
-  /* v5 핵심: scheduleRender 제거. render 호출이 applyActiveFilter 를 트리거 →
-     window.RECORDS 에 없는 멤버 drop → 무한 cycle 발생 (1.5초 주기).
-     대신 window.RECORDS 에 record 가 있으면 render 도 drop 안 함 (근본 fix).
-     UI 는 다른 render trigger (사용자 클릭, onValue, 페이지 전환) 에서 자동 반영. */
+  /* ── 3. Single source of truth — brutal sync (v7) ────────────────
+     이전 구조: 100ms detect + 200ms rescue = ping-pong (drop 10/30s + rescue 40/30s).
+     v7: 5분마다 window.MEMBERS = FB registry 통째 교체. diff 로직 제거.
+     사이클이 발생할 수 없는 deterministic sync. */
+
+  var _pauseUntil = 0;  /* circuit breaker timestamp */
+
   function ensureProtected(){
+    /* Circuit breaker: 과다 rescue 감지 시 pause */
+    if(Date.now() < _pauseUntil) return;
+    if(_stats.rescueCount > 50){
+      console.warn('[bug-2-rescue] ⚠️ rescue 폭주 감지 (' + _stats.rescueCount + '회/30s) — 60초 pause');
+      _pauseUntil = Date.now() + 60000;
+      return;
+    }
+
     if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
     var memIds = {};
     window.MEMBERS.forEach(function(m){ if(m && m.id) memIds[clean(m.id)] = true; });
@@ -20639,18 +20650,49 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       try{ if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)) MEMBERS.push(_protectedMembers[id]); }catch(e){}
     });
     _stats.rescueCount += missing.length;
-    /* v5: 첫 1회만 verbose, 이후 stats 누적 */
     if(!ensureProtected.__firstLogged){
-      console.log('[bug-2-rescue] ' + missing.length + '명 brute-force 재추가:', missing.slice(0, 5).map(function(id){ return _protectedMembers[id].name + '(' + id + ')'; }));
+      console.log('[bug-2-rescue] ' + missing.length + '명 brute-force 재추가 (이후 stats 만):', missing.slice(0, 5).map(function(id){ return _protectedMembers[id].name + '(' + id + ')'; }));
       ensureProtected.__firstLogged = true;
     }
-    /* LS 갱신 */
     try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
-    /* v5: scheduleRender 제거 — render 호출이 applyActiveFilter 트리거하여 cycle 유발.
-       window.RECORDS 가 fetchAndProtect 단계에서 보강되었으므로 다음 render 에서도 drop 안 함. */
   }
 
-  setInterval(ensureProtected, 200);
+  /* v7: 폴링 주기 200ms → 5s. ping-pong 가능 빈도 5배 감소. */
+  setInterval(ensureProtected, 5000);
+
+  /* v7: Brutal sync — 5분마다 window.MEMBERS = FB registry 통째 (single source of truth).
+     diff 로직 없이 deterministic 결정. 모든 stale field / phantom / drop 일거에 해결. */
+  function brutalSyncFromRegistry(){
+    if(!Object.keys(_protectedMembers).length) return;
+    if(!Array.isArray(window.MEMBERS)) window.MEMBERS = [];
+    var ids = Object.keys(_protectedMembers).sort();
+    /* in-place replace — array reference 유지 */
+    window.MEMBERS.length = 0;
+    ids.forEach(function(id){ window.MEMBERS.push(_protectedMembers[id]); });
+    /* lexical MEMBERS 동기 */
+    try{
+      if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
+        MEMBERS.length = 0;
+        ids.forEach(function(id){ MEMBERS.push(_protectedMembers[id]); });
+      }
+    }catch(e){}
+    /* FINAL_MEMBERS 동기 */
+    try{
+      if(Array.isArray(window.FINAL_MEMBERS)){
+        window.FINAL_MEMBERS.length = 0;
+        ids.forEach(function(id){ window.FINAL_MEMBERS.push(_protectedMembers[id]); });
+      }
+    }catch(e){}
+    /* LS 갱신 */
+    try{ localStorage.setItem('att_members_v1', JSON.stringify(window.MEMBERS)); }catch(e){}
+    if(!brutalSyncFromRegistry.__firstLogged){
+      console.log('[bug-2-rescue] 🔒 brutal sync: window.MEMBERS = FB registry (' + ids.length + '명). 이후 5분마다 자동.');
+      brutalSyncFromRegistry.__firstLogged = true;
+    }
+  }
+  /* 부팅 후 30초 첫 brutal sync (FB fetch 완료 후), 이후 5분마다 */
+  setTimeout(brutalSyncFromRegistry, 30000);
+  setInterval(brutalSyncFromRegistry, 300000);
 
   /* ── 4. window.MEMBERS setter trap — 재할당 감지 ───────────────── */
   function installMemberTrap(){
@@ -20799,13 +20841,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     installMemberTrap();
     /* 1차 fetch */
     fetchAndProtect();
-    /* 30초 주기 refresh — 처음 10분간 */
-    var refreshN = 0;
-    var refreshIv = setInterval(function(){
-      refreshN++;
-      if(refreshN > 20){ clearInterval(refreshIv); return; }
-      fetchAndProtect();
-    }, 30000);
+    /* v7: refresh 주기 30s → 5분 (트래픽 6배 감소). 보통 운영 중 멤버 변경 드물어서 충분. */
+    setInterval(function(){ fetchAndProtect(); }, 300000);
   });
 
   /* ── 6. 디버그 API ─────────────────────────────────────────────── */
@@ -20836,6 +20873,16 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     forceFetch: fetchAndProtect,
     forceRescue: ensureProtected,
     ensureRecordsNow: ensureRecordsForProtected,
+    /* v7: 수동 brutal sync — window.MEMBERS = FB registry 강제 적용 */
+    brutalSyncNow: function(){
+      console.log('[bug-2-rescue] 수동 brutal sync 시작...');
+      brutalSyncFromRegistry.__firstLogged = false;
+      brutalSyncFromRegistry();
+      /* UI 갱신 */
+      try{ if(typeof window.renderOverview === 'function') window.renderOverview(); }catch(e){}
+      try{ if(typeof window.renderRegionCards === 'function') window.renderRegionCards(); }catch(e){}
+      return window.MEMBERS.length;
+    },
     stats: function(){
       console.log('[bug-2-rescue] stats:', _stats);
       return _stats;
@@ -20856,7 +20903,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   };
 
-  console.log('[bug-2-rescue] v5 활성 (cycle 차단 + records inject + 로그 throttle). 디버그: window.__bug2Rescue');
+  console.log('[bug-2-rescue] v7 활성 (5s rescue + 5분 brutal sync + circuit breaker). 디버그: window.__bug2Rescue.brutalSyncNow() / stats()');
 })();
 </script>
 <!-- BUG_2_BRUTE_FORCE_RESCUE_END -->
