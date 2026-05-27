@@ -16225,42 +16225,60 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       var mid = esc(m.id);
       var goal = (plan.goals[m.id] && plan.goals[m.id].monthlyGoal) || '';
       var badgeT = (typeof badgeType === 'function') ? badgeType(m.type) : esc(m.type||'');
-      /* 작업 2-fix (phase2.0b + 0c): V112 의 detailFull 우선 호출 (st badge + rsn 괄호 형식, 일반 모드와 동일).
-         phase2.0b: window.detailFull / latestPrevRec export 로 함수 호출 가능하게.
-         phase2.0c: month 인자 의미 정정 — latestPrevRec(id, mo) 는 prevMonth(mo) 기록을 반환하므로,
-                    plan.baseMonth (이미 전월) 를 넘기면 두 달 전 lookup 이 됨. selectedHabitMonth() 또는
-                    nextMonth(baseMonth) 를 넘겨야 V112 normal 모드와 동일한 의미가 됨. */
-      var rsnLabel = '—';
+      /* 출석유형 컬럼 fix (사용자 요청):
+         이전: latestPrevRec(id, viewMo) — habit-month dropdown 의 prevMonth 마지막 일요일
+               → 사이클 baseMonth 4월의 4/26 데이터 표시 (실제 5월 데이터 무시)
+         변경: getSundayOfWeek(gb-date) — selectedDate 의 주 일요일 record
+               → 명단 + 차트 동일 source 일관성
+         fallback: 해당 일요일 record 없으면 '기록 없음' (이전 '—' 대신 명시) */
+      var rsnLabel = '<span style="color:var(--text3)">기록 없음</span>';
       try{
-        var _lpr = (typeof window.latestPrevRec === 'function') ? window.latestPrevRec
-                 : (typeof latestPrevRec === 'function' ? latestPrevRec : null);
-        var _df  = (typeof window.detailFull === 'function') ? window.detailFull : null;
-        var _det = (typeof window.detail === 'function') ? window.detail
-                 : (typeof detail === 'function' ? detail : null);
-        var _db  = (typeof window.detailBadge === 'function') ? window.detailBadge
-                 : (typeof detailBadge === 'function' ? detailBadge : null);
-        var _shm = (typeof window.selectedHabitMonth === 'function') ? window.selectedHabitMonth : null;
-        /* viewMo 결정: dropdown 의 viewing month > nextMonth(baseMonth) fallback > baseMonth 마지막 fallback */
-        var viewMo = _shm ? _shm() : (function(){
-          var bm = plan.baseMonth || '';
-          if(!bm) return '';
-          var yy=+bm.slice(0,4), mm=+bm.slice(5,7)+1;
-          if(mm>12){ yy++; mm=1; }
-          return yy + '-' + String(mm).padStart(2,'0');
-        })();
-        if(!viewMo) viewMo = plan.baseMonth || '';
-        if(_lpr && viewMo){
-          var r = _lpr(m.id, viewMo);
-          /* phase2.0c 진단 로그: 첫 1행만 출력 (스팸 방지). 검증 후 제거 예정. */
-          if(!window.__phase2c_logged){
-            window.__phase2c_logged = true;
-            try{ console.log('[phase2.0c-diag] cycle render — id=', m.id, 'name=', m.name,
-              'viewMo=', viewMo, 'plan.baseMonth=', plan.baseMonth, 'r=', r); }catch(_){}
+        var _df = (typeof window.detailFull === 'function') ? window.detailFull : null;
+        var _det = (typeof window.detail === 'function') ? window.detail : null;
+        var _db = (typeof window.detailBadge === 'function') ? window.detailBadge : null;
+        /* selectedDate 주 일요일 — chart fix 의 getSundayOfWeek 헬퍼 재활용 */
+        var _gd = document.getElementById('gb-date');
+        var _dateStr = (_gd && _gd.value) || new Date().toISOString().slice(0,10);
+        var _sunday = '';
+        try{
+          if(typeof window.getSundayOfWeek === 'function'){
+            _sunday = window.getSundayOfWeek(_dateStr);
+          } else {
+            var _d = new Date(String(_dateStr).slice(0,10) + 'T00:00:00');
+            if(!isNaN(_d.getTime())){
+              _d.setDate(_d.getDate() - _d.getDay());
+              _sunday = _d.getFullYear() + '-' + String(_d.getMonth()+1).padStart(2,'0') + '-' + String(_d.getDate()).padStart(2,'0');
+            }
           }
-          if(_df){ rsnLabel = _df(r); }
-          else if(_det && _db){ rsnLabel = _db(_det(r)); }
+        }catch(_){}
+        if(!_sunday) _sunday = String(_dateStr).slice(0,10);
+        /* union of (lexical RECORDS, window.RECORDS, window.FINAL_RECORDS) dedupe by id — 차트 fix 와 동일 */
+        var _r = null;
+        try{
+          if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)){
+            for(var __i=0; __i<RECORDS.length; __i++){
+              var __r=RECORDS[__i];
+              if(__r && __r.id === m.id && String(__r.date||'').slice(0,10) === _sunday){ _r = __r; break; }
+            }
+          }
+        }catch(_){}
+        if(!_r && Array.isArray(window.RECORDS)){
+          for(var __i2=0; __i2<window.RECORDS.length; __i2++){
+            var __r2=window.RECORDS[__i2];
+            if(__r2 && __r2.id === m.id && String(__r2.date||'').slice(0,10) === _sunday){ _r = __r2; break; }
+          }
         }
-      }catch(e){ try{ console.warn('[stage2-detailFull]', m.id, e); }catch(_){} }
+        if(!_r && Array.isArray(window.FINAL_RECORDS)){
+          for(var __i3=0; __i3<window.FINAL_RECORDS.length; __i3++){
+            var __r3=window.FINAL_RECORDS[__i3];
+            if(__r3 && __r3.id === m.id && String(__r3.date||'').slice(0,10) === _sunday){ _r = __r3; break; }
+          }
+        }
+        if(_r){
+          if(_df){ rsnLabel = _df(_r); }
+          else if(_det && _db){ rsnLabel = _db(_det(_r)); }
+        }
+      }catch(e){ try{ console.warn('[stage2-cycle-rsn]', m.id, e); }catch(_){} }
       /* 출처 배지 — snapshot 은 무표시, added 만 명시 */
       var src = sourceById[m.id];
       var srcChip = (src === 'added')
@@ -16329,10 +16347,10 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     }
   }, true);
 
-  /* habit-month / habit-year 변경 감지 */
+  /* habit-month / habit-year / gb-date 변경 감지 — 출석유형 컬럼 재렌더 트리거 추가 */
   document.addEventListener('change', function(ev){
     var t = ev.target;
-    if(t && (t.id === 'habit-month' || t.id === 'habit-year')){
+    if(t && (t.id === 'habit-month' || t.id === 'habit-year' || t.id === 'gb-date')){
       setTimeout(function(){ try{ refreshUI(); }catch(e){} }, 50);
     }
   }, true);
