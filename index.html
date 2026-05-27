@@ -11021,14 +11021,16 @@ function getDeltaInfo(){
   function st(d,s){return recs.filter(function(r){return String(r.date).slice(0,10)===d&&ids.has(r.id)&&r.st===s;}).length;}
   function total(d){return recs.filter(function(r){return String(r.date).slice(0,10)===d&&ids.has(r.id);}).length;}
   var ct=total(cur),pt=total(prev);
-  /* Partial data guard: 양쪽 모두 ≥ 70% coverage 필요 */
+  /* Partial data guard: 양쪽 모두 ≥ 95% coverage 필요 (v7-C: 70% → 95% upgrade)
+     사용자 보고: 성북 5/17 partial (92.6%) 케이스 — 70% 임계값으로 통과해서 -22.3% 표시됐음.
+     95% 로 올려서 partial 데이터로 인한 100% 오인식 차단. */
   if(totalMembers > 0){
     var curCoverage = ct / totalMembers;
     var prevCoverage = pt / totalMembers;
-    if(curCoverage < 0.7 || prevCoverage < 0.7){
+    if(curCoverage < 0.95 || prevCoverage < 0.95){
       if(!getDeltaInfo.__warnLogged){
         getDeltaInfo.__warnLogged = true;
-        console.warn('[delta-info] 전주대비 생략: cur(' + cur + ')=' + Math.round(curCoverage*100) + '%, prev(' + prev + ')=' + Math.round(prevCoverage*100) + '% (≥70% 필요)');
+        console.warn('[delta-info] 전주대비 생략: cur(' + cur + ')=' + Math.round(curCoverage*100) + '%, prev(' + prev + ')=' + Math.round(prevCoverage*100) + '% (≥95% 필요)');
       }
       return null;
     }
@@ -11103,16 +11105,15 @@ function getDeltaByRegion(){
     }
     var c=rateInfo(cur),p=rateInfo(prev);
     if(!c||!p) return;
-    /* Partial data guard: 양쪽 모두 ≥ 70% coverage 필요. 5/17 의 성북 partial 케이스 차단. */
-    if(c.coverage < 0.7 || p.coverage < 0.7){
-      /* 진단 로그 — 첫 1회만 */
+    /* v7-C: Partial data guard 70% → 95%. 92.6% partial 케이스 차단 (성북 5/17 case). */
+    if(c.coverage < 0.95 || p.coverage < 0.95){
       if(!getDeltaByRegion.__warnLogged){
         getDeltaByRegion.__warnLogged = {};
       }
       var wk = reg + '_' + cur + '_' + prev;
       if(!getDeltaByRegion.__warnLogged[wk]){
         getDeltaByRegion.__warnLogged[wk] = true;
-        console.warn('[delta-by-region] ' + reg + ' delta 생략: cur(' + cur + ')=' + Math.round(c.coverage*100) + '%, prev(' + prev + ')=' + Math.round(p.coverage*100) + '% (≥70% 필요)');
+        console.warn('[delta-by-region] ' + reg + ' delta 생략: cur(' + cur + ')=' + Math.round(c.coverage*100) + '%, prev(' + prev + ')=' + Math.round(p.coverage*100) + '% (≥95% 필요)');
       }
       return;
     }
@@ -20872,14 +20873,40 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
     return Promise.all(fetches).then(function(results){
       var totalAdded = results.reduce(function(s, r){ return s + r.added; }, 0);
-      if(totalAdded > 0){
-        console.log('[bug-2-rescue] ✅ window.RECORDS 에 ' + totalAdded + '건 record inject 완료 (' + orphanIds.length + '명 — drop cycle 차단).');
-        /* LS records 도 갱신 */
+      /* v7-C: FB 에도 record 없는 멤버 (예: 신규 가입자) 에게 synthetic placeholder 주입.
+         이유: applyActiveFilter (line 16935) 가 window.RECORDS 에 record 없는 멤버를
+         자동 drop 시킴. 신규 가입자는 record 가 없어서 카운트에서 누락됨 (1621 → 1616).
+         placeholder 는 date='2020-01-01', st='' 이라 stats 영향 없음 (월 필터 + st 필터 모두 제외). */
+      var placeholderInjected = 0;
+      results.forEach(function(r){
+        if(r.added === 0){
+          var member = _protectedMembers[r.id];
+          if(member){
+            /* placeholder 가 이미 있는지 확인 (중복 방지) */
+            var hasPlaceholder = window.RECORDS.some(function(x){ return x && x.id === member.id && x._bug2Placeholder; });
+            if(!hasPlaceholder){
+              var placeholder = {
+                id: member.id,
+                date: '2020-01-01',  /* 과거 — 현재 월/주 stats 제외 */
+                wk: 1, day: '일',
+                st: '', rsn: '_bug2-placeholder', streak: 0,
+                _bug2Placeholder: true
+              };
+              window.RECORDS.push(placeholder);
+              try{ if(typeof RECORDS !== 'undefined' && Array.isArray(RECORDS)) RECORDS.push(placeholder); }catch(e){}
+              placeholderInjected++;
+            }
+          }
+        }
+      });
+      if(totalAdded > 0 || placeholderInjected > 0){
+        var msg = '[bug-2-rescue] ✅ window.RECORDS 보강:';
+        if(totalAdded > 0) msg += ' FB record ' + totalAdded + '건 inject';
+        if(placeholderInjected > 0) msg += (totalAdded ? ',' : '') + ' synthetic placeholder ' + placeholderInjected + '명 (신규 가입자, stats 무영향)';
+        console.log(msg + ' — drop cycle 차단.');
         try{ localStorage.setItem('att_records_v1', JSON.stringify(window.RECORDS)); }catch(e){}
-      } else if(orphanIds.length > 0){
-        console.warn('[bug-2-rescue] ⚠️ orphan ' + orphanIds.length + '명 의 record 가 Firebase 에도 없음 — 진짜 record 없는 회원으로 간주');
       }
-      return totalAdded;
+      return totalAdded + placeholderInjected;
     });
   }
 
