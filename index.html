@@ -2131,8 +2131,17 @@ async function bulkSave(members, records) {
     const rObj = {};
     records.forEach(r => {
       const key = r.id.replace(/[.#$\[\]]/g, '_') + '_' + r.date;
+      /* Stage 2 fix (안전망 2nd layer): bulkSave 단계 sanitization.
+         CSV 매핑 단계 1차 fix 우회 경로 (예: 수동 record 조작, 다른 import 함수) 대비.
+         QR인증 → rsn='', streak=0 강제. */
+      let _rsn = r.rsn || '';
+      let _streak = r.streak || 0;
+      if(r.st === 'QR인증'){
+        _rsn = '';
+        _streak = 0;
+      }
       rObj[key] = { id:r.id, date:r.date, wk:r.wk||1, day:r.day||'일',
-                    st:r.st, rsn:r.rsn||'', streak:r.streak||0 };
+                    st:r.st, rsn:_rsn, streak:_streak };
     });
 
     await Promise.all([
@@ -3771,9 +3780,19 @@ function handleUpload(e){
         const pickedReason = pickReasonFromRow(row, rawSt.replace(/\s+/g,''));
         const normalized = normalizeWorshipRecordStatus(rawSt, pickedReason);
         const st = normalized.st;
-        const rsn = normalized.rsn;
-        const streakRaw = String(row['연속결석횟수']||row['연속결석']||'0').trim();
-        const streak = isNaN(parseInt(streakRaw))?0:parseInt(streakRaw);
+        /* Stage 2 fix (CSV → record 정규화): QR인증 row 강제 정규화 — rsn='', streak=0.
+           원인: 원본 CSV 의 QR인증 row 가 rsn='QR인증' / streak>0 으로 오염되어 있음 (5/17, 5/24 케이스).
+                CSV → records 매핑이 무비판적으로 그대로 저장 → Firebase 오염.
+           해결: QR인증은 사유/연속결석 의미 없음 → CSV 값 무시, 강제 ''/0. */
+        let rsn, streak;
+        if(st === 'QR인증'){
+          rsn = '';
+          streak = 0;
+        } else {
+          rsn = normalized.rsn;
+          const streakRaw = String(row['연속결석횟수']||row['연속결석']||'0').trim();
+          streak = isNaN(parseInt(streakRaw))?0:parseInt(streakRaw);
+        }
         /* task-8 CSV date 버그 fix: 날짜 컬럼명 확장 — '날짜' 만으로는 부족.
            이전 버그: 컬럼명 mismatch 시 today's date 로 fallback → 5/24 CSV 가 5/26 로 저장됨. */
         const dateRaw = String(
