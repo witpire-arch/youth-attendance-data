@@ -20616,13 +20616,11 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     setTimeout(function(){ restoreFromFirebase({ force: true }); }, 4000);
     /* 3차 안전망 — 추가 5초 후 */
     setTimeout(function(){ restoreFromFirebase({ force: false }); }, 9000);
-    /* 주기적 refresh — 30초 간격, 처음 5분만 */
-    var refreshN = 0;
-    var refreshIv = setInterval(function(){
-      refreshN++;
-      if(refreshN > 10){ clearInterval(refreshIv); return; }
-      fetchFirebaseMembers(true);
-    }, 30000);
+    /* 주기적 refresh 제거 (속도 개선):
+       - 이전: 30초 × 10회 fetchFirebaseMembers(true) — 매번 force=true 라 __membersCache 우회
+       - 현재: bug-2-rescue v9 가 5분 주기 fetchAndProtect 로 ongoing sync 담당
+       - _fbCache 의 30s TTL 은 다음 caller 가 자동 trigger (on-demand refresh)
+       - 효과: 페이지 boot 후 5분간 cache miss 3회 감소 */
   });
 
   /* ── v2: fbDB.ref('members').once 진단 wrap — Step2 의 drop 원인 격리 ─ */
