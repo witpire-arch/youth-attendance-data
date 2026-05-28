@@ -23408,6 +23408,120 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 </script>
 <!-- MEMBERS_FETCH_CACHE_END -->
 
+<!-- SERVICE_WORKER_REGISTER_START -->
+<script id="service-worker-register">
+(function(){
+  'use strict';
+  /* ════════════════════════════════════════════════════════════════
+     Service Worker 등록 — 2차 로드 속도 개선
+
+     목표: 콜드 4895ms → 2차 ~1500ms
+
+     동작:
+       - sw.js 가 정적 자원 (HTML/CSS/JS/CDN) 캐시
+       - Firebase Realtime DB 호출은 SW 우회 (fresh)
+       - stale-while-revalidate: 즉시 캐시 응답 + 백그라운드 갱신
+       - 한 번 reload 후 새 버전 적용
+
+     안전:
+       - SW 없으면 (브라우저 미지원 / file://) 정상 동작 (등록 skip)
+       - HTTPS 또는 localhost 에서만 등록
+       - 등록 실패 시 silent (앱 영향 없음)
+
+     디버그:
+       window.__unregisterSW()   — SW 해제 (임시 비활성)
+       window.__clearSWCache()   — 모든 SW 캐시 삭제 (강제 새로고침)
+       window.__swStatus()       — 현재 등록 상태
+     ════════════════════════════════════════════════════════════════ */
+
+  if(!('serviceWorker' in navigator)){
+    console.log('[SW] navigator.serviceWorker 미지원 — SW 등록 skip');
+    return;
+  }
+  /* file:// 또는 비-HTTPS 환경 (localhost 제외) — SW 등록 안 함 */
+  if(location.protocol === 'file:'){
+    console.log('[SW] file:// 환경 — SW 등록 skip');
+    return;
+  }
+
+  /* 페이지 load 이벤트 후 등록 (초기 paint 영향 안 받게) */
+  window.addEventListener('load', function(){
+    /* 등록 URL — 현재 경로 기준 (github.io/youth-attendance-data/sw.js) */
+    var swPath = './sw.js';
+    navigator.serviceWorker.register(swPath)
+      .then(function(reg){
+        console.log('[SW] registered scope: ' + reg.scope);
+        /* 새 버전 감지 — controller change 시 안내 */
+        reg.addEventListener('updatefound', function(){
+          var newSW = reg.installing;
+          if(!newSW) return;
+          newSW.addEventListener('statechange', function(){
+            if(newSW.state === 'installed' && navigator.serviceWorker.controller){
+              console.log('[SW] 새 버전 설치됨 — 다음 페이지 로드 시 적용');
+            }
+          });
+        });
+      })
+      .catch(function(err){
+        console.warn('[SW] registration failed (앱 정상 동작):', err && err.message);
+      });
+  });
+
+  /* 디버그 API */
+  window.__unregisterSW = async function(){
+    try{
+      var regs = await navigator.serviceWorker.getRegistrations();
+      var n = 0;
+      for(var i=0; i<regs.length; i++){
+        await regs[i].unregister();
+        n++;
+      }
+      console.log('[SW] unregistered ' + n + ' registration(s) — 새로고침 후 SW 없이 동작');
+      return n;
+    }catch(e){ console.warn('[SW] unregister error:', e); return -1; }
+  };
+
+  window.__clearSWCache = async function(){
+    try{
+      var names = await caches.keys();
+      var deleted = 0;
+      for(var i=0; i<names.length; i++){
+        if(names[i].indexOf('kmjj-') === 0){
+          await caches.delete(names[i]);
+          deleted++;
+        }
+      }
+      console.log('[SW] cleared ' + deleted + ' cache(s):', names.filter(function(n){return n.indexOf('kmjj-')===0;}));
+      /* SW 에도 message 보내서 cache clear 요청 (이중 안전망) */
+      if(navigator.serviceWorker.controller){
+        var ch = new MessageChannel();
+        navigator.serviceWorker.controller.postMessage({ type: 'CLEAR_CACHE' }, [ch.port2]);
+      }
+      return deleted;
+    }catch(e){ console.warn('[SW] clear cache error:', e); return -1; }
+  };
+
+  window.__swStatus = async function(){
+    try{
+      var regs = await navigator.serviceWorker.getRegistrations();
+      var caches_list = await caches.keys();
+      var status = {
+        controller: !!navigator.serviceWorker.controller,
+        controllerScriptURL: navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL,
+        registrations: regs.length,
+        regScopes: regs.map(function(r){ return r.scope; }),
+        caches: caches_list.filter(function(n){ return n.indexOf('kmjj-') === 0; })
+      };
+      console.log('[SW] status:', status);
+      return status;
+    }catch(e){ console.warn('[SW] status error:', e); return null; }
+  };
+
+  console.log('[SW] 등록 스크립트 로드 — load 이벤트 시 등록 (디버그: window.__swStatus / __unregisterSW / __clearSWCache)');
+})();
+</script>
+<!-- SERVICE_WORKER_REGISTER_END -->
+
 <!-- REASON_CHART_FIX_START -->
 <script id="reason-chart-fix">
 (function(){
