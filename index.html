@@ -15050,7 +15050,32 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
     var tgt = targetsMap();
     var plans = plansMap();
-    var targetMembers = scoped.filter(function(m){ return !!tgt[m.id+'_habit']; });
+    /* Part 2 fix: targetMembers source 통일 — tgt 마킹 → 사이클 명단 (snapshotMembers + addedMembers).
+       사이클 명단 페이지의 회복 32명 vs 타겟 현황 페이지의 회복된 타겟 0명 mismatch 해소.
+       사례별 동작:
+         - cycle 있고 멤버 ≥1: cycle 멤버 기반 (정상)
+         - cycle 없음: 기존 tgt 마킹 fallback (자료 페이지 등 사이클 외, silent)
+         - cycle 있지만 멤버 0 (이상 상황): console.warn 1회 + tgt 마킹 fallback */
+    var cyclePlan = null;
+    try{
+      if(window.habitualPlan && typeof window.habitualPlan.getCycleForMonth === 'function'){
+        cyclePlan = window.habitualPlan.getCycleForMonth(mo);
+      }
+    }catch(e){}
+    var cycleIds = null;
+    if(cyclePlan && typeof window.habitualPlan.planMemberIds === 'function'){
+      var _ids = window.habitualPlan.planMemberIds(cyclePlan);
+      if(_ids && _ids.length > 0){
+        cycleIds = {};
+        _ids.forEach(function(id){ cycleIds[id] = 1; });
+      } else if(!renderInspection.__emptyCycleWarned){
+        renderInspection.__emptyCycleWarned = true;
+        console.warn('[part2-fix] cycle "'+(cyclePlan.cycleId||mo)+'" 멤버 0 (snapshotMembers + addedMembers 모두 비어있음). tgt 마킹 fallback 사용.');
+      }
+    }
+    var targetMembers = cycleIds
+      ? scoped.filter(function(m){ return !!cycleIds[m.id]; })
+      : scoped.filter(function(m){ return !!tgt[m.id+'_habit']; });
 
     /* ── 패널 기본 hide (사용자 클릭 전엔 어떤 패널도 보이지 않게) ──
        매 render 마다 reset → 필터 변경 시에도 이전에 펼쳐둔 panel 닫힘.
