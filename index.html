@@ -16281,8 +16281,15 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       var addN = (plan.addedMembers||[]).length;
       var totalN = allIds.length;
       var targetCnt = allIds.filter(function(id){ return !!targets[id+'_habit']; }).length;
+      /* Part 2 후속 fix: withGoal 카운트 source 통일 — habitualPlans.goals → monthlyPlans.
+         region user 가 detail panel 에서 저장 시 att_plans (monthlyPlans) 는 LS+FB 동기되지만
+         att_habitual_plans_v1 (habitualPlans) 은 adminOnly 라 FB write BLOCKED → 새로고침 시
+         forceMirrorFromFB 가 LS 를 FB stale 로 revert. monthlyPlans 기준으로 통일하면 region
+         user 도 fresh 카운트 표시. */
+      var _mpForCount = {};
+      try { _mpForCount = JSON.parse(localStorage.getItem('att_plans') || '{}'); } catch(_) {}
       var withGoal = allIds.filter(function(id){
-        return plan.goals && plan.goals[id] && String(plan.goals[id].monthlyGoal||'').trim();
+        return _mpForCount[id] && String(_mpForCount[id].goal||'').trim();
       }).length;
       var rng = cycleRangeLabel(plan);
       sum.style.gridTemplateColumns='repeat(4,1fr)';
@@ -16297,9 +16304,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       body.innerHTML = '<tr><td colspan="7" class="empty">명단에 표시할 인원이 없습니다 (필터 결과 0)</td></tr>';
       return;
     }
+    /* Part 2 후속 fix: 사이클 명단 row 의 monthlyGoal display source 통일 (habitualPlans → monthlyPlans).
+       동일 사유 — habitualPlans 는 region user FB write 차단, monthlyPlans 만 LS+FB 동기. */
+    var _mpForRow = {};
+    try { _mpForRow = JSON.parse(localStorage.getItem('att_plans') || '{}'); } catch(_) {}
     body.innerHTML = list.map(function(m){
       var mid = esc(m.id);
-      var goal = (plan.goals[m.id] && plan.goals[m.id].monthlyGoal) || '';
+      var goal = (_mpForRow[m.id] && _mpForRow[m.id].goal) || '';
       var badgeT = (typeof badgeType === 'function') ? badgeType(m.type) : esc(m.type||'');
       /* 출석유형 컬럼 fix (사용자 요청):
          이전: latestPrevRec(id, viewMo) — habit-month dropdown 의 prevMonth 마지막 일요일
@@ -16377,17 +16388,21 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       '</tr>';
     }).join('');
 
-    /* monthlyGoal 입력 → plan.goals[id].monthlyGoal 저장 */
+    /* Part 2 후속 fix: 사이클 명단 monthlyGoal 입력 → monthlyPlans (att_plans) 에 저장.
+       이전: setPlan 으로 habitualPlans.goals 업데이트 (region user FB write BLOCKED → 새로고침 시 분실)
+       변경: att_plans 에 write — Step B 로 region user 도 FB sync 동작
+       saveHabitDetailPlan 의 STAGE2 sync 는 admin 용 legacy 호환 유지 (cycle 명단 view 는 더 이상 habitualPlans 안 봄). */
     var inputs = body.querySelectorAll('.s2-goal-inp');
     for(var i=0; i<inputs.length; i++){
       inputs[i].addEventListener('change', function(){
         var pid = this.dataset.pid;
-        var p = currentPlan();
-        if(!p) return;
-        if(!p.goals) p.goals = {};
-        if(!p.goals[pid]) p.goals[pid] = emptyGoal();
-        p.goals[pid].monthlyGoal = String(this.value||'').trim();
-        setPlan(p.cycleId, p);
+        var val = String(this.value||'').trim();
+        try {
+          var mp = JSON.parse(localStorage.getItem('att_plans') || '{}');
+          if(!mp[pid]) mp[pid] = {};
+          mp[pid].goal = val;
+          localStorage.setItem('att_plans', JSON.stringify(mp));
+        } catch(e) { console.warn('[stage2-cycle] att_plans goal save error', e); }
       });
     }
   }
