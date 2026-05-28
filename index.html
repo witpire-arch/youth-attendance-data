@@ -15155,13 +15155,19 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     panel1.innerHTML = panel1HTML;
     card1.onclick = function(){ panel1.style.display = (panel1.style.display==='none' ? '' : 'none'); };
 
-    /* ── 카드 2: 타겟 미선정 ── */
-    var streakIdx = buildStreakIndex();
+    /* ── 카드 2: 타겟 미선정 ──
+       Part 2 commit #3: 습관성 후보 풀 source 통일 — isHabitCandidate(streak 기반) → 사이클 명단.
+       commit #1/#2 와 동일 패턴 — habitByTZ 가 사이클 멤버 분포를 반영.
+       cycleIds 가 비어있으면 (cycle 없음 / 멤버 0) 기존 isHabitCandidate fallback. */
+    var streakIdx = cycleIds ? null : buildStreakIndex();
     var habitByTZ = {}, targetByTZ = {};
     scoped.forEach(function(m){
       var tz = normalizeTZ(m);
       if(!tz) return;
-      if(isHabitCandidate(m, streakIdx)){
+      var isCandidate = cycleIds
+        ? !!cycleIds[m.id]
+        : isHabitCandidate(m, streakIdx);
+      if(isCandidate){
         (habitByTZ[tz] = habitByTZ[tz] || []).push(m);
       }
       if(tgt[m.id+'_habit']){
