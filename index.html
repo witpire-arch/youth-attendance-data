@@ -4946,7 +4946,33 @@ function renderHabitTargetStatus(){
   const zoneFilter = zoneSel ? (zoneSel.value || '') : '';
 
   const targets = (typeof getTargets==='function') ? getTargets() : {};
-  let targetMembers = scoped.filter(m => targets[m.id+'_habit']);
+
+  /* Part 2 fix: targetMembers source 통일 — tgt 마킹 → 사이클 명단 (snapshotMembers + addedMembers).
+     renderInspection (commit #1, f4b64ac) 과 동일 패턴 — 화면 간 source 일관성.
+     사례별 동작:
+       - cycle 있고 멤버 ≥ 1: cycle 멤버 기반 (정상)
+       - cycle 없음: 기존 tgt 마킹 fallback (silent, 자료 페이지 등)
+       - cycle 있지만 멤버 0 (이상 상황): console.warn 1회 + tgt 마킹 fallback */
+  let cyclePlanHS = null;
+  try{
+    if(window.habitualPlan && typeof window.habitualPlan.getCycleForMonth === 'function'){
+      cyclePlanHS = window.habitualPlan.getCycleForMonth(mo);
+    }
+  }catch(e){}
+  let cycleIdsHS = null;
+  if(cyclePlanHS && typeof window.habitualPlan.planMemberIds === 'function'){
+    const _ids = window.habitualPlan.planMemberIds(cyclePlanHS);
+    if(_ids && _ids.length > 0){
+      cycleIdsHS = {};
+      _ids.forEach(id => { cycleIdsHS[id] = 1; });
+    } else if(!renderHabitTargetStatus.__emptyCycleWarned){
+      renderHabitTargetStatus.__emptyCycleWarned = true;
+      console.warn('[part2-fix] cycle "'+(cyclePlanHS.cycleId||mo)+'" 멤버 0 (snapshotMembers + addedMembers 모두 비어있음). tgt 마킹 fallback 사용.');
+    }
+  }
+  let targetMembers = cycleIdsHS
+    ? scoped.filter(m => !!cycleIdsHS[m.id])
+    : scoped.filter(m => targets[m.id+'_habit']);
   if(regFilter) targetMembers = targetMembers.filter(m => m.region===regFilter);
   if(zoneFilter) targetMembers = targetMembers.filter(m => teamZoneKey(m)===zoneFilter);
 
