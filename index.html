@@ -19167,9 +19167,9 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
        att_habitual_plans_v1  ↔ habitualPlans/<cycleId>
 
      동작:
-       1) localStorage.setItem 인터셉트 — watched key 만 FB 도 함께 write (admin only)
+       1) localStorage.setItem 인터셉트 — watched key 만 FB 도 함께 write (key 별 admin guard, Step B 이후)
        2) 양방향 1회 seed (로드 시):
-            a) admin: LS 데이터 있고 FB 비어있으면 → FB seed (LS→FB)
+            a) LS 데이터 있고 FB 비어있으면 → FB seed (LS→FB, key.adminOnly 시 admin only)
             b) 모든 사용자: FB 데이터 있고 LS 비어있으면 → LS 미러 (FB→LS)
        3) 읽기 경로 변경 없음 (Phase C 작업)
        4) fbDB / currentUser 미준비 시 silent skip + 폴링 후 재시도
@@ -19177,7 +19177,8 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
      안전:
        - LS write 는 항상 먼저 성공 (인터셉트는 wrap 이지 replace 아님)
        - 모든 FB 호출 try/catch + .catch() — 실패해도 LS 무손상
-       - region user 는 FB write 시도 안 함 (admin only)
+       - Step B: per-key admin guard — WATCHED[key].adminOnly: true 인 key 만 region user 차단
+         (att_habitual_plans_v1 만 adminOnly — Step C 에서 child path .update() 로 분리 예정)
        - seed 중복 방지: 디바이스별 LS 마커 (phase5bA_seed_v1)
        - 롤백: 이 IIFE 통째로 삭제 + sentinel 키 삭제
 
@@ -19187,11 +19188,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   var SCHEMA_VERSION = 1;
   var SEED_SENTINEL_KEY = 'phase5bA_seed_v' + SCHEMA_VERSION;
 
-  /* watched key → Firebase 경로 매핑 */
+  /* watched key → Firebase 경로 매핑.
+     adminOnly: true → region user write 차단 (전체 객체 full-set 시 다른 region 데이터 덮어쓰기 위험).
+     adminOnly: false → region user 도 write 허용 (Step B — personId 기반 flat dict 라 full-set 안전). */
   var WATCHED = {
-    'att_targets':           { fbPath: 'attendanceTargets' },
-    'att_plans':             { fbPath: 'monthlyPlans' },
-    'att_habitual_plans_v1': { fbPath: 'habitualPlans' }
+    'att_targets':           { fbPath: 'attendanceTargets', adminOnly: false },
+    'att_plans':             { fbPath: 'monthlyPlans',      adminOnly: false },
+    'att_habitual_plans_v1': { fbPath: 'habitualPlans',     adminOnly: true  }
   };
 
   function isAdmin(){
@@ -19259,9 +19262,12 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   var _phaseD_lastOwnWriteAt = {};
 
   function syncKeyToFB(lsKey, valueStr, source){
-    if(!isAdmin()) return;
     if(!hasFB()) return;
     var cfg = WATCHED[lsKey]; if(!cfg) return;
+    /* Step B: per-key admin guard — adminOnly:true 인 key 만 region user 차단.
+       att_targets/att_plans 는 personId 기반 flat dict → region user 도 허용.
+       att_habitual_plans_v1 는 cycle 객체 → adminOnly 유지 (Step C 에서 child path 분리). */
+    if(cfg.adminOnly && !isAdmin()) return;
     var obj; try{ obj = JSON.parse(valueStr); }catch(e){ console.warn('[5bA-phaseB] JSON parse fail:', lsKey); return; }
     if(!obj || typeof obj !== 'object') obj = {};
     var payload = withMeta(obj, source || 'intercept');
@@ -19299,9 +19305,9 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           }catch(e){ console.warn('[5bA-phaseB] LS mirror write fail', lsKey, e); }
           return;
         }
-        /* (b) LS→FB seed: LS 가 풍부하고 FB 가 비어있으면 FB 채움 (admin only) */
+        /* (b) LS→FB seed: LS 가 풍부하고 FB 가 비어있으면 FB 채움 (key.adminOnly 시 admin only) */
         if(lsN > 0 && fbN === 0){
-          if(!isAdmin()){ console.log('[5bA-phaseB] seed skip (non-admin):', lsKey); return; }
+          if(cfg.adminOnly && !isAdmin()){ console.log('[5bA-phaseB] seed skip (non-admin, adminOnly):', lsKey); return; }
           var payload = withMeta(lsObj, 'seed');
           return window.fbDB.ref(cfg.fbPath).set(payload).then(function(){
             console.log('[5bA-phaseB] LS→FB seed', cfg.fbPath, '(' + lsN + ' keys from LS)');
