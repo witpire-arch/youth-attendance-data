@@ -23254,6 +23254,21 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   /* 캐시 대상 path */
   var CACHED_PATHS = { 'members': 1, 'estage': 1 };  /* records 는 records-lazy 가 처리 */
   var _statHits = 0, _statMisses = 0;
+  /* per-path stats + 호출자 stack 진단 */
+  var _statByPath = {};  /* path → {hits, misses, missTimings, missCallers} */
+  function _statRec(path, type){
+    if(!_statByPath[path]) _statByPath[path] = { hits: 0, misses: 0, missTimings: [], missCallers: [] };
+    _statByPath[path][type]++;
+    if(type === 'misses'){
+      _statByPath[path].missTimings.push(Math.round(performance.now()));
+      /* miss 호출자 추적 — stack trace */
+      try{
+        var stack = (new Error()).stack || '';
+        var lines = stack.split('\n').slice(3, 7).map(function(l){ return l.trim(); }).join(' ← ');
+        _statByPath[path].missCallers.push(lines);
+      }catch(e){}
+    }
+  }
 
   function installCache(){
     if(!window.fbDB || typeof window.fbDB.ref !== 'function') return false;
@@ -23271,6 +23286,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
             var now = Date.now();
             if(c && (now - c.ts) < TTL_MS){
               _statHits++;
+              _statRec(path, 'hits');
               if(_statHits <= 5){
                 console.log('[members-cache] HIT ' + path + ' (age=' + (now-c.ts) + 'ms)');
               }
@@ -23278,7 +23294,14 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
             }
             /* miss — 실제 fetch + 캐시 */
             _statMisses++;
-            console.log('[members-cache] MISS ' + path + ' (fetch start)');
+            _statRec(path, 'misses');
+            /* miss 진단: 모든 miss 에 stack 출력 (보통 1-2회 미만이라 스팸 없음) */
+            try{
+              var _stk = ((new Error()).stack || '').split('\n').slice(3, 6).map(function(l){ return l.trim(); }).join(' ← ');
+              console.log('[members-cache] MISS ' + path + ' (fetch start, t=' + Math.round(performance.now()) + 'ms) caller: ' + _stk);
+            }catch(e){
+              console.log('[members-cache] MISS ' + path + ' (fetch start, t=' + Math.round(performance.now()) + 'ms)');
+            }
             var p = origOnce(eventType);
             _cache[path] = { ts: now, promise: p };
             /* fetch 실패 시 캐시 무효화 — 다음 호출이 다시 시도 가능 */
@@ -23316,9 +23339,20 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   /* 디버그 API */
   window.__membersCache = {
     stats: function(){
-      console.log('[members-cache] hits=' + _statHits + ', misses=' + _statMisses);
-      console.log('  paths cached:', Object.keys(_cache).filter(function(p){ return _cache[p]; }));
-      return { hits: _statHits, misses: _statMisses };
+      console.group('[members-cache] stats');
+      console.log('total hits=' + _statHits + ', misses=' + _statMisses);
+      Object.keys(_statByPath).forEach(function(p){
+        var s = _statByPath[p];
+        console.log('  ' + p + ': hits=' + s.hits + ', misses=' + s.misses + (s.missTimings.length ? ' (miss at ' + s.missTimings.join('/') + 'ms)' : ''));
+        if(s.missCallers.length){
+          s.missCallers.forEach(function(c, i){
+            console.log('    miss #' + (i+1) + ' caller: ' + c);
+          });
+        }
+      });
+      console.log('paths cached:', Object.keys(_cache).filter(function(p){ return _cache[p]; }));
+      console.groupEnd();
+      return { hits: _statHits, misses: _statMisses, byPath: _statByPath };
     },
     invalidate: function(path){
       if(path){ _cache[path] = null; console.log('[members-cache] invalidated ' + path); }
