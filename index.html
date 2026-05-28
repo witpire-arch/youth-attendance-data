@@ -23255,17 +23255,28 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
   var CACHED_PATHS = { 'members': 1, 'estage': 1 };  /* records 는 records-lazy 가 처리 */
   var _statHits = 0, _statMisses = 0;
   /* per-path stats + 호출자 stack 진단 */
-  var _statByPath = {};  /* path → {hits, misses, missTimings, missCallers} */
+  var _statByPath = {};  /* path → {hits, misses, missTimings, missCallers, missCallersFull} */
+  var _traceOnMiss = false;  /* statsDetailed() 가 켜기 — console.trace 클릭 가능 */
   function _statRec(path, type){
-    if(!_statByPath[path]) _statByPath[path] = { hits: 0, misses: 0, missTimings: [], missCallers: [] };
+    if(!_statByPath[path]) _statByPath[path] = { hits: 0, misses: 0, missTimings: [], missCallers: [], missCallersFull: [] };
     _statByPath[path][type]++;
     if(type === 'misses'){
       _statByPath[path].missTimings.push(Math.round(performance.now()));
-      /* miss 호출자 추적 — stack trace */
+      /* miss 호출자 추적 — stack trace (compact + full) */
       try{
         var stack = (new Error()).stack || '';
-        var lines = stack.split('\n').slice(3, 7).map(function(l){ return l.trim(); }).join(' ← ');
-        _statByPath[path].missCallers.push(lines);
+        var lines = stack.split('\n');
+        /* compact: 3 frames (한 줄) */
+        var compactStr = lines.slice(3, 6).map(function(l){ return l.trim(); }).join(' ← ');
+        _statByPath[path].missCallers.push(compactStr);
+        /* full: 전체 stack (statsDetailed 용) */
+        _statByPath[path].missCallersFull.push(lines.slice(2).join('\n'));
+        /* trace mode 켜져 있으면 console.trace (clickable in DevTools) */
+        if(_traceOnMiss){
+          console.groupCollapsed('[members-cache] MISS trace: ' + path);
+          console.trace();
+          console.groupEnd();
+        }
       }catch(e){}
     }
   }
@@ -23338,6 +23349,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
   /* 디버그 API */
   window.__membersCache = {
+    /* 간단 요약 — compact caller (3 frames 한 줄) */
     stats: function(){
       console.group('[members-cache] stats');
       console.log('total hits=' + _statHits + ', misses=' + _statMisses);
@@ -23351,8 +23363,34 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
         }
       });
       console.log('paths cached:', Object.keys(_cache).filter(function(p){ return _cache[p]; }));
+      console.log('💡 더 자세히: window.__membersCache.statsDetailed()');
       console.groupEnd();
       return { hits: _statHits, misses: _statMisses, byPath: _statByPath };
+    },
+    /* 상세 — 전체 stack trace per miss (clickable file:line in DevTools) */
+    statsDetailed: function(){
+      console.group('[members-cache] statsDetailed (full stack)');
+      console.log('total hits=' + _statHits + ', misses=' + _statMisses);
+      Object.keys(_statByPath).forEach(function(p){
+        var s = _statByPath[p];
+        console.group(p + ': hits=' + s.hits + ', misses=' + s.misses);
+        if(s.missTimings.length){
+          console.log('miss timings: ' + s.missTimings.join('ms / ') + 'ms');
+        }
+        s.missCallersFull.forEach(function(stack, i){
+          console.groupCollapsed('miss #' + (i+1) + ' @ ' + s.missTimings[i] + 'ms — full stack (펼치기)');
+          console.log(stack);
+          console.groupEnd();
+        });
+        console.groupEnd();
+      });
+      console.groupEnd();
+      return _statByPath;
+    },
+    /* 향후 miss 발생 시 console.trace 자동 호출 (clickable stack) — toggle */
+    trace: function(on){
+      _traceOnMiss = (on === false) ? false : true;
+      console.log('[members-cache] trace on miss: ' + _traceOnMiss + (_traceOnMiss ? ' — 다음 miss 부터 console.trace 자동 출력' : ''));
     },
     invalidate: function(path){
       if(path){ _cache[path] = null; console.log('[members-cache] invalidated ' + path); }
