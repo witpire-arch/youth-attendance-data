@@ -22,7 +22,11 @@
 
 'use strict';
 
-const CACHE_VERSION = 'kmjj-v1';
+/* Stage 1 verify (2026-05-29): 'kmjj-v1' → 'kmjj-v2-stage1-verify'
+   sw.js bytes 변경 → 사용자 다음 F5 시 reg.update() 가 install 트리거
+   → updatefound + statechange 'installed' fire → 우측 하단 배너 표시.
+   Stage 2 에서 commit hash 자동 주입으로 정착 예정. */
+const CACHE_VERSION = 'kmjj-v2-stage1-verify';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 
