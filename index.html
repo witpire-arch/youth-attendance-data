@@ -23491,7 +23491,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 (function(){
   'use strict';
   /* ════════════════════════════════════════════════════════════════
-     Service Worker 등록 — 2차 로드 속도 개선
+     Service Worker 등록 — 2차 로드 속도 개선 + Stage 1 자동 갱신 안내
 
      목표: 콜드 4895ms → 2차 ~1500ms
 
@@ -23501,10 +23501,18 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
        - stale-while-revalidate: 즉시 캐시 응답 + 백그라운드 갱신
        - 한 번 reload 후 새 버전 적용
 
+     Stage 1 (2026-05-29) — 새 버전 안내 메커니즘:
+       - reg.update() 자동 호출: 페이지 visible 전환 시 (throttle 1분) + 부팅 5초 후 1회
+       - 새 SW install 감지 시 우측 하단 배너 표시 "새 버전 준비됨 — 새로고침"
+       - 자동 reload 안 함 — 사용자가 [새로고침] 또는 [나중에] 선택
+       - 첫 설치 (controller 없음) 시 silent — 신규 사용자 토스트 안 뜸
+       - sw.js bytes 변경 시에만 updatefound fire — CACHE_VERSION 갱신 (Stage 2) 필요
+
      안전:
        - SW 없으면 (브라우저 미지원 / file://) 정상 동작 (등록 skip)
        - HTTPS 또는 localhost 에서만 등록
        - 등록 실패 시 silent (앱 영향 없음)
+       - 배너 표시는 idempotent (페이지 라이프타임 1회), 모든 SW 호출 try/catch
 
      디버그:
        window.__unregisterSW()   — SW 해제 (임시 비활성)
@@ -23529,16 +23537,58 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     navigator.serviceWorker.register(swPath)
       .then(function(reg){
         console.log('[SW] registered scope: ' + reg.scope);
-        /* 새 버전 감지 — controller change 시 안내 */
+
+        /* Stage 1: 새 버전 안내 배너 — idempotent, controller 있을 때만 (첫 설치 silent) */
+        function showUpdateBanner(source){
+          if(document.getElementById('sw-update-banner')) return;
+          if(!navigator.serviceWorker.controller) return;
+          var b = document.createElement('div');
+          b.id = 'sw-update-banner';
+          b.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;background:#2d8b3d;color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.2);font-size:14px;display:flex;gap:10px;align-items:center;font-family:inherit';
+          b.innerHTML =
+            '<span>🆕 새 버전이 준비됐어요</span>' +
+            '<button id="sw-update-reload" style="background:#fff;color:#2d8b3d;border:0;padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px">새로고침</button>' +
+            '<button id="sw-update-dismiss" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.4);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:13px">나중에</button>';
+          document.body.appendChild(b);
+          var rb = document.getElementById('sw-update-reload');
+          var db = document.getElementById('sw-update-dismiss');
+          if(rb) rb.addEventListener('click', function(){ try{ location.reload(); }catch(_){} });
+          if(db) db.addEventListener('click', function(){ try{ b.remove(); }catch(_){} });
+          console.log('[SW] update banner shown:', source);
+        }
+
+        /* 이미 waiting 인 SW 가 있으면 (다른 탭이 install 했음) — 즉시 안내 */
+        if(reg.waiting && navigator.serviceWorker.controller){
+          showUpdateBanner('initial-waiting');
+        }
+
+        /* updatefound — 새 SW install 시작 */
         reg.addEventListener('updatefound', function(){
           var newSW = reg.installing;
           if(!newSW) return;
           newSW.addEventListener('statechange', function(){
             if(newSW.state === 'installed' && navigator.serviceWorker.controller){
-              console.log('[SW] 새 버전 설치됨 — 다음 페이지 로드 시 적용');
+              console.log('[SW] 새 버전 설치됨 — 배너 표시');
+              showUpdateBanner('updatefound');
             }
           });
         });
+
+        /* 페이지 visible 시 reg.update() — 새 sw.js 가 있으면 install 트리거.
+           throttle 1분 — 잦은 탭 switch 시 폭주 방지. */
+        var _swUpdateThrottleAt = 0;
+        document.addEventListener('visibilitychange', function(){
+          if(document.visibilityState !== 'visible') return;
+          var now = Date.now();
+          if(now - _swUpdateThrottleAt < 60000) return;
+          _swUpdateThrottleAt = now;
+          try{ reg.update().catch(function(){}); }catch(_){}
+        });
+
+        /* 부팅 5초 후 1회 — 첫 로드 시점에 visibilitychange 발생 안 할 수 있음 */
+        setTimeout(function(){
+          try{ reg.update().catch(function(){}); }catch(_){}
+        }, 5000);
       })
       .catch(function(err){
         console.warn('[SW] registration failed (앱 정상 동작):', err && err.message);
