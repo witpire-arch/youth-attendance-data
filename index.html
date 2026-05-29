@@ -16217,6 +16217,28 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var members = membersAll();
     var memMap = {}; members.forEach(function(m){ memMap[m.id] = m; });
 
+    /* Issue 0-B fix: region 계정 권한 누수 차단 — 사이클 명단 + 모든 count 가 자기 region 만.
+       admin 은 무변동 (전체 유지). allIds 자체를 region narrowing 하면
+       하류 list / totalN / targetCnt / withGoal / _recoveredCount 모두 일관 (allIds 기반 계산).
+       Step B 와 무관 — pre-existing 디자인 결함의 보강.
+       Fail-closed: admin 외 (또는 currentUser 미설정) — region 필터 강제, region falsy 면 빈 명단.
+       isAdmin() 사용 (line 15422, 같은 IIFE) — role==='admin' OR email==='witpire@gmail.com' (witpire fallback 포함). */
+    if(!isAdmin()){
+      var _myRegion = (window.currentUser && window.currentUser.region) || '';
+      if(_myRegion){
+        allIds = allIds.filter(function(id){
+          var m = memMap[id];
+          return m && m.region === _myRegion;
+        });
+      } else {
+        if(!applyPlanSnapshotToBody.__failClosedWarned){
+          applyPlanSnapshotToBody.__failClosedWarned = true;
+          console.warn('[part2-fix] non-admin without region (or no currentUser) — 빈 명단 fail-closed');
+        }
+        allIds = [];
+      }
+    }
+
     /* 현재 dropdown 필터 적용 (명단 set 은 고정, 그 위에서 narrowing) */
     var regEl = $('habit-reg'), zoneEl = $('habit-zone'), onlyEl = $('habit-only');
     var reg = (regEl && regEl.value) || '';
@@ -16277,8 +16299,20 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     /* count summary 갱신 — cycle 명단 기준 (snapshot + added) + 회복 카운트 */
     var sum = $('habit-count-summary');
     if(sum){
-      var snapN = (plan.snapshotMembers||[]).length;
-      var addN = (plan.addedMembers||[]).length;
+      /* Issue 0-B fix: snapN/addN 도 filtered allIds 기준 — region 계정 sub-text 일관성.
+         Fail-closed 게이트 일치 (isAdmin() 사용 — witpire fallback 포함):
+         admin 만 literal 두 줄 무변동, 그 외 모두 filtered allIds 기반.
+         Edit 1 의 allIds=[] (fail-closed) 케이스에서 snapN/addN 0/0 자동 도출. */
+      var snapN, addN;
+      if(isAdmin()){
+        snapN = (plan.snapshotMembers||[]).length;
+        addN = (plan.addedMembers||[]).length;
+      } else {
+        var _allIdSet = {};
+        allIds.forEach(function(id){ _allIdSet[id] = 1; });
+        snapN = (plan.snapshotMembers||[]).filter(function(id){ return !!_allIdSet[id]; }).length;
+        addN = (plan.addedMembers||[]).filter(function(am){ return am && am.personId && !!_allIdSet[am.personId]; }).length;
+      }
       var totalN = allIds.length;
       var targetCnt = allIds.filter(function(id){ return !!targets[id+'_habit']; }).length;
       /* Part 2 후속 fix: withGoal 카운트 source 통일 — habitualPlans.goals → monthlyPlans.
