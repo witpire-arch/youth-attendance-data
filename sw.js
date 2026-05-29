@@ -22,11 +22,13 @@
 
 'use strict';
 
-/* Stage 1 verify (2026-05-29): 'kmjj-v1' → 'kmjj-v2-stage1-verify'
-   sw.js bytes 변경 → 사용자 다음 F5 시 reg.update() 가 install 트리거
-   → updatefound + statechange 'installed' fire → 우측 하단 배너 표시.
-   Stage 2 에서 commit hash 자동 주입으로 정착 예정. */
-const CACHE_VERSION = 'kmjj-v2-stage1-verify';
+/* Stage 1 robust verify (2026-05-29): 'kmjj-v2-stage1-verify' → 'kmjj-v3-banner-verify'
+   robust commit (731ef5d) 이 race condition fix 완료. 이 commit 으로 sw.js bytes 변경.
+   사용자가 새 index.html (robust 코드) 를 가진 상태에서 다음 F5:
+     - 5초 후 reg.update() → 새 sw.js → install v3 → updatefound → trackSW → banner
+     - 또는 controllerchange 가 먼저 잡으면 그 path → banner
+   Stage 2 에서 commit hash 자동 주입 정착 예정. */
+const CACHE_VERSION = 'kmjj-v3-banner-verify';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 
