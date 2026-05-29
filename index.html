@@ -23508,6 +23508,13 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
        - 첫 설치 (controller 없음) 시 silent — 신규 사용자 토스트 안 뜸
        - sw.js bytes 변경 시에만 updatefound fire — CACHE_VERSION 갱신 (Stage 2) 필요
 
+     Stage 1 robust (2026-05-29 후속) — race condition fix:
+       3가지 safety net 추가 — register().then() 늦게 실행되어 SW 가 이미 install/activate 됐을 때도 banner 표시:
+       - IIFE scope hadControllerOnLoad: boot 시점 capture, 첫 설치 vs 재설치 정확히 구별
+       - register().then() 에서 reg.installing 동기 체크 (race window 좁힘)
+       - navigator.serviceWorker.controllerchange listener (IIFE 일찍 attach, 모든 race 의 safety net)
+       - showUpdateBanner 를 IIFE scope 로 끌어올림 (controllerchange 에서 호출 가능)
+
      안전:
        - SW 없으면 (브라우저 미지원 / file://) 정상 동작 (등록 skip)
        - HTTPS 또는 localhost 에서만 등록
@@ -23530,48 +23537,101 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     return;
   }
 
+  /* Stage 1 robust — IIFE scope helpers + race safety net.
+     boot 시점 controller 존재 여부 capture: 첫 설치 silent, 재설치만 banner. */
+  var hadControllerOnLoad = !!navigator.serviceWorker.controller;
+  console.log('[SW] page boot — hadControllerOnLoad:', hadControllerOnLoad,
+    '| scriptURL:', (navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL) || '(none)');
+
+  function showUpdateBanner(source){
+    if(document.getElementById('sw-update-banner')) return;
+    if(!hadControllerOnLoad){
+      console.log('[SW] banner skip (no prior controller, 첫 설치):', source);
+      return;
+    }
+    if(!document.body){
+      /* body 아직 없음 — DOMContentLoaded 까지 대기 (드물지만 안전망) */
+      document.addEventListener('DOMContentLoaded', function once(){
+        document.removeEventListener('DOMContentLoaded', once);
+        showUpdateBanner(source + '-after-dom');
+      });
+      return;
+    }
+    var b = document.createElement('div');
+    b.id = 'sw-update-banner';
+    b.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;background:#2d8b3d;color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.2);font-size:14px;display:flex;gap:10px;align-items:center;font-family:inherit';
+    b.innerHTML =
+      '<span>🆕 새 버전이 준비됐어요</span>' +
+      '<button id="sw-update-reload" style="background:#fff;color:#2d8b3d;border:0;padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px">새로고침</button>' +
+      '<button id="sw-update-dismiss" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.4);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:13px">나중에</button>';
+    document.body.appendChild(b);
+    var rb = document.getElementById('sw-update-reload');
+    var db = document.getElementById('sw-update-dismiss');
+    if(rb) rb.addEventListener('click', function(){ try{ location.reload(); }catch(_){} });
+    if(db) db.addEventListener('click', function(){ try{ b.remove(); }catch(_){} });
+    console.log('[SW] update banner shown:', source);
+  }
+
+  function trackSW(sw, source){
+    if(!sw) return;
+    console.log('[SW] tracking SW:', source, '| state:', sw.state);
+    if(sw.state === 'installed'){
+      /* 이미 installed — statechange 미발생, 즉시 banner */
+      showUpdateBanner(source + '-already-installed');
+      return;
+    }
+    if(sw.state === 'activated' || sw.state === 'activating' || sw.state === 'redundant'){
+      /* 이미 install 단계 지남 — controllerchange 가 safety net 으로 잡음 */
+      console.log('[SW] SW already past install:', source, sw.state);
+      return;
+    }
+    /* state: 'parsed' or 'installing' — statechange 대기 */
+    sw.addEventListener('statechange', function(){
+      console.log('[SW] statechange:', source, '→', sw.state);
+      if(sw.state === 'installed'){
+        showUpdateBanner(source + '-installed');
+      }
+    });
+  }
+
+  /* Safety net: controllerchange — register().then() 늦었을 때도 잡음.
+     IIFE scope 일찍 attach → 모든 race 케이스 커버. */
+  navigator.serviceWorker.addEventListener('controllerchange', function(){
+    var newURL = (navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL) || '(none)';
+    console.log('[SW] controllerchange fired | new controller:', newURL);
+    if(hadControllerOnLoad){
+      showUpdateBanner('controllerchange');
+    } else {
+      /* 첫 controller 획득 (신규 사용자) — silent + mark for future */
+      hadControllerOnLoad = true;
+    }
+  });
+
   /* 페이지 load 이벤트 후 등록 (초기 paint 영향 안 받게) */
   window.addEventListener('load', function(){
     /* 등록 URL — 현재 경로 기준 (github.io/youth-attendance-data/sw.js) */
     var swPath = './sw.js';
     navigator.serviceWorker.register(swPath)
       .then(function(reg){
-        console.log('[SW] registered scope: ' + reg.scope);
+        console.log('[SW] registered — scope:', reg.scope,
+          '| installing:', !!reg.installing && reg.installing.state,
+          '| waiting:', !!reg.waiting && reg.waiting.state,
+          '| active:', !!reg.active && reg.active.state);
 
-        /* Stage 1: 새 버전 안내 배너 — idempotent, controller 있을 때만 (첫 설치 silent) */
-        function showUpdateBanner(source){
-          if(document.getElementById('sw-update-banner')) return;
-          if(!navigator.serviceWorker.controller) return;
-          var b = document.createElement('div');
-          b.id = 'sw-update-banner';
-          b.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;background:#2d8b3d;color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.2);font-size:14px;display:flex;gap:10px;align-items:center;font-family:inherit';
-          b.innerHTML =
-            '<span>🆕 새 버전이 준비됐어요</span>' +
-            '<button id="sw-update-reload" style="background:#fff;color:#2d8b3d;border:0;padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px">새로고침</button>' +
-            '<button id="sw-update-dismiss" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.4);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:13px">나중에</button>';
-          document.body.appendChild(b);
-          var rb = document.getElementById('sw-update-reload');
-          var db = document.getElementById('sw-update-dismiss');
-          if(rb) rb.addEventListener('click', function(){ try{ location.reload(); }catch(_){} });
-          if(db) db.addEventListener('click', function(){ try{ b.remove(); }catch(_){} });
-          console.log('[SW] update banner shown:', source);
+        /* Race fix 1: 이미 waiting 인 SW (다른 탭이 install 했음) */
+        if(reg.waiting){
+          trackSW(reg.waiting, 'initial-waiting');
         }
 
-        /* 이미 waiting 인 SW 가 있으면 (다른 탭이 install 했음) — 즉시 안내 */
-        if(reg.waiting && navigator.serviceWorker.controller){
-          showUpdateBanner('initial-waiting');
+        /* Race fix 2: 이미 installing — register().then() 늦었을 때 (updatefound 놓침) */
+        if(reg.installing){
+          trackSW(reg.installing, 'initial-installing');
         }
 
-        /* updatefound — 새 SW install 시작 */
+        /* updatefound — 미래 install 시작 */
         reg.addEventListener('updatefound', function(){
-          var newSW = reg.installing;
-          if(!newSW) return;
-          newSW.addEventListener('statechange', function(){
-            if(newSW.state === 'installed' && navigator.serviceWorker.controller){
-              console.log('[SW] 새 버전 설치됨 — 배너 표시');
-              showUpdateBanner('updatefound');
-            }
-          });
+          console.log('[SW] updatefound fired');
+          trackSW(reg.installing, 'updatefound');
         });
 
         /* 페이지 visible 시 reg.update() — 새 sw.js 가 있으면 install 트리거.
