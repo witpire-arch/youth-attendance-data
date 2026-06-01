@@ -22,12 +22,13 @@
 
 'use strict';
 
-/* cycle 7 hotfix (2026-06-01): 'kmjj-v5-cycle7-recovery' → 'kmjj-v6-cycle7-panel-perm'
-   작업 B 카드 클릭 명단 패널 0-B 권한 누수 재발 차단 — 3개 패널(타겟 설정/월목표 입력/회복)
-   렌더 choke-point(_panelMemberRows)에 isAdmin()+region+fail-closed 가드 강제.
+/* cycle 7 hotfix (2026-06-01): 'kmjj-v6-cycle7-panel-perm' → 'kmjj-v7-longabsent-perm'
+   8회 이상 결석자(renderLongAbsent) region 누수 차단 — 활성 함수가 getLongAbsentList(region-scoped)를
+   우회해 arrMembers()(raw)를 직접 써서 지역 계정이 "전체 지역" 기본값으로 전 지역 결석자 노출하던 것.
+   fix: getFilteredMembers() + fail-closed 가드 + 드롭다운 non-admin "전체 지역" 제거/자기 region 고정.
    sw.js bytes 변경 → 다음 F5 시 새 SW install + 업데이트 배너 fire → 사용자 [새로고침] 으로 새 코드 수신.
    Stage 2 에서 commit hash 자동 주입 정착 예정. */
-const CACHE_VERSION = 'kmjj-v6-cycle7-panel-perm';
+const CACHE_VERSION = 'kmjj-v7-longabsent-perm';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 

@@ -12196,7 +12196,21 @@ window.addEventListener('load',function(){
 
   function latestRecDirect(id){var all=arrRecords().filter(function(r){return clean(r.id)===clean(id)&&r.date;}).sort(function(a,b){return normDate(a.date).localeCompare(normDate(b.date));}); return all[all.length-1]||null;}
   function streakOf(id){var lr=latestRecDirect(id); return lr?parseInt(lr.streak||0,10)||0:0;}
-  function populateLAFiltersFinal(){var s=document.getElementById('la-reg-filter'); if(!s)return; var old=s.value; s.innerHTML='<option value="">전체 지역</option>'+regionOrder().map(function(r){return '<option value="'+esc(r)+'">'+esc(r)+'</option>';}).join(''); s.value=old;}
+  function populateLAFiltersFinal(){
+    var s=document.getElementById('la-reg-filter'); if(!s)return;
+    var old=s.value;
+    /* cycle7 누수 fix: 지역 계정은 "전체 지역" 옵션 제거 + 자기 region 고정 (fail-closed).
+       (0-B 동형 — "전체 지역"(value="") 기본값이 renderLongAbsent 에서 전 지역 노출시키던 경로를 원천 차단) */
+    var _lu = (typeof currentUser!=='undefined' && currentUser) ? currentUser : (window.currentUser||null);
+    if(_lu && _lu.role!=='admin'){
+      var _lrg = _lu.region || '';
+      if(_lrg){ s.innerHTML='<option value="'+esc(_lrg)+'">'+esc(_lrg)+'</option>'; s.value=_lrg; }
+      else { s.innerHTML=''; s.value=''; }  /* region 없음 → 빈 옵션 (데이터도 fail-closed) */
+      return;
+    }
+    s.innerHTML='<option value="">전체 지역</option>'+regionOrder().map(function(r){return '<option value="'+esc(r)+'">'+esc(r)+'</option>';}).join('');
+    s.value=old;
+  }
   window.renderLongAbsent=function(){
     populateLAFiltersFinal(); var reg=clean(document.getElementById('la-reg-filter')&&document.getElementById('la-reg-filter').value), ty=clean(document.getElementById('la-type-filter')&&document.getElementById('la-type-filter').value);
     /* fix: placeholder / test 데이터 (A001, A002, 홍길동, 박태현 등 streak=0) 가 명단에
@@ -12208,7 +12222,16 @@ window.addEventListener('load',function(){
     var _RX_ID = /^\d{8}-\d{4,6}$/;
     var _VALID_TYPES = {'가족':1,'가족외':1,'일반':1,'':1};
     var _excludedCnt = { invalidId:0, invalidType:0, noName:0, lowStreak:0 };
-    var list=arrMembers().filter(function(m){return m&&m.id&&!m._retired;})
+    /* cycle7 누수 fix: arrMembers()(raw, region 무시) → getFilteredMembers()(region choke-point) + 명시 가드.
+       활성 renderLongAbsent 가 getLongAbsentList(region-scoped)를 우회해 arrMembers()를 직접 써서 누수했음.
+       getFilteredMembers(): non-admin=자기 region. 추가로 fail-closed(region falsy → 빈 명단). */
+    var _laBase = (typeof getFilteredMembers==='function') ? getFilteredMembers() : arrMembers();
+    if(typeof currentUser!=='undefined' && currentUser && currentUser.role!=='admin'){
+      _laBase = currentUser.region
+        ? _laBase.filter(function(m){return clean(m.region)===clean(currentUser.region);})
+        : [];
+    }
+    var list=_laBase.filter(function(m){return m&&m.id&&!m._retired;})
       .filter(function(m){return !reg||clean(m.region)===reg;})
       .filter(function(m){return !ty||normType(m.type)===normType(ty);})
       .filter(function(m){
