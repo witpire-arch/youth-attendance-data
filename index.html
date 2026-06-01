@@ -16279,20 +16279,40 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     });
 
     /* Part 3 — 회복 분류 (B 방식: 시각적 표시, 명단에서 제외 안 함)
-       회복: 사이클 시작 후 모든 주일에 사유결석/결석 0 (사유출석/QR 인증 = attended) */
+       ── cycle 7 fix #1: 회복 기준을 타겟월(점검월)로 교체 ──
+       사이클 구조: 진단 baseMonth(M-2) / 계획 cycleStart(M-1) / 점검 cycleEnd = 타겟월(M).
+         예) 타겟 6월 사이클 = 진단 4월(baseMonth) · 계획 5월(cycleStart) · 점검 6월(cycleEnd).
+       회복 정의(최종): 타겟월(cycleEnd) 한 달 '모든 주일' 출석
+         (사유결석·결석 0회, 사유출석/QR인증 = 출석 인정). 계획 이행은 회복 판정 미반영.
+       이전 버그: checkMo = cycleStart(=계획월 5월) 으로 잘못된 달을 봤음 → '회복 32' (무효 숫자).
+       ⚠️ 함정 가드: 타겟월에 지난 주일이 0개이거나 월 출결 미완성이면 회복 0 + 판정 보류.
+         gate 없이 isMemberRecovered 만 쓰면 (1) 0-주일 vacuous-true 로 전원 회복(323) 오집계,
+         (2) 부분월(일부 주일만 지난 달)에서 조기 회복 처리 위험 → isMonthAttendanceComplete 게이트.
+       타겟월 = plan.cycleEnd (없으면 nextMonth(cycleStart), 그래도 없으면 baseMonth+2 fallback). */
     var _recoverIdSet = {};
     var _recoveredCount = 0;
+    var _recoverPending = false;
+    var _targetMo = plan.cycleEnd
+      || (plan.cycleStart ? nextMonth(plan.cycleStart) : '')
+      || (plan.baseMonth ? nextMonth(nextMonth(plan.baseMonth)) : '');
     try{
       var _isMemRec = (typeof window.isMemberRecovered === 'function') ? window.isMemberRecovered : null;
-      if(_isMemRec){
-        var cycleStartMo = plan.cycleStart || '';
-        var checkMo = cycleStartMo || plan.baseMonth || '';
-        list.forEach(function(m){
-          if(_isMemRec(m.id, checkMo)){
-            _recoverIdSet[m.id] = true;
-            _recoveredCount++;
-          }
-        });
+      var _monthDone = (typeof window.isMonthAttendanceComplete === 'function') ? window.isMonthAttendanceComplete : null;
+      if(_isMemRec && _targetMo){
+        var _mc = _monthDone
+          ? _monthDone(parseInt(_targetMo.slice(0,4),10), parseInt(_targetMo.slice(5,7),10))
+          : { complete:true };
+        if(_mc && _mc.complete){
+          list.forEach(function(m){
+            if(_isMemRec(m.id, _targetMo)){
+              _recoverIdSet[m.id] = true;
+              _recoveredCount++;
+            }
+          });
+        } else {
+          /* 타겟월 미완성(주일 0개 포함) → 회복 0, 판정 보류 (함정 가드) */
+          _recoverPending = true;
+        }
       }
     }catch(e){}
 
@@ -16327,11 +16347,84 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
       }).length;
       var rng = cycleRangeLabel(plan);
       sum.style.gridTemplateColumns='repeat(4,1fr)';
+      /* cycle 7 작업 B: 타겟 설정/월목표 입력/회복 3개 카드에 클릭 힌트 + cursor pointer */
+      var _clk = '<span style="font-size:10px;color:var(--blue);font-weight:500;margin-left:4px">클릭 → 명단</span>';
       sum.innerHTML =
         '<div class="mc"><div class="lbl">'+rng+' 사이클 명단</div><div class="val">'+totalN+'<span style="font-size:12px">명</span></div><div class="sub">스냅샷 '+snapN+' + 추가 '+addN+' · 기준월 '+esc(plan.baseMonth)+'</div></div>'+
-        '<div class="mc"><div class="lbl">타겟 설정</div><div class="val">'+targetCnt+'</div></div>'+
-        '<div class="mc"><div class="lbl">월목표 입력</div><div class="val">'+withGoal+'<span style="font-size:12px">/'+totalN+'</span></div></div>'+
-        '<div class="mc"><div class="lbl">회복</div><div class="val" style="color:var(--green,#2d8b3d)">'+_recoveredCount+'<span style="font-size:12px">/'+totalN+'</span></div><div class="sub">모든 주일 출석 (사유결석/결석 0)</div></div>';
+        '<div id="hb-card-target" class="mc" style="cursor:pointer;border-left:3px solid var(--blue,#1550a0)"><div class="lbl">타겟 설정 '+_clk+'</div><div class="val">'+targetCnt+'</div></div>'+
+        '<div id="hb-card-goal" class="mc" style="cursor:pointer;border-left:3px solid var(--blue,#1550a0)"><div class="lbl">월목표 입력 '+_clk+'</div><div class="val">'+withGoal+'<span style="font-size:12px">/'+totalN+'</span></div></div>'+
+        '<div id="hb-card-recover" class="mc" style="cursor:pointer;border-left:3px solid var(--green,#2d8b3d)"><div class="lbl">회복 '+_clk+'</div><div class="val" style="color:var(--green,#2d8b3d)">'+_recoveredCount+'<span style="font-size:12px">/'+totalN+'</span></div><div class="sub">'+
+          (_recoverPending
+            ? '타겟월 '+esc(_targetMo)+' 판정 대기 (월 출결 미완성)'
+            : '타겟월 '+esc(_targetMo)+' 모든 주일 출석 (사유결석/결석 0)')+'</div></div>';
+
+      /* ── cycle 7 작업 B: 카드 클릭 → 명단 펼침 (타겟 설정 / 월목표 입력 / 회복) ──
+         '타겟 현황' 탭의 카드→패널 토글 패턴 재사용. 사이클 명단(totalN) 카드는 제외 — 이미 아래 표에 노출.
+         🔒 권한(0-B 재발 방지): 세 패널 명단 모두 allIds 에서 파생.
+            allIds 는 위 Issue 0-B fix 로 이미 isAdmin() 게이트 + region 필터 + fail-closed(allIds=[]) 적용됨
+            → 지역 계정은 카드를 클릭해도 자기 region 명단만, currentUser/region 미설정이면 빈 명단. */
+      var _panelMemberRows = function(ids, kind){
+        var rows = ids.map(function(id){ return memMap[id]; }).filter(function(m){ return !!m; });
+        rows.sort(function(a,b){
+          var rc = String(a.region||'').localeCompare(String(b.region||''),'ko');
+          if(rc!==0) return rc;
+          var tzA=_tzSortKey(a), tzB=_tzSortKey(b);
+          if(tzA!==tzB) return tzA<tzB?-1:1;
+          return String(a.name||'').localeCompare(String(b.name||''),'ko');
+        });
+        if(!rows.length) return '<div class="empty" style="padding:14px">해당 인원이 없습니다.</div>';
+        var head = (kind==='goal')
+          ? '<thead><tr><th>이름</th><th>지역</th><th>팀-구역</th><th>월 목표</th></tr></thead>'
+          : (kind==='recover')
+            ? '<thead><tr><th>이름</th><th>지역</th><th>팀-구역</th><th>회복 근거</th></tr></thead>'
+            : '<thead><tr><th>이름</th><th>지역</th><th>팀-구역</th></tr></thead>';
+        var bodyRows = rows.map(function(m){
+          var base = '<td style="font-weight:700">'+esc(m.name||'')+'</td><td>'+esc(m.region||'')+'</td><td>'+esc((m.team||'')+'-'+(m.zone||''))+'</td>';
+          if(kind==='goal'){
+            var g = (_mpForCount[m.id] && _mpForCount[m.id].goal) || '';
+            return '<tr>'+base+'<td>'+esc(g)+'</td></tr>';
+          }
+          if(kind==='recover'){
+            return '<tr>'+base+'<td>타겟월 '+esc(_targetMo)+' 모든 주일 출석</td></tr>';
+          }
+          return '<tr>'+base+'</tr>';
+        }).join('');
+        return '<div style="font-size:12px;color:var(--text3);margin-bottom:8px">총 '+rows.length+'명</div>'+
+          '<div class="tw"><table>'+head+'<tbody>'+bodyRows+'</tbody></table></div>';
+      };
+
+      var _targetIds = allIds.filter(function(id){ return !!targets[id+'_habit']; });
+      var _goalIds = allIds.filter(function(id){ return _mpForCount[id] && String(_mpForCount[id].goal||'').trim(); });
+      var _recoverIds = Object.keys(_recoverIdSet);
+
+      var _recoverHeader =
+        '<div style="font-size:11.5px;line-height:1.55;color:var(--text2,#555);background:var(--surface2,#f3f2ec);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:8px 10px;margin-bottom:8px">'+
+        '<b>회복 기준</b>: 타겟월(<b>'+esc(_targetMo)+'</b>) 한 달간 <b>모든 주일 출석</b> 시 회복. '+
+        '사유출석은 출석 인정, 사유결석·결석이 1회라도 있으면 회복 아님. 계획 이행은 미반영(출석만 판단).</div>';
+
+      var _panelBox = $('hb-cycle-panels');
+      if(!_panelBox){
+        _panelBox = document.createElement('div');
+        _panelBox.id = 'hb-cycle-panels';
+        if(sum.parentNode) sum.parentNode.insertBefore(_panelBox, sum.nextSibling);
+      }
+      var _pStyle = 'display:none;background:var(--surface,#fafaf7);border:1px solid var(--border,#e5e3dc);border-radius:6px;padding:10px 12px;margin:0 0 10px';
+      _panelBox.innerHTML =
+        '<div id="hb-panel-target" style="'+_pStyle+'">'+_panelMemberRows(_targetIds,'target')+'</div>'+
+        '<div id="hb-panel-goal" style="'+_pStyle+'">'+_panelMemberRows(_goalIds,'goal')+'</div>'+
+        '<div id="hb-panel-recover" style="'+_pStyle+'">'+_recoverHeader+
+          (_recoverPending
+            ? '<div class="empty" style="padding:14px">타겟월 '+esc(_targetMo)+' 출결이 아직 완성되지 않아 회복 판정을 보류합니다 (월 말 판정).</div>'
+            : _panelMemberRows(_recoverIds,'recover'))+
+        '</div>';
+
+      var _bindPanel = function(cardId, panelId){
+        var c = $(cardId), p = $(panelId);
+        if(c && p) c.onclick = function(){ p.style.display = (p.style.display==='none' ? '' : 'none'); };
+      };
+      _bindPanel('hb-card-target','hb-panel-target');
+      _bindPanel('hb-card-goal','hb-panel-goal');
+      _bindPanel('hb-card-recover','hb-panel-recover');
     }
 
     if(!list.length){

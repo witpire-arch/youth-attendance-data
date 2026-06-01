@@ -22,11 +22,11 @@
 
 'use strict';
 
-/* Stage 1 robust banner-fire verify (2026-05-29): 'kmjj-v3-banner-verify' → 'kmjj-v4-banner-verify-fire'
-   사용자 Step A 통과 — robust 코드 (731ef5d) 가 페이지에서 실제 실행 중.
-   이 commit 으로 sw.js bytes 변경 → 다음 F5 시 새 SW install 트리거 + robust 코드 가 잡음 → 배너 fire.
+/* cycle 7 (2026-06-01): 'kmjj-v4-banner-verify-fire' → 'kmjj-v5-cycle7-recovery'
+   작업 A(회복 6월 타겟월 기준 fix) + 작업 B(사이클 명단 카드 클릭→명단 펼침) 배포.
+   sw.js bytes 변경 → 다음 F5 시 새 SW install + 업데이트 배너 fire → 사용자 [새로고침] 으로 새 코드 수신.
    Stage 2 에서 commit hash 자동 주입 정착 예정. */
-const CACHE_VERSION = 'kmjj-v4-banner-verify-fire';
+const CACHE_VERSION = 'kmjj-v5-cycle7-recovery';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 
