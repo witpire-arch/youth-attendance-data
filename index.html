@@ -2927,10 +2927,11 @@ function renderStatSum() {
   let _sdv=null;
   try{
     // getDeltaV2가 있으면 우선 사용 (RECORDS 전체 기반)
-    if(typeof window.getDeltaV2==='function') _sdv=window.getDeltaV2();
+    // cycle7: getDeltaV2 는 전 지역 RECORDS 기반 → admin 만 사용. non-admin 은 아래 scopedRecords fallback 으로 region 스코프.
+    if(typeof window.getDeltaV2==='function' && window.currentUser && window.currentUser.role==='admin') _sdv=window.getDeltaV2();
     if(!_sdv){
       // 직접 계산 - window.RECORDS 전체 기반
-      const _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
+      const _allR=(typeof scopedRecords==='function'?scopedRecords():(Array.isArray(window.RECORDS)?window.RECORDS:[])); /* cycle7: region 스코프 (admin=전체) */
       const _sd2=[...new Set(_allR.map(r=>String(r&&r.date||'').slice(0,10)).filter(Boolean))].sort().reverse();
       if(_sd2.length>=2){
         const _c=_sd2[0],_p=_sd2[1];
@@ -2946,7 +2947,7 @@ function renderStatSum() {
     }
   }catch(e){}
   if(!_sdv){
-    try{const _sr=Array.isArray(window.RECORDS)?window.RECORDS:[],_sd=[];
+    try{const _sr=(typeof scopedRecords==='function'?scopedRecords():(Array.isArray(window.RECORDS)?window.RECORDS:[])),_sd=[]; /* cycle7: region 스코프 (admin=전체) */
     _sr.forEach(r=>{const d=String(r&&r.date||'').slice(0,10);if(d&&!_sd.includes(d))_sd.push(d);});
     _sd.sort().reverse();
     if(_sd.length>=2)_sdv={cur:_sd[0],prev:_sd[1],rateDelta:0};
@@ -2986,7 +2987,7 @@ function renderStatSum() {
       // 전주대비: _prev는 전역 records의 dates에서 찾고, 해당 지역 records로 비교
       let deltaHtml='';
       try{
-        const _allR=Array.isArray(window.RECORDS)?window.RECORDS:[];
+        const _allR=(typeof scopedRecords==='function'?scopedRecords():(Array.isArray(window.RECORDS)?window.RECORDS:[])); /* cycle7: region 스코프 (admin=전체) */
         const _allDates=[...new Set(_allR.map(rec=>String(rec&&rec.date||'').slice(0,10)).filter(Boolean))].sort();
         const _cur=_statD||(_allDates.length?_allDates[_allDates.length-1]:'');
         if(_cur){
@@ -4666,6 +4667,8 @@ function openHabitDetail(id, mo, alreadyOnTab=false) {
   const m = MEMBERS.find(x=>x.id===id);
   const el = document.getElementById('habit-detail') || document.getElementById('habit-detail-page');
   if(!m || !el) return;
+  /* cycle7 choke-point: 상세 진입 region 가드. admin=무변동 / non-admin 은 타지역·region없음이면 차단(fail-closed). */
+  if(window.currentUser && window.currentUser.role!=='admin' && (!window.currentUser.region || m.region!==window.currentUser.region)) return;
   currentHabitDetail = { id, mo };
 
   // 보고주제 내 별도 탭으로 이동해서 상세를 보여줌
@@ -6563,6 +6566,8 @@ function renderWeekCompare() {
     const m=MEMBERS.find(x=>x.id===id);
     const el=document.getElementById('cert-detail');
     if(!m||!el) return;
+    /* cycle7 choke-point: 상세 진입 region 가드. admin=무변동 / non-admin 은 타지역·region없음이면 차단(fail-closed). */
+    if(window.currentUser && window.currentUser.role!=='admin' && (!window.currentUser.region || m.region!==window.currentUser.region)) return;
     window.currentCertDetail={id,mo};
     if(!alreadyOnTab){
       nav('report', document.querySelector('button[onclick*="report"]'));
@@ -7362,6 +7367,8 @@ function renderWeekCompare() {
     const m=MEMBERS.find(x=>x.id===id);
     const el=document.getElementById('cert-detail');
     if(!m||!el) return;
+    /* cycle7 choke-point: 상세 진입 region 가드. admin=무변동 / non-admin 은 타지역·region없음이면 차단(fail-closed). */
+    if(window.currentUser && window.currentUser.role!=='admin' && (!window.currentUser.region || m.region!==window.currentUser.region)) return;
     mo=mo || (document.getElementById('gb-date')?.value||'').slice(0,7) || (typeof curMonth==='function'?curMonth():'');
     window.currentCertDetail={id,mo};
     if(!alreadyOnTab){
@@ -8714,8 +8721,27 @@ body.v97-data-loading #login-screen{z-index:9999;}
   function rateBar(p){let col=p>=80?'var(--green)':p>=60?'var(--amber)':'var(--red)'; return '<div class="rb-wrap"><div class="rb"><div class="rf" style="width:'+Math.max(0,Math.min(100,p)).toFixed(1)+'%;background:'+col+'"></div></div><span style="font-size:11px;color:'+col+';font-weight:700">'+p.toFixed(1)+'%</span></div>';}
   function typeBadge(t){t=normType(t); let cls=t==='가족'?'b-fam':t==='가족외'?'b-famx':'b-gen'; return '<span class="badge '+cls+'">'+t+'</span>';}
   function detailBadge(r){let d=detail(r); if(!d)return '-'; let cls=d==='QR인증'?'b-qr':d==='사유결석'?'b-ab':(d==='대체예배'?'b-fam':(d==='인증오류'?'b-ab':'b-sa')); return '<span class="badge '+cls+'">'+esc(d)+'</span>';}
-  function scopedMembers(){syncData(); if(window.currentUser&&currentUser.role!=='admin')return MEMBERS.filter(m=>m.region===currentUser.region); return MEMBERS;}
+  /* cycle7 choke-point 통합: fail-OPEN → fail-CLOSED.
+     admin(role==='admin')=전체(무변동) / region 계정=자기 region / 그 외(미로그인·role없음·region없음)=빈 결과. */
+  function scopedMembers(){
+    syncData();
+    var u = window.currentUser;
+    if(u && u.role==='admin') return MEMBERS;                                  // admin = 전체 (무변동)
+    if(u && u.region) return MEMBERS.filter(function(m){return m.region===u.region;});  // region 계정
+    return [];                                                                 // fail-closed
+  }
   window.getFilteredMembers=scopedMembers;
+  /* cycle7 choke-point 통합: 출결 레코드 region 접근자 (멤버측 scopedMembers 와 대칭).
+     admin=전체 records(무변동) / region 계정=자기 region 멤버 id 의 records / 그 외=빈 (fail-closed). */
+  function scopedRecords(){
+    var recs = Array.isArray(window.RECORDS) ? window.RECORDS : [];
+    var u = window.currentUser;
+    if(u && u.role==='admin') return recs;                 // admin = 전체 (무변동)
+    if(!(u && u.region)) return [];                         // fail-closed
+    var ids = {}; scopedMembers().forEach(function(m){ if(m && m.id) ids[m.id]=1; });
+    return recs.filter(function(r){ return r && ids[r.id]; });
+  }
+  window.scopedRecords=scopedRecords;
   function renderReasonAnalysis(){
     let mo=currentMonth(), recs=monthRecs(mo).filter(r=>r.st==='사유결석'); let cnt={}; recs.forEach(r=>{let k=c(r.rsn)||'사유없음'; cnt[k]=(cnt[k]||0)+1;});
     let root=document.getElementById('overview-extra-analysis'); if(!root){root=document.createElement('div'); root.id='overview-extra-analysis'; let after=document.getElementById('type-cards')||document.getElementById('ov-sections')||document.getElementById('ov-metrics'); if(after) after.insertAdjacentElement('afterend',root);}
@@ -8764,7 +8790,7 @@ body.v97-data-loading #login-screen{z-index:9999;}
   function prevMonth(mo){var y=+mo.slice(0,4), m=+mo.slice(5,7)-1; if(m<1){y--;m=12;} return y+'-'+String(m).padStart(2,'0');}
   function normType(t){t=clean(t).replace(/\s+/g,''); if(t.indexOf('가족외')>-1||t.indexOf('가족外')>-1)return '가족외'; if(t.indexOf('가족')>-1)return '가족'; return '일반';}
   function recs(){return Array.isArray(window.RECORDS)?window.RECORDS:[];}
-  function scopedMembers(){var arr=Array.isArray(window.MEMBERS)?window.MEMBERS:[]; if(window.currentUser&&window.currentUser.role!=='admin')arr=arr.filter(function(m){return clean(m.region)===clean(window.currentUser.region);}); var reg=clean(document.getElementById('habit-reg')&&document.getElementById('habit-reg').value); if(reg)arr=arr.filter(function(m){return clean(m.region)===reg;}); var zone=clean(document.getElementById('habit-zone')&&document.getElementById('habit-zone').value); if(zone){var _znorm=(typeof normalizeTeamZone==='function')?normalizeTeamZone(zone):zone;arr=arr.filter(function(m){var _mz=(typeof normalizeTeamZone==='function')?normalizeTeamZone((m.team||'')+'-'+(m.zone||'')):clean((m.team||'')+'-'+(m.zone||''));return _mz===_znorm;});} return arr;}
+  function scopedMembers(){var arr=Array.isArray(window.MEMBERS)?window.MEMBERS:[]; var _u=window.currentUser; if(!(_u&&_u.role==='admin')){ arr=(_u&&_u.region)?arr.filter(function(m){return clean(m.region)===clean(_u.region);}):[]; } /* cycle7: admin=전체(무변동), region=자기 region, 그 외=빈(fail-closed) */ var reg=clean(document.getElementById('habit-reg')&&document.getElementById('habit-reg').value); if(reg)arr=arr.filter(function(m){return clean(m.region)===reg;}); var zone=clean(document.getElementById('habit-zone')&&document.getElementById('habit-zone').value); if(zone){var _znorm=(typeof normalizeTeamZone==='function')?normalizeTeamZone(zone):zone;arr=arr.filter(function(m){var _mz=(typeof normalizeTeamZone==='function')?normalizeTeamZone((m.team||'')+'-'+(m.zone||'')):clean((m.team||'')+'-'+(m.zone||''));return _mz===_znorm;});} return arr;}
   function detail(r){
     if(!r)return '';
     var st=clean(r.st||r['출석유형']||r['출결']);

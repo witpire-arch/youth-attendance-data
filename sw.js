@@ -22,13 +22,15 @@
 
 'use strict';
 
-/* cycle 7 hotfix (2026-06-01): 'kmjj-v6-cycle7-panel-perm' → 'kmjj-v7-longabsent-perm'
-   8회 이상 결석자(renderLongAbsent) region 누수 차단 — 활성 함수가 getLongAbsentList(region-scoped)를
-   우회해 arrMembers()(raw)를 직접 써서 지역 계정이 "전체 지역" 기본값으로 전 지역 결석자 노출하던 것.
-   fix: getFilteredMembers() + fail-closed 가드 + 드롭다운 non-admin "전체 지역" 제거/자기 region 고정.
+/* cycle 7 (2026-06-01): 'kmjj-v7-longabsent-perm' → 'kmjj-v8-region-chokepoint'
+   region 스코프 단일 choke-point 통합 + audit 잔여 정리:
+   - scopedMembers fail-OPEN → fail-CLOSED (미로그인/region없음 → 빈 결과), admin 무변동
+   - scopedRecords() 신설 (출결 region 접근자, admin=전체)
+   - renderStatSum 전주대비 delta → scopedRecords (수치 region 스코프, getDeltaV2 는 admin 만)
+   - openHabitDetail/openCertDetail region 가드 추가
    sw.js bytes 변경 → 다음 F5 시 새 SW install + 업데이트 배너 fire → 사용자 [새로고침] 으로 새 코드 수신.
    Stage 2 에서 commit hash 자동 주입 정착 예정. */
-const CACHE_VERSION = 'kmjj-v7-longabsent-perm';
+const CACHE_VERSION = 'kmjj-v8-region-chokepoint';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 
