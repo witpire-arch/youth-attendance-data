@@ -22,11 +22,12 @@
 
 'use strict';
 
-/* cycle 7 (2026-06-01): 'kmjj-v4-banner-verify-fire' → 'kmjj-v5-cycle7-recovery'
-   작업 A(회복 6월 타겟월 기준 fix) + 작업 B(사이클 명단 카드 클릭→명단 펼침) 배포.
+/* cycle 7 hotfix (2026-06-01): 'kmjj-v5-cycle7-recovery' → 'kmjj-v6-cycle7-panel-perm'
+   작업 B 카드 클릭 명단 패널 0-B 권한 누수 재발 차단 — 3개 패널(타겟 설정/월목표 입력/회복)
+   렌더 choke-point(_panelMemberRows)에 isAdmin()+region+fail-closed 가드 강제.
    sw.js bytes 변경 → 다음 F5 시 새 SW install + 업데이트 배너 fire → 사용자 [새로고침] 으로 새 코드 수신.
    Stage 2 에서 commit hash 자동 주입 정착 예정. */
-const CACHE_VERSION = 'kmjj-v5-cycle7-recovery';
+const CACHE_VERSION = 'kmjj-v6-cycle7-panel-perm';
 const STATIC_CACHE = CACHE_VERSION + '-static';
 const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
 

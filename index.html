@@ -16360,11 +16360,25 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
 
       /* ── cycle 7 작업 B: 카드 클릭 → 명단 펼침 (타겟 설정 / 월목표 입력 / 회복) ──
          '타겟 현황' 탭의 카드→패널 토글 패턴 재사용. 사이클 명단(totalN) 카드는 제외 — 이미 아래 표에 노출.
-         🔒 권한(0-B 재발 방지): 세 패널 명단 모두 allIds 에서 파생.
-            allIds 는 위 Issue 0-B fix 로 이미 isAdmin() 게이트 + region 필터 + fail-closed(allIds=[]) 적용됨
-            → 지역 계정은 카드를 클릭해도 자기 region 명단만, currentUser/region 미설정이면 빈 명단. */
+         🔒 권한(0-B 누수 재발 차단, cycle 7 hotfix): 세 패널 명단은 전부 _panelMemberRows 를
+            거치며, 이 함수가 렌더 직전 0-B 와 동일한 가드를 '직접' 강제한다 (단일 choke-point).
+            → 타겟 설정/월목표 입력/회복 3개 뷰 모두 동일 가드 적용 (allIds 필터에 의존하지 않는 독립 방어).
+            admin = 전체 / non-admin = 자기 region 만 / non-admin 인데 region falsy = 빈 명단 (fail-closed). */
       var _panelMemberRows = function(ids, kind){
         var rows = ids.map(function(id){ return memMap[id]; }).filter(function(m){ return !!m; });
+        /* 🔒 0-B 가드 (모든 패널 강제) — region 누수 차단 */
+        if(!isAdmin()){
+          var _myReg = (window.currentUser && window.currentUser.region) || '';
+          if(_myReg){
+            rows = rows.filter(function(m){ return m.region === _myReg; });
+          } else {
+            if(!applyPlanSnapshotToBody.__panelFailClosedWarned){
+              applyPlanSnapshotToBody.__panelFailClosedWarned = true;
+              console.warn('[cycle7-panel] non-admin without region (or no currentUser) — 빈 패널 명단 fail-closed');
+            }
+            rows = [];
+          }
+        }
         rows.sort(function(a,b){
           var rc = String(a.region||'').localeCompare(String(b.region||''),'ko');
           if(rc!==0) return rc;
@@ -16393,6 +16407,7 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           '<div class="tw"><table>'+head+'<tbody>'+bodyRows+'</tbody></table></div>';
       };
 
+      /* id 풀: allIds 는 위 0-B fix 로 이미 region-scoped. _panelMemberRows 가 한 번 더 가드(이중 방어). */
       var _targetIds = allIds.filter(function(id){ return !!targets[id+'_habit']; });
       var _goalIds = allIds.filter(function(id){ return _mpForCount[id] && String(_mpForCount[id].goal||'').trim(); });
       var _recoverIds = Object.keys(_recoverIdSet);
