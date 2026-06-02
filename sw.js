@@ -1,181 +1,54 @@
 /* ════════════════════════════════════════════════════════════════
-   출결관리 시스템 Service Worker — 2차 로드 속도 개선
+   Service Worker — KILL-SWITCH (cycle 7, 2026-06-01)
 
-   목표: 콜드 4895ms → 2차 ~1500ms (Ctrl+R / 일반 navigation)
+   결정: 오프라인/캐시 불필요 확정 → Service Worker 를 완전히 제거한다.
+   이 파일은 더 이상 어떤 자원도 캐시하지 않으며, 기존 사용자에게 남아있는
+   SW 와 Cache Storage 를 '자기 자신 포함' 깨끗이 제거(self-destruct)한다.
+   → CACHE_VERSION 수동 bump 영구 종료. 코드 변경은 일반 새로고침으로 즉시 반영.
 
-   캐시 전략:
-     1. Precache: 페이지 진입에 필요한 최소 자산 (index.html)
-     2. Runtime cache:
-        - 정적 자산 (HTML/CSS/Fonts): stale-while-revalidate
-        - 외부 CDN (Chart.js / XLSX / Firebase SDK): cache-first (1주일)
-     3. Firebase Realtime DB (firebaseio.com): cache 안 함 (fresh)
+   동작:
+     install  : skipWaiting() — 대기 없이 즉시 활성화
+     activate : (1) 모든 Cache Storage 삭제 (이전 kmjj-v* static/runtime 포함)
+                (2) clients.claim() — 열린 탭 제어권 확보
+                (3) registration.unregister() — 자기 등록 해제
+                (4) 열린 탭 navigate(reload) 1회 — SW/캐시 떨어진 fresh 상태로 재진입
+     fetch    : 핸들러 없음 → 모든 요청 네트워크 직행 (캐시 개입 0)
 
-   버전 관리:
-     CACHE_VERSION 변경 시 이전 캐시 자동 삭제
-     index.html 변경 시 SW 가 stale-while-revalidate 로 백그라운드 갱신
-     → 한 번 reload 후 새 버전 적용
-
-   디버그 (index.html 에서):
-     window.__unregisterSW()  — SW 등록 해제
-     window.__clearSWCache()  — 모든 캐시 삭제
+   배포 메커니즘:
+     - 신규 방문자: index.html 에 등록 코드가 없으므로 SW 가 아예 생성되지 않음.
+     - 기존 사용자: 브라우저의 자동 sw.js 갱신 검사가 이 파일을 받아 위 activate 를
+       실행 → SW/캐시 자가 해제 + 탭 1회 reload. 이후로는 SW 없는 순수 네트워크 동작.
    ════════════════════════════════════════════════════════════════ */
 
 'use strict';
 
-/* cycle 7 (2026-06-01): 'kmjj-v7-longabsent-perm' → 'kmjj-v8-region-chokepoint'
-   region 스코프 단일 choke-point 통합 + audit 잔여 정리:
-   - scopedMembers fail-OPEN → fail-CLOSED (미로그인/region없음 → 빈 결과), admin 무변동
-   - scopedRecords() 신설 (출결 region 접근자, admin=전체)
-   - renderStatSum 전주대비 delta → scopedRecords (수치 region 스코프, getDeltaV2 는 admin 만)
-   - openHabitDetail/openCertDetail region 가드 추가
-   sw.js bytes 변경 → 다음 F5 시 새 SW install + 업데이트 배너 fire → 사용자 [새로고침] 으로 새 코드 수신.
-   Stage 2 에서 commit hash 자동 주입 정착 예정. */
-const CACHE_VERSION = 'kmjj-v8-region-chokepoint';
-const STATIC_CACHE = CACHE_VERSION + '-static';
-const RUNTIME_CACHE = CACHE_VERSION + '-runtime';
-
-/* SW 자기 위치 기준 — github.io/youth-attendance-data/sw.js 면 scope = /youth-attendance-data/ */
-const SCOPE = self.registration ? self.registration.scope : self.location.origin + '/';
-const BASE = new URL(SCOPE).pathname; /* '/youth-attendance-data/' */
-
-/* 페이지 진입에 꼭 필요한 minimum precache */
-const PRECACHE_URLS = [
-  BASE,
-  BASE + 'index.html'
-];
-
-/* Firebase Realtime DB — 절대 cache 안 함 (항상 fresh) */
-const NEVER_CACHE_HOSTS = [
-  'firebaseio.com',
-  '.firebase.com'
-];
-
-/* 외부 CDN 정적 자원 — cache-first (1주일) */
-const CACHE_FIRST_HOSTS = [
-  'fonts.googleapis.com',
-  'fonts.gstatic.com',
-  'www.gstatic.com',         /* firebase SDK */
-  'cdn.jsdelivr.net',         /* chart.js */
-  'cdnjs.cloudflare.com'      /* xlsx */
-];
-
-const CDN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; /* 7 days */
-
-/* ── Install: precache 핵심 자산 ──────────────────────────────────── */
-self.addEventListener('install', (event) => {
-  console.log('[SW] install ' + CACHE_VERSION);
-  event.waitUntil(
-    caches.open(STATIC_CACHE)
-      .then((cache) => cache.addAll(PRECACHE_URLS).catch((err) => {
-        console.warn('[SW] precache failed (계속 진행):', err);
-      }))
-      .then(() => self.skipWaiting())
-  );
+self.addEventListener('install', function () {
+  /* 대기열 건너뛰고 즉시 activate 로 진입 */
+  self.skipWaiting();
 });
 
-/* ── Activate: 이전 버전 캐시 삭제 ──────────────────────────────────── */
-self.addEventListener('activate', (event) => {
-  console.log('[SW] activate ' + CACHE_VERSION);
-  event.waitUntil(
-    caches.keys()
-      .then((names) => Promise.all(
-        names
-          .filter((n) => n.startsWith('kmjj-') && n !== STATIC_CACHE && n !== RUNTIME_CACHE)
-          .map((n) => {
-            console.log('[SW] delete old cache: ' + n);
-            return caches.delete(n);
-          })
-      ))
-      .then(() => self.clients.claim())
-  );
-});
+self.addEventListener('activate', function (event) {
+  event.waitUntil((async function () {
+    /* (1) 모든 캐시 삭제 */
+    try {
+      var keys = await caches.keys();
+      await Promise.all(keys.map(function (k) { return caches.delete(k); }));
+    } catch (e) { /* noop */ }
 
-/* ── Fetch: 라우팅 ──────────────────────────────────────────────────── */
-self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return; /* POST / PUT 등은 SW 우회 */
-  const url = new URL(req.url);
+    /* (2) 열린 탭 제어권 확보 (navigate 가능하게) */
+    try { await self.clients.claim(); } catch (e) { /* noop */ }
 
-  /* (1) Firebase Realtime DB — 절대 cache, fresh 응답 */
-  if (NEVER_CACHE_HOSTS.some(h => url.hostname.endsWith(h))) {
-    return; /* SW 우회 — 브라우저가 직접 네트워크 처리 */
-  }
+    /* (3) 자기 등록 해제 — 이후 네비게이션은 SW 없이 동작 */
+    try { await self.registration.unregister(); } catch (e) { /* noop */ }
 
-  /* (2) 외부 CDN — cache-first with stale revalidation */
-  if (CACHE_FIRST_HOSTS.some(h => url.hostname === h || url.hostname.endsWith('.' + h))) {
-    event.respondWith(cacheFirstWithRefresh(req, RUNTIME_CACHE, CDN_MAX_AGE_MS));
-    return;
-  }
-
-  /* (3) 같은 origin 의 정적 자원 (HTML/CSS/JS/이미지) — stale-while-revalidate */
-  if (url.origin === self.location.origin) {
-    /* HTML navigation 요청 — stale-while-revalidate, 빠른 응답 우선 */
-    event.respondWith(staleWhileRevalidate(req, STATIC_CACHE));
-    return;
-  }
-
-  /* 그 외 (다른 origin) — 네트워크 그대로 */
-});
-
-/* ── Strategy: cache-first with background refresh ──────────────── */
-function cacheFirstWithRefresh(req, cacheName, maxAge) {
-  return caches.open(cacheName).then((cache) => {
-    return cache.match(req).then((cached) => {
-      /* 캐시 적중 & 신선도 OK → 즉시 반환 */
-      if (cached) {
-        const dateHeader = cached.headers.get('date');
-        const age = dateHeader ? (Date.now() - new Date(dateHeader).getTime()) : Infinity;
-        if (age < maxAge) {
-          /* fresh: 캐시만 반환 */
-          return cached;
-        }
-        /* stale: 캐시 반환 + 백그라운드 갱신 */
-        fetch(req).then((res) => {
-          if (res && res.status === 200) cache.put(req, res);
-        }).catch(() => {});
-        return cached;
-      }
-      /* 캐시 miss → 네트워크 + 캐시 저장 */
-      return fetch(req).then((res) => {
-        if (res && res.status === 200) {
-          cache.put(req, res.clone());
-        }
-        return res;
+    /* (4) 열린 탭을 1회 reload → 캐시/SW 떨어진 fresh 상태로 재진입 */
+    try {
+      var clientList = await self.clients.matchAll({ type: 'window' });
+      clientList.forEach(function (client) {
+        try { client.navigate(client.url); } catch (e) { /* noop */ }
       });
-    });
-  });
-}
-
-/* ── Strategy: stale-while-revalidate ───────────────────────────── */
-function staleWhileRevalidate(req, cacheName) {
-  return caches.open(cacheName).then((cache) => {
-    return cache.match(req).then((cached) => {
-      const networkPromise = fetch(req).then((res) => {
-        if (res && res.status === 200) {
-          cache.put(req, res.clone()).catch(() => {});
-        }
-        return res;
-      }).catch((err) => {
-        /* 네트워크 실패: 캐시가 있으면 캐시 사용, 없으면 throw */
-        if (cached) return cached;
-        throw err;
-      });
-      /* 캐시 있으면 즉시 반환 + 백그라운드 갱신 */
-      return cached || networkPromise;
-    });
-  });
-}
-
-/* ── Message: client 에서 명시적 cache clear 요청 ─────────────────── */
-self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'CLEAR_CACHE') {
-    caches.keys().then((names) => {
-      return Promise.all(names.filter((n) => n.startsWith('kmjj-')).map((n) => caches.delete(n)));
-    }).then(() => {
-      console.log('[SW] caches cleared');
-      if (event.ports && event.ports[0]) event.ports[0].postMessage({ ok: true });
-    });
-  } else if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
+    } catch (e) { /* noop */ }
+  })());
 });
+
+/* fetch 핸들러 의도적으로 없음 — 모든 요청은 브라우저가 네트워크로 직접 처리. */
