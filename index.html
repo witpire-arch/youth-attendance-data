@@ -9032,8 +9032,27 @@ body.v97-data-loading #login-screen{z-index:9999;}
 
   function applyFinalData(){
     try {
-      MEMBERS = FINAL_MEMBERS.map(function(m){ return Object.assign({}, m); });
+      /* Option A (bug-2 핑퐁 fix): 재빌드 시 FINAL_MEMBERS(고정 스냅샷) ∪
+         (현재 window.MEMBERS 중 FINAL 에 없는 '실제 회원') 을 보존.
+         → Firebase 로 추가된 신규(이광명 등)가 매 applyFinalData 호출마다 drop 되지 않음
+           → applyFinalData ↔ bug-2-guard rescue 핑퐁 정지 + MEMBERS 정본(1636) 안정화.
+         junk(고유번호 형식·이름 비정상)는 union 제외 (renderLongAbsent 등과 동일 실제-회원 기준). */
+      var _finalIds = {};
+      FINAL_MEMBERS.forEach(function(m){ if(m && m.id) _finalIds[String(m.id)] = 1; });
+      var _RX_REAL_ID = /^\d{8}-\d{4,6}$/;
+      var _extraSeen = {}, _extras = [];
+      (Array.isArray(window.MEMBERS) ? window.MEMBERS : []).forEach(function(m){
+        if(!m || !m.id) return;
+        var id = String(m.id);
+        if(_finalIds[id] || _extraSeen[id]) return;                              /* FINAL 에 이미 있거나 중복 */
+        if(!_RX_REAL_ID.test(id) || String(m.name||'').trim() === '') return;    /* junk 제외 */
+        _extraSeen[id] = 1;
+        _extras.push(Object.assign({}, m));
+      });
+
+      MEMBERS = FINAL_MEMBERS.map(function(m){ return Object.assign({}, m); }).concat(_extras);
       RECORDS = FINAL_RECORDS.map(function(r){ return Object.assign({}, r, {date:nd(r.date), st:status(r.st)}); });
+      if(_extras.length){ try{ console.log('[final apply] FINAL ' + FINAL_MEMBERS.length + ' + 신규 보존 ' + _extras.length + ' = ' + MEMBERS.length + ' (핑퐁 방지 union)'); }catch(_){} }
       // 전역 RECORDS/MEMBERS도 업데이트
       if(Array.isArray(window.RECORDS)){window.RECORDS.length=0; RECORDS.forEach(function(r){window.RECORDS.push(r);});}
       else { window.RECORDS = RECORDS.slice(); }
@@ -9043,7 +9062,7 @@ body.v97-data-loading #login-screen{z-index:9999;}
       localStorage.setItem('att_members_v1', JSON.stringify(MEMBERS));
       localStorage.setItem('att_records_v1', JSON.stringify(RECORDS));
       localStorage.removeItem('att_week_snapshots_v57');
-      localStorage.removeItem('att_auto_backups_v57');
+      /* Option A: att_auto_backups_v57 삭제 제거 — 업로드 사전 백업(안전망) 보존 */
     } catch(e) {
       console.error('[final apply failed]', e);
     }
