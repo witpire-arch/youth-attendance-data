@@ -20395,6 +20395,69 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           var backupResult = await backupMembers();
           console.log('[task-8] 백업 완료:', backupResult.fname, '(Firebase ' + backupResult.count + '명, in-memory ' + backupResult.memCount + '명' + (backupResult.mismatch ? ' ⚠️ mismatch' : '') + ')');
 
+          /* (1.5) task-8 fix — 미리보기 == 적용 보장 (과다 제거 차단) ──────────────
+             버그: preview.removed 는 Firebase 정본(truth)으로 계산되는데, apply 는
+             handleUpload 끝의 bulkSave 가 .set() 으로 /members 를 window.MEMBERS(전체 교체)로 덮어씀.
+             window.MEMBERS 가 bug-2 silent-drop 으로 짧으면 → preview 에 없던 회원까지 통째 삭제(과다 제거).
+             fix: apply 직전 window.MEMBERS 를 truth(preview 와 동일 소스)로 재시드 + preview.removed 만 제거.
+                  → handleUpload 가 added/변경 반영 후 bulkSave 하면
+                    최종 /members = truth − removed + added(+변경) = preview 와 정확히 일치. */
+          try{
+            if(Array.isArray(truth.members) && truth.members.length){
+              var _rmSet = {}; (diff.removed||[]).forEach(function(r){ if(r && r.id!=null) _rmSet[String(r.id)] = 1; });
+              var _seed = truth.members
+                .filter(function(m){ return m && m.id!=null && !_rmSet[String(m.id)]; })
+                .map(function(m){ return JSON.parse(JSON.stringify(m)); });
+              if(Array.isArray(window.MEMBERS)){ window.MEMBERS.length = 0; _seed.forEach(function(m){ window.MEMBERS.push(m); }); }
+              else { window.MEMBERS = _seed; }
+              console.log('[task-8 fix] window.MEMBERS 재시드: truth ' + truth.members.length + ' − removed ' + Object.keys(_rmSet).length + ' = ' + window.MEMBERS.length + ' (handleUpload 가 added/updated 반영 예정)');
+            } else {
+              alert('정본 명단(truth)을 가져오지 못해 과다 제거 위험이 있습니다. 적용을 중단합니다.');
+              console.error('[task-8 fix] truth.members 비어있음 — apply 중단 (fail-closed)');
+              return;
+            }
+          }catch(_seedErr){
+            alert('명단 재시드 실패 — 안전을 위해 적용을 중단합니다: ' + _seedErr.message);
+            console.error('[task-8 fix] 재시드 실패:', _seedErr);
+            return;
+          }
+
+          /* (1.6) task-8 fix — records 도 동일 보호 ─────────────────────
+             bulkSave 가 /records 도 .set() 으로 window.RECORDS 전체 교체 → window.RECORDS 가 stale 하면
+             과거 출결이 통째로 clobber. apply 직전 Firebase /records(정본)로 재시드 + fail-closed.
+             ⚠️ 가드: 정본이 비었거나(0건) 메모리보다 크게 적으면(=정본이 오히려 손상/clobber 의심)
+                그걸로 재시드하면 더 망가지므로 적용 중단 — /records 복원을 먼저 하도록 유도. */
+          try{
+            if(!window.fbDB || typeof window.fbDB.ref !== 'function'){
+              alert('Firebase 미연결 — records 정본 확인 불가, 적용 중단.');
+              console.error('[task-8 fix] fbDB 없음 — records 재시드 불가 (fail-closed)');
+              return;
+            }
+            var _memRecN = Array.isArray(window.RECORDS) ? window.RECORDS.length : 0;
+            var _recSnap = await window.fbDB.ref('records').once('value');
+            var _recVal = _recSnap.val() || {};
+            var _recKeys = Object.keys(_recVal);
+            var _fbRecN = _recKeys.length;
+            if(!_fbRecN){
+              alert('Firebase /records 가 비어있음 — clobber 위험, 적용 중단. /records 복원을 먼저 하세요.');
+              console.error('[task-8 fix] /records 정본 0건 — apply 중단 (fail-closed)');
+              return;
+            }
+            if(_memRecN > _fbRecN + 100){
+              alert('Firebase /records(' + _fbRecN + '건)가 메모리(' + _memRecN + '건)보다 크게 적습니다 — /records 손상(clobber) 의심.\n적용을 중단합니다. /records 를 먼저 복원하세요.');
+              console.error('[task-8 fix] /records 정본(' + _fbRecN + ') < 메모리(' + _memRecN + ') — apply 중단 (fail-closed)');
+              return;
+            }
+            var _recSeed = _recKeys.map(function(k){ var r = _recVal[k] || {}; return { id:String(r.id), date:r.date, wk:r.wk||1, day:r.day||'일', st:r.st, rsn:r.rsn||'', streak:r.streak||0 }; });
+            if(Array.isArray(window.RECORDS)){ window.RECORDS.length = 0; _recSeed.forEach(function(r){ window.RECORDS.push(r); }); }
+            else { window.RECORDS = _recSeed; }
+            console.log('[task-8 fix] window.RECORDS 재시드: Firebase /records ' + _fbRecN + '건 (메모리 직전 ' + _memRecN + '건) — bulkSave .set() clobber 차단');
+          }catch(_recErr){
+            alert('records 재시드 실패 — 안전을 위해 적용을 중단합니다: ' + _recErr.message);
+            console.error('[task-8 fix] records 재시드 실패:', _recErr);
+            return;
+          }
+
           /* (2) 유형 보호 (옵션) */
           if(opts.typeMode === 'keep' && diff.typeChanged.length > 0){
             var typeSnapshot = {};
