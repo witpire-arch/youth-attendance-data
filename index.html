@@ -17595,25 +17595,25 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
     var actives = activeIdSet();
     var region = isRegionUser() ? userRegion() : null;
     var before = (Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0);
-    filterArrInPlace(window.MEMBERS, function(m){
+    /* bug-2 핑퐁 fix: record 없는 '신규/실제 회원'은 drop 하지 않는다 (신규는 record 없는 게 정상).
+       이전: actives(=record 보유 id) 만 유지 → record 0건 신규 회원을 phantom 으로 drop →
+             bug-2-guard 가 정본에서 복원 → 다음 렌더에 또 drop … 30초 핑퐁 + 느림.
+       변경: record 보유 OR '실제 회원'(고유번호 형식 + 이름) 이면 유지. junk(A001/홍길동/팀명 등)만 제거.
+       (판정 기준은 getLongAbsentList(11365)·renderLongAbsent 의 실제-회원 검증과 동일.) */
+    var _RX_REAL_ID = /^\d{8}-\d{4,6}$/;
+    function _keepReal(m){ return !!m && _RX_REAL_ID.test(String(m.id||'')) && String(m.name||'').trim() !== ''; }
+    function _passActive(m){
       if(!m || !m.id) return false;
       if(region && m.region !== region) return false;
-      return !!actives[m.id];
-    });
+      return !!actives[m.id] || _keepReal(m);
+    }
+    filterArrInPlace(window.MEMBERS, _passActive);
     try{
       if(typeof MEMBERS !== 'undefined' && Array.isArray(MEMBERS)){
-        filterArrInPlace(MEMBERS, function(m){
-          if(!m || !m.id) return false;
-          if(region && m.region !== region) return false;
-          return !!actives[m.id];
-        });
+        filterArrInPlace(MEMBERS, _passActive);
       }
     }catch(e){}
-    filterArrInPlace(window.FINAL_MEMBERS, function(m){
-      if(!m || !m.id) return false;
-      if(region && m.region !== region) return false;
-      return !!actives[m.id];
-    });
+    filterArrInPlace(window.FINAL_MEMBERS, _passActive);
     var after = (Array.isArray(window.MEMBERS) ? window.MEMBERS.length : 0);
     /* [4] active count 디버그 로그 — Phase 1.5: dedup (값이 변할 때만 출력) */
     var rsCount = Object.keys(actives).length;
