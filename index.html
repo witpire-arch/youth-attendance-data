@@ -10360,10 +10360,10 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
   }
   window.mobileDownload = mobileDownload;
 
-  // CSV 내보내기: data URI 대신 Blob 방식으로 변경(휴대폰 다운로드 안정화), 고유번호 컬럼은 제외
+  // CSV 내보내기: Blob 방식(휴대폰 다운로드 안정화). 고유번호 컬럼 포함 → 내보낸 파일 그대로 재업로드 가능(round-trip, 업로드 파서가 고유번호로 매칭).
   window.exportCSV = function(){
     var mo = safe(function(){return typeof curMonth==='function'?curMonth():new Date().toISOString().slice(0,7);}, new Date().toISOString().slice(0,7));
-    var rows=[['지역','팀-구역','이름','유형','등록구분','출석유형','사유','날짜','연속결석횟수','출석률(%)','마지막출석일','습결자타겟','E단계타겟']];
+    var rows=[['고유번호','지역','팀-구역','이름','유형','등록구분','출석유형','사유','날짜','연속결석횟수','출석률(%)','마지막출석일','습결자타겟','E단계타겟']];
     var targetObj = safe(function(){return typeof getTargets==='function'?getTargets():{};},{});
     var arr = safe(function(){return (typeof getFilteredMembers==='function'?getFilteredMembers():(Array.isArray(window.MEMBERS)?window.MEMBERS:[]))||[];},[]);
     arr.forEach(function(m){
@@ -10374,7 +10374,7 @@ button.nav-item[onclick*="nav('streak'"]{display:none !important;}
       var sk=safe(function(){return typeof latestStreak==='function'?latestStreak(m.id):0;},0);
       var tz=safe(function(){return typeof getTeamZone==='function'?getTeamZone(m):(m.team||'');},m.team||'');
       var last=safe(function(){return typeof lastAttendDate==='function'?(lastAttendDate(m.id)||''):'';},'');
-      rows.push([m.region||'',tz,m.name||'',m.type||'',m.regType||'',r.st||'',r.rsn||'',r.date||'',sk,p,last,targetObj[m.id+'_habit']?'Y':'',targetObj[m.id+'_estage']?'Y':'']);
+      rows.push([m.id||'',m.region||'',tz,m.name||'',m.type||'',m.regType||'',r.st||'',r.rsn||'',r.date||'',sk,p,last,targetObj[m.id+'_habit']?'Y':'',targetObj[m.id+'_estage']?'Y':'']);
     });
     var csv='\uFEFF'+rows.map(function(row){return row.map(function(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
     mobileDownload('출결현황_'+mo+'.csv','text/csv;charset=utf-8',csv);
