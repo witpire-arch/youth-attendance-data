@@ -9037,6 +9037,8 @@ body.v97-data-loading #login-screen{z-index:9999;}
          → Firebase 로 추가된 신규(이광명 등)가 매 applyFinalData 호출마다 drop 되지 않음
            → applyFinalData ↔ bug-2-guard rescue 핑퐁 정지 + MEMBERS 정본(1636) 안정화.
          junk(고유번호 형식·이름 비정상)는 union 제외 (renderLongAbsent 등과 동일 실제-회원 기준). */
+      var _removedIds = {};
+      try { (JSON.parse(localStorage.getItem('att_removed_ids') || '[]') || []).forEach(function(id){ _removedIds[String(id)] = 1; }); } catch(_){}
       var _finalIds = {};
       FINAL_MEMBERS.forEach(function(m){ if(m && m.id) _finalIds[String(m.id)] = 1; });
       var _RX_REAL_ID = /^\d{8}-\d{4,6}$/;
@@ -9044,13 +9046,18 @@ body.v97-data-loading #login-screen{z-index:9999;}
       (Array.isArray(window.MEMBERS) ? window.MEMBERS : []).forEach(function(m){
         if(!m || !m.id) return;
         var id = String(m.id);
-        if(_finalIds[id] || _extraSeen[id]) return;                              /* FINAL 에 이미 있거나 중복 */
+        if(_finalIds[id] || _extraSeen[id] || _removedIds[id]) return;           /* FINAL 에 있거나 중복이거나 삭제된 id */
         if(!_RX_REAL_ID.test(id) || String(m.name||'').trim() === '') return;    /* junk 제외 */
         _extraSeen[id] = 1;
         _extras.push(Object.assign({}, m));
       });
 
-      MEMBERS = FINAL_MEMBERS.map(function(m){ return Object.assign({}, m); }).concat(_extras);
+      /* att_removed_ids: 재적 업로드에서 제거된 회원은 FINAL 스냅샷에서도 제외 → 부활 방지.
+         (FINAL_MEMBERS 는 삭제를 모르는 고정 스냅샷이라, 이 집합으로 제거를 영구 반영.) */
+      MEMBERS = FINAL_MEMBERS
+        .filter(function(m){ return !(m && m.id && _removedIds[String(m.id)]); })
+        .map(function(m){ return Object.assign({}, m); })
+        .concat(_extras);
       RECORDS = FINAL_RECORDS.map(function(r){ return Object.assign({}, r, {date:nd(r.date), st:status(r.st)}); });
       if(_extras.length){ try{ console.log('[final apply] FINAL ' + FINAL_MEMBERS.length + ' + 신규 보존 ' + _extras.length + ' = ' + MEMBERS.length + ' (핑퐁 방지 union)'); }catch(_){} }
       // 전역 RECORDS/MEMBERS도 업데이트
@@ -20440,6 +20447,17 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
             console.error('[task-8 fix] 재시드 실패:', _seedErr);
             return;
           }
+
+          /* (1.5b) 제거된 id 영구 기록(att_removed_ids) → applyFinalData 가 FINAL 스냅샷에서
+             부활시키지 않도록. CSV 에 (다시) 포함된 id 는 집합에서 해제(재가입 대비). */
+          try{
+            var _prevRm = []; try{ _prevRm = JSON.parse(localStorage.getItem('att_removed_ids') || '[]') || []; }catch(_){}
+            var _rmMerged = {};
+            _prevRm.forEach(function(id){ if(!extracted.map[String(id)]) _rmMerged[String(id)] = 1; });   /* CSV 에 있으면 removed 해제 */
+            (diff.removed||[]).forEach(function(r){ if(r && r.id != null) _rmMerged[String(r.id)] = 1; });
+            localStorage.setItem('att_removed_ids', JSON.stringify(Object.keys(_rmMerged)));
+            console.log('[task-8 fix] att_removed_ids = ' + Object.keys(_rmMerged).length + '건 (이번 removed ' + (diff.removed||[]).length + '명 반영, FINAL 부활 방지)');
+          }catch(_rmErr){ console.warn('[task-8 fix] att_removed_ids 기록 실패:', _rmErr); }
 
           /* (1.6) task-8 fix — records 도 동일 보호 ─────────────────────
              bulkSave 가 /records 도 .set() 으로 window.RECORDS 전체 교체 → window.RECORDS 가 stale 하면
