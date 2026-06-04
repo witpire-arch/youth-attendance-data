@@ -20421,32 +20421,19 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
           var backupResult = await backupMembers();
           console.log('[task-8] 백업 완료:', backupResult.fname, '(Firebase ' + backupResult.count + '명, in-memory ' + backupResult.memCount + '명' + (backupResult.mismatch ? ' ⚠️ mismatch' : '') + ')');
 
-          /* (1.5) task-8 fix — 미리보기 == 적용 보장 (과다 제거 차단) ──────────────
-             버그: preview.removed 는 Firebase 정본(truth)으로 계산되는데, apply 는
-             handleUpload 끝의 bulkSave 가 .set() 으로 /members 를 window.MEMBERS(전체 교체)로 덮어씀.
-             window.MEMBERS 가 bug-2 silent-drop 으로 짧으면 → preview 에 없던 회원까지 통째 삭제(과다 제거).
-             fix: apply 직전 window.MEMBERS 를 truth(preview 와 동일 소스)로 재시드 + preview.removed 만 제거.
-                  → handleUpload 가 added/변경 반영 후 bulkSave 하면
-                    최종 /members = truth − removed + added(+변경) = preview 와 정확히 일치. */
-          try{
-            if(Array.isArray(truth.members) && truth.members.length){
-              var _rmSet = {}; (diff.removed||[]).forEach(function(r){ if(r && r.id!=null) _rmSet[String(r.id)] = 1; });
-              var _seed = truth.members
-                .filter(function(m){ return m && m.id!=null && !_rmSet[String(m.id)]; })
-                .map(function(m){ return JSON.parse(JSON.stringify(m)); });
-              if(Array.isArray(window.MEMBERS)){ window.MEMBERS.length = 0; _seed.forEach(function(m){ window.MEMBERS.push(m); }); }
-              else { window.MEMBERS = _seed; }
-              console.log('[task-8 fix] window.MEMBERS 재시드: truth ' + truth.members.length + ' − removed ' + Object.keys(_rmSet).length + ' = ' + window.MEMBERS.length + ' (handleUpload 가 added/updated 반영 예정)');
-            } else {
-              alert('정본 명단(truth)을 가져오지 못해 과다 제거 위험이 있습니다. 적용을 중단합니다.');
-              console.error('[task-8 fix] truth.members 비어있음 — apply 중단 (fail-closed)');
-              return;
-            }
-          }catch(_seedErr){
-            alert('명단 재시드 실패 — 안전을 위해 적용을 중단합니다: ' + _seedErr.message);
-            console.error('[task-8 fix] 재시드 실패:', _seedErr);
+          /* (1.5) task-8 fix v2 — write 시점 정본화 준비 ──────────────
+             v1(window.MEMBERS 재시드)은 무효였음: handleUpload 은 lexical MEMBERS(applyFinalData 가 새 배열로
+             재할당한 별개 배열)를 bulkSave 로 넘기는데, v1 은 window.MEMBERS(다른 배열)만 고쳐서 write 에 안 닿음
+             → 제거 미반영 + 중복 bloat(1716) 그대로 저장. 또 실제 저장은 V111 병합저장(merge save).
+             v2: 아래 (2.5) 에서 bulkSave 1회용 wrap 으로 넘어온 members 를 CSV 로스터(id∈csvMap)+dedupe 로 강제.
+             여기선 csvMap 유효성 가드 + 원본 bulkSave(병합저장) 캡처만 한다. */
+          var _csvIdSet = {}; Object.keys(extracted.map || {}).forEach(function(id){ _csvIdSet[String(id)] = 1; });
+          if(Object.keys(_csvIdSet).length < 1000){
+            alert('CSV 로스터 인원이 비정상(' + Object.keys(_csvIdSet).length + '명) — 안전을 위해 적용 중단.');
+            console.error('[task-8 fix] csvMap < 1000 — apply 중단 (fail-closed)');
             return;
           }
+          var _bottomBulk = window.bulkSave;   /* type 보호 wrap 설치 前 원본(병합저장) — write 후 여기로 깨끗이 복원 */
 
           /* (1.5b) 제거된 id 영구 기록(att_removed_ids) → applyFinalData 가 FINAL 스냅샷에서
              부활시키지 않도록. CSV 에 (다시) 포함된 id 는 집합에서 해제(재가입 대비). */
@@ -20503,6 +20490,40 @@ body.cf-released.llf-pin-loading #overview-extra-analysis{visibility:visible !im
             });
             applyTypeProtection(typeSnapshot);
             console.log('[task-8] 유형 보호 활성 — ' + Object.keys(typeSnapshot).length + '명 type snapshot');
+          }
+
+          /* (2.5) task-8 fix v2 — bulkSave 1회용 wrap: write 시점에 members 를 CSV 로스터만 + id dedupe 로 강제.
+             → 제거 대상(removed: 한나은·이유린·조윤찬) + 중복 bloat 을 결정적 제거 → 정확히 CSV 인원.
+             _origForCall(=현재 window.bulkSave, type-protection wrap 포함)을 호출해 유형보호도 정상 동작,
+             finally 에서 _bottomBulk(병합저장 원본)로 복원 → wrap 중첩 충돌 없이 깨끗이 원복. */
+          try{
+            var _origForCall = window.bulkSave;
+            var _t8Consumed = false;
+            window.bulkSave = async function(members, records){
+              _t8Consumed = true;
+              try{
+                if(Array.isArray(members)){
+                  var _seen = {}, _canon = [], _before = members.length;
+                  members.forEach(function(m){
+                    if(!m || m.id == null) return;
+                    var id = String(m.id);
+                    if(!_csvIdSet[id]) return;             /* CSV 에 없으면 제외 (= removed/이탈) */
+                    if(_seen[id]) return; _seen[id] = 1;   /* 중복 제거 */
+                    _canon.push(m);
+                  });
+                  console.log('[task-8 fix] bulkSave 정본화: ' + _before + ' → CSV 로스터 ' + _canon.length + '명 (removed/dup 제거)');
+                  members = _canon;
+                }
+              }catch(_e){ console.warn('[task-8 fix] bulkSave 정본화 오류:', _e); }
+              finally{ window.bulkSave = _bottomBulk; }    /* 1회용 해제 → 병합저장 원본 복원 */
+              return _origForCall.call(this, members, records);
+            };
+            setTimeout(function(){ if(!_t8Consumed && window.bulkSave !== _bottomBulk){ window.bulkSave = _bottomBulk; console.warn('[task-8 fix] bulkSave wrap 60s 미소비 — 자동 해제'); } }, 60000);
+          }catch(_wrapErr){
+            window.bulkSave = _bottomBulk;
+            alert('정본화 wrap 설치 실패 — 적용 중단: ' + _wrapErr.message);
+            console.error('[task-8 fix] bulkSave wrap 실패:', _wrapErr);
+            return;
           }
 
           /* (3) 원본 handleUpload 호출 — 모든 wrapper 정상 실행 */
